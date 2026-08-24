@@ -1,0 +1,40 @@
+{
+  "title": "Kagi Analytics Overview",
+  "description": "Challenge and token issuance metrics",
+  "panels": [
+    {
+      "title": "Challenges Issued",
+      "type": "timeseries",
+      "targets": [
+        {
+          "query": "SELECT toStartOfInterval(toDateTime(at), INTERVAL 5 minute) AS bucket, count() FROM events WHERE event = 'challenge_issued' GROUP BY bucket ORDER BY bucket",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Tokens Issued",
+      "type": "timeseries",
+      "targets": [
+        {
+          "query": "SELECT toStartOfInterval(toDateTime(at), INTERVAL 5 minute) AS bucket, count() FROM events WHERE event = 'token_issued' GROUP BY bucket ORDER BY bucket",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Failures by Event",
+      "type": "table",
+      "targets": [
+        {
+          "query": "SELECT event, count() AS failures FROM events WHERE payload->'result' = 'error' GROUP BY event ORDER BY failures DESC",
+          "refId": "C"
+        }
+      ]
+    }
+  ],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  }
+}

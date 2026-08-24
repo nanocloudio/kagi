@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kagi.dev/schemas/analytics-event.json",
+  "title": "AnalyticsEvent",
+  "type": "object",
+  "required": ["event", "at", "tenant_id"],
+  "properties": {
+    "event": { "type": "string", "minLength": 1 },
+    "at": { "type": "integer", "minimum": 0 },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "device_id": { "type": "string", "minLength": 1 },
+    "rid": { "type": "string", "minLength": 1 },
+    "payload": { "type": ["object", "null"], "default": null }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,10 @@
+# Test code may unwrap/expect/panic freely; production lints stay strict.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+disallowed-macros = [
+    { path = "std::println",  reason = "use tracing" },
+    { path = "std::eprintln", reason = "use tracing" },
+    { path = "std::dbg",      reason = "remove before commit" },
+]

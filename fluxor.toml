@@ -1,0 +1,62 @@
+# Kagi project config consumed by the `fluxor` CLI.
+
+# Project identity. Required for `fluxor publish`; downstream projects
+# (chronicle pipelines embedding token_mint, for instance) reference kagi
+# by this name.
+[project]
+name    = "kagi"
+version = "0.0.1"
+
+# Cross-project dependencies. Resolves to fluxor's published source
+# crates and fmod palette via the local registry. PIC modules in
+# `modules/app/*/mod.rs` consume the materialised SDK source at
+# `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
+[dependencies]
+fluxor = "0.0.1"
+# wave publishes the protocol-module palette. `configs/e2e-*.yaml` have
+# always named `http` and `ws_stream`, but without the dependency they could
+# not resolve — so every runtime e2e soft-skipped, and a gate that skips is
+# a gate that reports green over an untested graph.
+wave = "0.0.1"
+
+[ci]
+# Module targets to build in CI phase 3. `bcm2712` `.fmod` artefacts run
+# as PIC on linux/aarch64 (the issuer + the e2e harness); `wasm` builds
+# the browser secret-store backend. Modules whose `hardware_targets`
+# exclude a target are skipped for it (token_mint is bcm2712-only).
+targets = ["bcm2712", "wasm"]
+
+
+# No `[ci.cargo] host_tools_crate`: kagi has no root cargo manifest. Its
+# shared sources are `modules/common/**`, a SOURCE TREE rather than a
+# crate, and the host suites under `tests/harness` mount them — one
+# source, two compilations. Phase 4's built-in `cargo-test (harness)`
+# runs them after the module build.
+
+[ci.hygiene]
+# Tiers where inline tests are banned. `modules/**` is no_std PIC and
+# cannot host a std test harness; its units are host suites under
+# `tests/harness`, which `#[path]`-mount `modules/common/**`.
+forbid_inline_tests = ["modules"]
+mode = "strict"
+max_inline_lines = 80
+
+[ci.test]
+# Shadow-checkout hard-fail guard: tests/ and configs/ live in
+# .git-shadow/, so a primary-only checkout cannot run the test suite or
+# render the deployment graph templates. The guard fails CI instead.
+scripts = ["tools/ci-shadow-guard.sh"]
+
+[ci.templates]
+dir = "configs"
+# Defaults for the template-render gate (CI phase 1.5). Just enough to
+# make every template render without leftover `__KEY__` placeholders —
+# not production values.
+vars = { NODE_ID = "0", HTTP_PORT = "18080", WS_PORT = "19700", TOKEN_PORT = "18081", GATE_PORT = "18083", ENROL_PORT = "18084", TENANT_SEED = "render-only-not-a-secret", WELLKNOWN_PORT = "18085", CA_PEM = "render-only", E2EE_PORT = "18086", KEYPKG_PORT = "18087", STATE_PORT = "18088", PKI_PORT = "18090", ISSUER_CN = "render-only", TRUST_DOMAIN = "render.invalid", ISSUER = "https://issuer.invalid" }
+
+[required]
+# Optional wire-ABI assertion (defence in depth). The authoritative
+# ABI is derived from the resolved fluxor version in `[dependencies]`;
+# this pin makes drift fail the version-skew phase of `fluxor ci`
+# explicitly.
+fluxor = { abi = 1 }

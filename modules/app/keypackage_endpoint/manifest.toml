@@ -1,0 +1,28 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+buffer_size = 16384
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+buffer_size = 16384
+
+[observability]
+metrics = [
+  "package_published",
+  "package_claimed_exclusive",
+  "package_claimed_last_resort",
+  "package_pool_empty",
+  "package_pool_full",
+  "package_malformed",
+]

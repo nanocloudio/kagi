@@ -1,0 +1,41 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# Also builds for `wasm` (browser secret store). There is no FS provider
+# in the browser today, so the wasm build runs memory-only (the same
+# graceful degrade as a Pi with no FS provider); durable browser storage
+# (OPFS/IndexedDB) is a future FS-provider concern, not a module change.
+hardware_targets = ["bcm2712", "wasm"]
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "replies"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + VALUE reply header (corr 4 + status 1 + id f8 + ver f8) +
+# secret value f16 (2 + 1024), rounded up with headroom for LIST pages.
+max_record = 4096
+
+[[ports]]
+name = "key_update"
+direction = "input"
+content_type = "OctetStream"
+
+# Sealed records persist to `secrets/store.bin` relative to the fluxor
+# process's current working directory. The `secrets/` directory must
+# exist before launch (the FS provider's OPEN_CREATE creates files, not
+# parent directories). A missing FS provider silently degrades the store
+# to memory-only — fine for dev rigs, a durability hazard in production.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+metrics = ["get_ops", "put_ops", "list_ops", "rotate_ops", "decrypt_failures", "records", "bytes_stored"]

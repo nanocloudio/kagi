@@ -1,0 +1,24 @@
+# Generated artifacts
+target/
+
+# Internal working notes, RFCs and plans. Not part of the public
+# reference surface, and absent from a public clone.
+.context/
+
+# Node.js dependencies
+node_modules/
+
+# Local environment files
+.env
+
+# fluxor CLI transient lock
+.fluxor.lock.lock
+
+# Shadow-tracked: versioned in .git-shadow/, never pushed to this repo's
+# remote, and absent from a public clone. `configs/` carries
+# deployment and rig-specific graphs. `benches/`, `examples/` and `fuzz/`
+# are omitted until those tiers exist; add
+# them here and in .git-shadow/info/exclude together if introduced.
+/tests/
+/configs/
+/.git-shadow/

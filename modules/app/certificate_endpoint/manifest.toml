@@ -1,0 +1,28 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+buffer_size = 16384
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+buffer_size = 16384
+
+# The CA's signing seed, in the MSG_MINT_KEY shape every kagi module takes.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+[observability]
+metrics = ["certificate_issued", "certificate_no_key", "certificate_malformed"]

@@ -1,0 +1,49 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+buffer_size = 16384
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+buffer_size = 16384
+
+# The seed this endpoint signs challenges and certificates with, in the same
+# MSG_MINT_KEY shape `token_mint` takes. Until one arrives every request is
+# refused: an enrolment endpoint that answered without a key would hand out
+# challenges nothing could later verify.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The enrolled device, written through `secret_store`. A directory is durable
+# storage keyed by an identifier, which is what that module already is —
+# a second store would be a second thing to keep consistent.
+[[ports]]
+name = "directory_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[observability]
+metrics = [
+  "enrol_started",
+  "enrol_redeemed",
+  "enrol_no_key",
+  "enrol_malformed",
+  "enrol_bad_challenge",
+  "enrol_pkce_mismatch",
+  "enrol_bad_possession",
+  "enrol_recorded",
+]

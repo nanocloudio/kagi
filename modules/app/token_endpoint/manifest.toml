@@ -1,0 +1,42 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+buffer_size = 16384
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+buffer_size = 16384
+
+# To and from `token_mint`. The endpoint owns the HTTP shape of a token
+# request; what a token SAYS, and the key that signs it, stay where they
+# already are.
+[[ports]]
+name = "mint_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "mint_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+
+[observability]
+metrics = [
+  "token_issued",
+  "token_refused",
+  "token_malformed",
+  "token_in_flight_full",
+  "token_unmatched_reply",
+]

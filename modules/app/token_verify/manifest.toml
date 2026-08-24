@@ -1,0 +1,29 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "verify_requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "results"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + VERIFY_RESP (corr 4 + status 1 + claims f16: 2 + up to
+# MAX_CLAIMS_BYTES). On ST_OK the reply carries the decoded claims JSON so
+# a caller (e.g. a chronicle Decision) can authorize on them.
+max_record = 2048
+
+[[ports]]
+name = "verify_key"
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["verify_ok", "verify_bad_sig", "verify_expired", "verify_malformed", "no_key_errors"]
