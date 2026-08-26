@@ -17,7 +17,7 @@ direction = "output"
 content_type = "HttpResponse"
 buffer_size = 16384
 
-# The signing seed, in the MSG_MINT_KEY shape every kagi module takes.
+# The signing seed, in the MSG_KEY_ADD shape every kagi module takes.
 [[ports]]
 name = "signing_key"
 direction = "input"

@@ -69,12 +69,26 @@ mod b64;
 mod chan;
 #[path = "../../common/ids.rs"]
 mod ids;
+#[path = "../../common/issuer_key.rs"]
+mod issuer_key;
 #[path = "../../common/jose.rs"]
 mod jose;
 #[path = "../../common/jwk.rs"]
 mod jwk;
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
+mod key_vault;
 #[path = "../../common/pkce.rs"]
 mod pkce;
+#[path = "../../common/state_wire.rs"]
+mod state_wire;
+#[path = "../../common/time_policy.rs"]
+mod time_policy;
+
+// wave's SMTP connector wire, mounted from the materialised `wave-common`
+// tree. A second copy of a layout is how two repos come to disagree about
+// one neither can check for the other.
+#[path = "../../../target/fluxor/wave-common/smtp_wire.rs"]
+mod smtp_wire;
 
 use auth_wire::PayloadReader;
 
@@ -130,14 +144,37 @@ struct ModuleState {
     in_requests: i32,
     out_responses: i32,
     in_key: i32,
-    out_directory: i32,
+    /// Operator requests for enrolment authorisations, and the replies.
+    /// Both ride the control plane — see `MSG_ENROL_AUTH_REQ`.
+    in_auth: i32,
+    out_auth: i32,
+    out_state: i32,
+    in_state: i32,
+    out_mail: i32,
+    in_mail: i32,
+
+    /// The envelope sender enrolment mail is submitted from.
+    mail_from: [u8; MAX_FIELD],
+    mail_from_len: u16,
 
     /// The Ed25519 seed. Signing and verifying are the same key here because
     /// this endpoint is the only party on either end of a challenge token.
-    seed: [u8; 32],
+    /// out[4]: this signer's public half, as a VERIFY KEY_ADD.
+    out_key_announce: i32,
+    /// The challenge signing key, held in the vault under the label the
+    /// keyset record names. This module never holds a private key.
+    key: issuer_key::IssuerKey,
+    /// The HMAC key that binds an enrolment code to its transaction.
+    ///
+    /// Derived from the signing key at open (see `derive_code_key`) rather
+    /// than held as a separate secret, so there is exactly one thing to
+    /// provision — and unlike its predecessor it is STABLE across restarts.
+    code_key: [u8; 32],
+    /// Scratch for one vault SIGN, kept in module state rather than on the
+    /// PIC stack.
+    sign_scratch: [u8; MAX_TOKEN + issuer_key::SIGN_SCRATCH_OVERHEAD],
     kid: [u8; 32],
     kid_len: u8,
-    has_key: bool,
 
     /// The deployment's issuer identity, and the secret tenant ids derive
     /// from. Graph parameters: a caller that could name its own issuer could
@@ -156,10 +193,409 @@ struct ModuleState {
     enrol_pkce_mismatch: u32,
     enrol_bad_possession: u32,
     enrol_recorded: u32,
+    enrol_replayed: u32,
+    enrol_state_unavailable: u32,
+    enrol_mail_submitted: u32,
+    enrol_mail_failed: u32,
+    enrol_code_bad: u32,
+    enrol_txn_burned: u32,
+
+    /// The nonce of the challenge currently being redeemed, captured during
+    /// verification so the consume can key on it without re-parsing.
+    redeem_nonce: [u8; MAX_NONCE],
+    redeem_nonce_len: u8,
+    /// The challenge's own expiry, so the consume marker outlives exactly the
+    /// window in which a replay would otherwise be possible and no longer.
+    redeem_exp: u64,
+    /// The code the client presented at `/redeem`.
+    redeem_code: [u8; CODE_DIGITS],
+    /// The device record this redemption will commit: its id, and the
+    /// certificate's own claims. What is enrolled is exactly what was
+    /// attested, with no second rendering to disagree with the first.
+    redeem_device_id: [u8; 4 + ids::DEVICE_ID_LENGTH],
+    redeem_claims: [u8; 1024],
+    redeem_claims_len: u16,
+
+    /// True when `/start` ADOPTED an operator-minted transaction rather than
+    /// creating one — the QR ceremony. It decides two things: no transaction
+    /// is written (one already exists) and no mail is submitted (there is no
+    /// mailbox).
+    start_adopted: bool,
+    /// What `/start` produced and is about to commit: the transaction's
+    /// nonce, the code mailed against it, and the address it goes to.
+    start_nonce: [u8; MAX_NONCE],
+    start_nonce_len: u8,
+    start_code: [u8; CODE_DIGITS],
+    start_email: [u8; MAX_FIELD],
+    start_email_len: u16,
+    /// The challenge's expiry, so the transaction outlives exactly the window
+    /// the challenge itself is good for.
+    start_exp: u64,
+
+    /// Redemptions waiting on the ledger.
+    pending: [Pending; MAX_PENDING],
+    next_corr: u32,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
 }
+
+/// The longest base64url nonce a challenge carries.
+const MAX_NONCE: usize = 48;
+
+/// The exact length of an OPERATOR-minted transaction nonce, base64url.
+///
+/// `ENROL_AUTH_ID_BYTES` (8) unpadded is 11 characters, where a mailed
+/// transaction's `NONCE_BYTES` (16) is 22. `/start` will only adopt a nonce
+/// of this length, and that check is load-bearing rather than cosmetic.
+///
+/// **What it stops.** `/redeem` takes its nonce from the challenge token, so
+/// before adoption existed the only way to spend attempts against
+/// transaction N was to hold the token naming N — which only the client that
+/// started it had. Adoption lets any caller mint a token for any nonce, and
+/// without this check somebody who learned a MAILED transaction's nonce
+/// could burn its five attempts and lock out the person waiting on that
+/// mail. They still could not redeem it, having no code; they could deny it.
+///
+/// Length rather than a marker character because base64url is `A-Za-z0-9-_`
+/// and a prefix drawn from that alphabet would collide with real nonces at
+/// one in sixty-four. Two lengths cannot collide at all.
+const OPERATOR_NONCE_LEN: usize = 11;
+/// Redemptions in flight at once. Each holds a signed certificate, so this is
+/// bounded by memory rather than by throughput; a fifth concurrent redemption
+/// is refused rather than queued.
+const MAX_PENDING: usize = 4;
+
+/// A redemption that has been verified and is waiting for the ledger.
+///
+/// The certificate is already signed and held here. That ordering is
+/// deliberate: signing is deterministic and cheap, and holding the result
+/// means the answer sent on success is exactly the one the verification
+/// produced, rather than something re-derived after an await.
+#[derive(Clone, Copy)]
+struct Pending {
+    live: bool,
+    /// `STAGE_CONSUME` while the nonce is being spent, `STAGE_COMMIT` while
+    /// the device record is being written.
+    stage: u8,
+    conn: u16,
+    stream: u16,
+    corr: u32,
+    cert: [u8; MAX_TOKEN],
+    cert_len: u16,
+    device_id: [u8; 4 + ids::DEVICE_ID_LENGTH],
+    claims: [u8; 1024],
+    claims_len: u16,
+    /// The transaction's nonce, and the code the client presented against it.
+    nonce: [u8; MAX_NONCE],
+    nonce_len: u8,
+    code: [u8; CODE_DIGITS],
+    /// The CALLER's correlation, for a stage that answers on a channel.
+    /// Distinct from `corr`, which correlates this module's own request to
+    /// the state adapter — confusing the two would reply to the operator
+    /// with the ledger's correlation and to the ledger with the operator's.
+    caller_corr: u32,
+    /// When the authorisation being minted expires, echoed to the operator.
+    auth_exp: u64,
+    /// The etag the transaction was read at, so the consume can compare and
+    /// swap against exactly the revision the code was checked on.
+    etag: [u8; state_wire::MAX_ETAG],
+    etag_len: u8,
+    attempts: u32,
+}
+
+/// Writing the transaction `/start` created.
+const STAGE_START: u8 = 0;
+/// Reading the transaction back at `/redeem`, to check the code against it.
+const STAGE_LOOKUP: u8 = 1;
+/// Spending the transaction.
+const STAGE_CONSUME: u8 = 2;
+/// Committing the device record.
+const STAGE_COMMIT: u8 = 3;
+/// Writing an operator-minted enrolment AUTHORISATION — the thing a QR
+/// carries. Unlike every other stage this one answers on a CHANNEL rather
+/// than an HTTP connection, because the operator asked over the control
+/// plane and there is no request socket to reply on.
+const STAGE_AUTH_MINT: u8 = 4;
+
+impl Pending {
+    const fn zero() -> Self {
+        Self {
+            live: false,
+            stage: STAGE_START,
+            caller_corr: 0,
+            auth_exp: 0,
+            conn: 0,
+            stream: 0,
+            corr: 0,
+            cert: [0u8; MAX_TOKEN],
+            cert_len: 0,
+            device_id: [0u8; 4 + ids::DEVICE_ID_LENGTH],
+            claims: [0u8; 1024],
+            claims_len: 0,
+            nonce: [0u8; MAX_NONCE],
+            nonce_len: 0,
+            code: [0u8; CODE_DIGITS],
+            etag: [0u8; state_wire::MAX_ETAG],
+            etag_len: 0,
+            attempts: 0,
+        }
+    }
+}
+
+/// The enrolment code's length, in decimal digits.
+///
+/// Eight, not six: the code is the only secret standing between somebody who
+/// has intercepted a challenge token and an enrolled device, and 10^8 with a
+/// five-attempt cap and a ten-minute window is a different proposition from
+/// 10^6.
+const CODE_DIGITS: usize = 8;
+
+/// How many wrong codes a transaction tolerates before it is burned.
+const MAX_CODE_ATTEMPTS: u32 = 5;
+
+/// Derive the key the code hash is taken under.
+///
+/// HMAC and not a bare digest: a stored `sha256(nonce‖code)` would let anyone
+/// who could read the ledger enumerate a 10^8 space offline in seconds. Under
+/// a key they do not have, the stored value says nothing.
+///
+/// Emit this signer's public half as a VERIFY [`auth_wire::MSG_KEY_ADD`].
+///
+/// **This edge exists because the operator can no longer supply it.** The
+/// signing record names a vault LABEL, so the private half is generated
+/// inside the vault and whoever distributed the record never sees the
+/// public half either. This module is the only component that does.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn announce_public_key(
+    s: &ModuleState,
+    sys: &SyscallTable,
+    issuer: &[u8],
+    kid: &[u8],
+    profile_id: u16,
+) {
+    if s.out_key_announce < 0 || !s.key.is_open() {
+        return;
+    }
+    let rec = auth_wire::KeyRecord {
+        issuer,
+        profile_id,
+        kid,
+        suite: s.key.suite(),
+        state: auth_wire::key_state::ACTIVE,
+        key_use: auth_wire::key_use::VERIFY,
+        generation: 0,
+        activate_after_unix: 0,
+        remove_after_unix: 0,
+        key_ref: s.key.public_key(),
+    };
+    let mut payload = [0u8; 512];
+    let mut w = auth_wire::PayloadWriter::new(&mut payload);
+    if rec.write(&mut w).is_err() {
+        return;
+    }
+    let n = w.len();
+    chan::channel_write_msg(
+        sys,
+        s.out_key_announce,
+        auth_wire::MSG_KEY_ADD,
+        &payload[..n],
+    );
+}
+
+/// Derive the code-HMAC key from the vault-held signing key, once, at open.
+///
+/// **This closes the restart hole its predecessor documented.** That version
+/// derived the key from a signing seed held in module RAM and re-delivered
+/// on restart, so a restart before redemption invalidated every outstanding
+/// code — fail-closed, but a real outage for anyone mid-enrolment. Closing
+/// it needed "a KEY_VAULT that can reopen a named key", which now exists.
+///
+/// The construction is `SHA-256(Sign_k(domain))`. Two properties make it
+/// work, and both are load-bearing:
+///
+/// - **Ed25519 signing is deterministic** (RFC 8032 derives the nonce from
+///   the key and message, not from randomness), so the same key over the
+///   same domain string yields the same signature on every boot — which is
+///   what makes the derived key stable across restarts. This module accepts
+///   Ed25519 keys ONLY, and that restriction is now load-bearing rather than
+///   merely tidy: an ECDSA key would produce a different signature every
+///   time and silently invalidate every outstanding code, which is exactly
+///   the failure this replaced.
+/// - **The signature is unavailable without the key**, which the vault never
+///   exports — so the derived key is no weaker than the signing key itself.
+///
+/// The domain string is separate from anything the module ever signs for a
+/// caller, so the derivation cannot be induced by asking for a challenge.
+fn derive_code_key(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    const CODE_KEY_DOMAIN: &[u8] = b"kagi/enrolment/code-hmac/v1";
+    let key = s.key;
+    // SAFETY: `sys` is the module's own table; `sign_scratch` does not alias
+    // the domain constant.
+    let Some(sig) = (unsafe { key.sign(sys, &mut s.sign_scratch, CODE_KEY_DOMAIN) }) else {
+        return false;
+    };
+    s.code_key = sha256(&sig);
+    true
+}
+
+/// `HMAC-SHA256(k, nonce ‖ code)`, base64url.
+///
+/// The nonce is bound in so a code is only ever valid for the transaction it
+/// was issued against — otherwise a code observed once would open any
+/// transaction that happened to draw the same digits.
+fn code_hash(key: &[u8; 32], nonce: &[u8], code: &[u8]) -> [u8; 43] {
+    let mut message = [0u8; MAX_NONCE + CODE_DIGITS];
+    let n = nonce.len().min(MAX_NONCE);
+    message[..n].copy_from_slice(&nonce[..n]);
+    let end = n + code.len().min(CODE_DIGITS);
+    message[n..end].copy_from_slice(&code[..end - n]);
+    let mut mac = [0u8; 32];
+    hmac(HashAlg::Sha256, key, &message[..end], &mut mac);
+    b64::encode_digest32(&mac)
+}
+
+/// Compare two code hashes without leaking where they first differ.
+fn hashes_equal(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Draw a decimal code from the platform CSPRNG.
+///
+/// Rejection sampling, not modulo. `byte % 10` maps 256 values onto ten
+/// digits unevenly — 0 through 5 come up more often than 6 through 9 — and a
+/// biased code is a smaller search space than its digit count claims.
+///
+/// # Safety
+///
+/// Caller supplies a live `SyscallTable`.
+unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_DIGITS]) -> Result<(), Refusal> {
+    let mut filled = 0usize;
+    // Bounded: each round draws a full code's worth of bytes and keeps the
+    // usable ones, so the expected number of rounds is a little over one and
+    // the loop cannot run away.
+    for _ in 0..16 {
+        let mut raw = [0u8; CODE_DIGITS * 2];
+        if (sys.provider_call)(-1, 0x0C3C, raw.as_mut_ptr(), raw.len()) < 0 {
+            return Err(Refusal::NoEntropy);
+        }
+        for byte in raw {
+            if filled == CODE_DIGITS {
+                return Ok(());
+            }
+            // 250 is the largest multiple of 10 that fits a byte; anything
+            // above it is discarded rather than folded.
+            if byte < 250 {
+                out[filled] = b'0' + (byte % 10);
+                filled += 1;
+            }
+        }
+        if filled == CODE_DIGITS {
+            return Ok(());
+        }
+    }
+    Err(Refusal::NoEntropy)
+}
+
+/// Submit the enrolment mail carrying `code` to `to`.
+///
+/// Fire-and-forget by design: the connector is a lockstep, single-submission
+/// machine, and blocking `/start` on a delivery round trip would serialise
+/// enrolment at one mailbox per RTT. The answer to `/start` is therefore not
+/// a delivery claim — it says a code was issued and a submission was made.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn submit_mail(s: &mut ModuleState, sys: &SyscallTable, to: &[u8], code: &[u8], cid: u32) {
+    if s.out_mail < 0 || !chan::can_write(sys, s.out_mail) {
+        s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
+        return;
+    }
+    let mut body = [0u8; 512];
+    let mut at = 0usize;
+    let put_str = |buf: &mut [u8], at: &mut usize, text: &[u8]| {
+        let end = (*at + text.len()).min(buf.len());
+        buf[*at..end].copy_from_slice(&text[..end - *at]);
+        *at = end;
+    };
+    put_str(&mut body, &mut at, b"From: ");
+    put_str(
+        &mut body,
+        &mut at,
+        &s.mail_from[..usize::from(s.mail_from_len)],
+    );
+    put_str(&mut body, &mut at, b"\r\nTo: ");
+    put_str(&mut body, &mut at, to);
+    put_str(
+        &mut body,
+        &mut at,
+        b"\r\nSubject: Your enrolment code\r\nContent-Type: text/plain\r\n\r\nEnrolment code: ",
+    );
+    put_str(&mut body, &mut at, code);
+    put_str(&mut body, &mut at, b"\r\n");
+
+    let mut frame = [0u8; 1024];
+    let Some(n) = smtp_wire::write_smtp_request(
+        smtp_wire::SMTP_OP_SUBMIT,
+        cid,
+        0,
+        &s.mail_from[..usize::from(s.mail_from_len)],
+        to,
+        &body[..at],
+        &mut frame,
+    ) else {
+        s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
+        return;
+    };
+    if (sys.channel_write)(s.out_mail, frame.as_ptr(), n) > 0 {
+        s.enrol_mail_submitted = s.enrol_mail_submitted.saturating_add(1);
+    } else {
+        s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
+    }
+}
+
+/// Drain delivery results, so a refused submission is counted rather than
+/// silently forgotten.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn drain_mail(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_mail < 0 {
+        return;
+    }
+    while chan::can_read(sys, s.in_mail) {
+        let mut buf = [0u8; 1024];
+        let n = (sys.channel_read)(s.in_mail, buf.as_mut_ptr(), buf.len());
+        if n <= 0 {
+            break;
+        }
+        let Some(head) = smtp_wire::parse_smtp_result(&buf[..n as usize]) else {
+            continue;
+        };
+        if head.outcome != smtp_wire::SMTP_OUT_ACCEPTED {
+            // The code will never arrive. The transaction is left to expire
+            // rather than burned here: burning it would need the nonce this
+            // result does not carry, and an expiry is the same outcome a few
+            // minutes later.
+            s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
+        }
+    }
+}
+
+/// This module's client id on the ledger's shared reply port.
+const STATE_CLIENT: u8 = 1;
 
 define_params! {
     ModuleState;
@@ -174,6 +610,19 @@ define_params! {
         #[expect(clippy::cast_possible_truncation, reason = "clamped to MAX_FIELD above")]
         {
             s.iss_len = n as u16;
+        }
+    };
+
+    3, mail_from, str, 0 => |s, d, len| {
+        let n = if len > MAX_FIELD { MAX_FIELD } else { len };
+        let mut i = 0usize;
+        while i < n {
+            s.mail_from[i] = *d.add(i);
+            i += 1;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "clamped to MAX_FIELD above")]
+        {
+            s.mail_from_len = n as u16;
         }
     };
 
@@ -276,16 +725,23 @@ pub extern "C" fn module_new(
         s.in_requests = in_chan;
         s.out_responses = out_chan;
         s.in_key = dev_channel_port(sys, 0, 1);
-        s.out_directory = dev_channel_port(sys, 1, 1);
+        s.out_state = dev_channel_port(sys, 1, 1);
+        s.in_state = dev_channel_port(sys, 0, 2);
+        s.out_mail = dev_channel_port(sys, 1, 2);
+        s.in_mail = dev_channel_port(sys, 0, 3);
+        s.in_auth = dev_channel_port(sys, 0, 4);
+        s.out_auth = dev_channel_port(sys, 1, 3);
+        s.out_key_announce = dev_channel_port(sys, 1, 4);
 
-        s.seed = [0; 32];
+        s.key = issuer_key::IssuerKey::empty();
+        s.code_key = [0; 32];
         s.kid = [0; 32];
         s.kid_len = 0;
-        s.has_key = false;
         s.iss = [0; MAX_FIELD];
         s.iss_len = 0;
         s.tenant_seed = [0; 64];
         s.tenant_seed_len = 0;
+        s.start_adopted = false;
         s.enrol_started = 0;
         s.enrol_redeemed = 0;
         s.enrol_no_key = 0;
@@ -294,6 +750,29 @@ pub extern "C" fn module_new(
         s.enrol_pkce_mismatch = 0;
         s.enrol_bad_possession = 0;
         s.enrol_recorded = 0;
+        s.enrol_replayed = 0;
+        s.enrol_state_unavailable = 0;
+        s.enrol_mail_submitted = 0;
+        s.enrol_mail_failed = 0;
+        s.enrol_code_bad = 0;
+        s.enrol_txn_burned = 0;
+        s.redeem_nonce = [0u8; MAX_NONCE];
+        s.redeem_nonce_len = 0;
+        s.redeem_exp = 0;
+        s.redeem_device_id = [0u8; 4 + ids::DEVICE_ID_LENGTH];
+        s.redeem_claims = [0u8; 1024];
+        s.redeem_claims_len = 0;
+        s.redeem_code = [0u8; CODE_DIGITS];
+        s.start_nonce = [0u8; MAX_NONCE];
+        s.start_nonce_len = 0;
+        s.start_code = [0u8; CODE_DIGITS];
+        s.start_email = [0u8; MAX_FIELD];
+        s.start_email_len = 0;
+        s.start_exp = 0;
+        s.mail_from = [0u8; MAX_FIELD];
+        s.mail_from_len = 0;
+        s.pending = [Pending::zero(); MAX_PENDING];
+        s.next_corr = 1;
 
         parse_tlv(s, params, params_len);
 
@@ -311,6 +790,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
 
         drain_key(s, sys);
+        drain_auth(s, sys);
+        // Ledger replies before new requests, so a redemption that can be
+        // completed this step is completed rather than held for another.
+        drain_state(s, sys);
+        drain_mail(s, sys);
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
@@ -333,7 +817,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Take the latest MSG_MINT_KEY (`[alg u8][kid f8][seed 32]`).
+/// Take this profile's signing key from a `MSG_KEY_ADD`.
 ///
 /// # Safety
 ///
@@ -349,22 +833,68 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         }
         let mut buf = [0u8; 256];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
-        if msg_type != auth_wire::MSG_MINT_KEY {
+        // The key lifecycle, not a single raw-key delivery. This endpoint
+        // signs one artefact shape and holds one key for it, so it takes
+        // the ADD for its own profile and ignores everything else on the
+        // channel — the channel carries the whole issuer keyset.
+        let payload = &buf[..plen as usize];
+        if msg_type != auth_wire::MSG_KEY_ADD {
             continue;
         }
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(alg), Ok(kid)) = (r.u8(), r.field8()) else {
+        let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
             continue;
         };
-        // Ed25519 only. An enrolment endpoint signs one shape of artefact and
-        // there is no reason for it to carry two algorithms; a graph that
-        // hands it a P-256 key has made a mistake worth failing on rather
-        // than quietly not signing.
-        let seed = r.rest();
-        if alg != auth_wire::MINT_ALG_ED25519 || seed.len() < 32 || kid.len() > s.kid.len() {
+        if rec.key_use != auth_wire::key_use::SIGN
+            || rec.profile_id != auth_wire::suite::profile::ENROLMENT_CHALLENGE
+        {
             continue;
         }
-        s.seed.copy_from_slice(&seed[..32]);
+
+        // Ed25519 only. An enrolment endpoint signs one shape of artefact and
+        // there is no reason for it to carry two suites; a graph that hands
+        // it a P-256 key has made a mistake worth failing on rather than
+        // quietly not signing.
+        let (kid, label) = (rec.kid, rec.key_ref);
+        if rec.suite != auth_wire::suite::ED25519
+            || label.is_empty()
+            || label.len() > auth_wire::MAX_KEY_LABEL
+            || kid.is_empty()
+            || kid.len() > s.kid.len()
+        {
+            continue;
+        }
+        // A REDELIVERED record for the key already open is a no-op.
+        //
+        // Not an optimisation: closing and reopening releases the vault
+        // handle and takes a new one, and any challenge already issued under
+        // the old handle is then being verified across that seam. A control
+        // plane that sends the same record twice — which is ordinary, since
+        // records are idempotent by design — would otherwise invalidate
+        // enrolments in flight.
+        if s.key.is_open() && s.key.label() == label {
+            continue;
+        }
+        // The record names a LABEL; the key is generated inside the vault on
+        // first open and never travels.
+        s.key.close(sys);
+        if !s.key.open(sys, rec.suite, label) || !derive_code_key(s, sys) {
+            s.key.close(sys);
+            continue;
+        }
+        // Announced under DEVICE_CERTIFICATE, not under the profile the
+        // signing record named. This key signs BOTH the enrolment challenge
+        // (which only this module verifies, from its own copy) and the
+        // device certificate (which `mint_admission` verifies, and looks up
+        // under the profile the certificate belongs to). A verifier finds a
+        // key by the profile of the credential it is checking, so the
+        // announcement is filed where that lookup will go.
+        announce_public_key(
+            s,
+            sys,
+            rec.issuer,
+            kid,
+            auth_wire::suite::profile::DEVICE_CERTIFICATE,
+        );
         s.kid = [0; 32];
         s.kid[..kid.len()].copy_from_slice(kid);
         #[expect(
@@ -374,7 +904,6 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         {
             s.kid_len = kid.len() as u8;
         }
-        s.has_key = true;
     }
 }
 
@@ -423,7 +952,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
-    if !s.has_key {
+    if !s.key.is_open() {
         s.enrol_no_key = s.enrol_no_key.saturating_add(1);
         refuse(s, sys, conn, stream, Refusal::NoKey);
         return;
@@ -446,14 +975,20 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             // before the response is written over the same buffer.
             let mut token = [0u8; MAX_TOKEN];
             token[..len].copy_from_slice(&s.out[..len]);
-            let mut body = [0u8; MAX_TOKEN + 64];
-            let field: &[u8] = if is_start {
-                b"challenge_token"
+            if is_start {
+                // The transaction has to exist before the client is told the
+                // enrolment started: a challenge whose code the ledger never
+                // recorded could never be redeemed, and the client would be
+                // waiting on a mail that opens nothing.
+                begin_start(s, sys, conn, stream, &token[..len]);
             } else {
-                b"device_certificate"
-            };
-            let n = write_json_field(&mut body, field, &token[..len]);
-            respond(s, sys, conn, stream, 200, &body[..n]);
+                // A verified redemption is not yet a successful one. The
+                // challenge's nonce has to be consumed in the ledger first,
+                // and the certificate is only handed over if this redemption
+                // is the one that consumed it. Everything below happens when
+                // the ledger answers.
+                begin_lookup(s, sys, conn, stream, &token[..len]);
+            }
         }
         Err(refusal) => {
             match refusal {
@@ -492,35 +1027,108 @@ unsafe fn start(
     let mut email = [0u8; MAX_FIELD];
     let mut challenge = [0u8; MAX_FIELD];
     let mut canonical = [0u8; jwk::MAX_CANONICAL];
-    let (email_len, challenge_len, canonical_len) = {
+    let mut adopt = [0u8; MAX_FIELD];
+    let (email_len, challenge_len, canonical_len, adopt_len) = {
         let body = &s.buf[body_at..body_end];
         let email_len = json_string(body, b"email", &mut email);
         let challenge_len = json_string(body, b"code_challenge", &mut challenge);
         let canonical_len = canonical_device_jwk(body, &mut canonical).unwrap_or(0);
-        (email_len, challenge_len, canonical_len)
+        // The QR ceremony: `"transaction"` names a transaction an OPERATOR
+        // already minted, in place of the mailbox this device cannot prove.
+        let adopt_len = json_string(body, b"transaction", &mut adopt);
+        (email_len, challenge_len, canonical_len, adopt_len)
     };
-    if email_len == 0 || canonical_len == 0 || challenge_len != CODE_CHALLENGE_LEN {
+    // Exactly one delivery channel. A body carrying BOTH an email and a
+    // transaction is refused rather than resolved: the two authorise by
+    // different means, and a request that names both has not said which it
+    // is claiming — while an implementation that picked one would be picking
+    // for an attacker who supplied the other.
+    if (email_len == 0) == (adopt_len == 0) {
+        return Err(Refusal::Malformed);
+    }
+    if canonical_len == 0 || challenge_len != CODE_CHALLENGE_LEN {
+        return Err(Refusal::Malformed);
+    }
+    // Only an operator-minted nonce may be adopted — see
+    // `OPERATOR_NONCE_LEN`. A mailed transaction's nonce is a different
+    // length and is refused here, so adoption cannot be turned against the
+    // mail path.
+    if adopt_len > 0 && adopt_len != OPERATOR_NONCE_LEN {
         return Err(Refusal::Malformed);
     }
 
     // Hashes, not the values: the token is handed to the caller, and an
     // email address in it would travel through every log the caller keeps.
+    // An adopted ceremony hashes the empty string — there is no mailbox, and
+    // a stand-in value would assert one.
     let email_hash = b64::encode_digest32(&sha256(&email[..email_len]));
     let pubkey_hash = b64::encode_digest32(&sha256(&canonical[..canonical_len]));
 
-    let mut nonce_bytes = [0u8; NONCE_BYTES];
-    // Only a negative result is a failure. The SDK's two descriptions of
-    // `RANDOM_FILL` disagree — `kernel_abi.rs` says it returns the byte count
-    // and `runtime/net.rs`'s own wrapper says it returns zero — so this
-    // accepts either and refuses only the errno both agree on. A predictable
-    // nonce is worse than no answer, so the refusal is real when it comes.
-    if (sys.provider_call)(-1, 0x0C3C, nonce_bytes.as_mut_ptr(), NONCE_BYTES) < 0 {
-        return Err(Refusal::NoEntropy);
-    }
     let mut nonce = [0u8; 32];
-    let nonce_len = b64::encode(&nonce_bytes, &mut nonce).ok_or(Refusal::Malformed)?;
+    let nonce_len;
+    let mut code = [0u8; CODE_DIGITS];
+    if adopt_len > 0 {
+        // QR ceremony: ADOPT the operator's transaction rather than creating
+        // one. The nonce is theirs, and the code is already recorded against
+        // it — this endpoint never learns the code and does not need to. The
+        // device proves it holds the code at `/redeem`, exactly as a mailed
+        // one does, so the redemption path is unchanged and cannot tell the
+        // two ceremonies apart.
+        //
+        // What this branch does NOT do is check the transaction exists. That
+        // is deliberate: `/start` here only binds a device key and a PKCE
+        // challenge to a nonce, and a challenge token naming a transaction
+        // that never existed is worthless — `/redeem` looks the nonce up and
+        // refuses. Verifying here would add a round trip to learn something
+        // the next step establishes anyway, and would answer a prober's
+        // question about which nonces are live.
+        nonce_len = adopt_len.min(nonce.len());
+        nonce[..nonce_len].copy_from_slice(&adopt[..nonce_len]);
+        s.start_code = [0u8; CODE_DIGITS];
+    } else {
+        let mut nonce_bytes = [0u8; NONCE_BYTES];
+        // Only a negative result is a failure. The SDK's two descriptions of
+        // `RANDOM_FILL` disagree — `kernel_abi.rs` says it returns the byte
+        // count and `runtime/net.rs`'s own wrapper says it returns zero — so
+        // this accepts either and refuses only the errno both agree on. A
+        // predictable nonce is worse than no answer.
+        if (sys.provider_call)(-1, 0x0C3C, nonce_bytes.as_mut_ptr(), NONCE_BYTES) < 0 {
+            return Err(Refusal::NoEntropy);
+        }
+        nonce_len = b64::encode(&nonce_bytes, &mut nonce).ok_or(Refusal::Malformed)?;
 
-    let now = dev_unix_millis(sys) / 1000;
+        // The code that proves control of the mailbox. It never enters the
+        // challenge token — the token goes to the client, and a client that
+        // could read its own code would be proving nothing.
+        draw_code(sys, &mut code)?;
+        s.start_code = code;
+    }
+    s.start_adopted = adopt_len > 0;
+    s.start_nonce = [0u8; MAX_NONCE];
+    s.start_nonce[..nonce_len].copy_from_slice(&nonce[..nonce_len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_NONCE")]
+    {
+        s.start_nonce_len = nonce_len as u8;
+    }
+    s.start_email = [0u8; MAX_FIELD];
+    s.start_email[..email_len].copy_from_slice(&email[..email_len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_FIELD")]
+    {
+        s.start_email_len = email_len as u16;
+    }
+
+    // The enrolment ceremony is the one place a device legitimately has no
+    // clock of its own — it is being enrolled precisely because it is new.
+    // That exception belongs to the DEVICE, not to this issuer: the issuer
+    // is stamping a challenge's window and still needs a real reading, so
+    // `EnrolmentCeremony` here means "an issuer-signed observation is what
+    // the device may present back", not "this side may guess".
+    let obs = dev_trusted_unix(sys);
+    let now = time_policy::now_for(time_policy::Decision::EnrolmentCeremony, &obs).unwrap_or(0);
+    if now == 0 {
+        // A challenge dated from nothing is one `/redeem` cannot check.
+        return Err(Refusal::NoKey);
+    }
 
     let mut claims = [0u8; 1024];
     let mut at = 0usize;
@@ -536,6 +1144,7 @@ unsafe fn start(
     put_json_string(&mut claims, &mut at, &email_hash)?;
     put(&mut claims, &mut at, br#","exp":"#)?;
     put_u64(&mut claims, &mut at, now + CHALLENGE_TTL_SECS)?;
+    s.start_exp = now + CHALLENGE_TTL_SECS;
     put(&mut claims, &mut at, br#","iat":"#)?;
     put_u64(&mut claims, &mut at, now)?;
     put(&mut claims, &mut at, br#","iss":"#)?;
@@ -566,15 +1175,24 @@ unsafe fn redeem(
     let mut verifier = [0u8; MAX_VERIFIER];
     let mut signature_b64 = [0u8; 128];
     let mut canonical = [0u8; jwk::MAX_CANONICAL];
-    let (token_len, verifier_len, sig_len, canonical_len) = {
+    let mut code = [0u8; CODE_DIGITS];
+    let (token_len, verifier_len, sig_len, canonical_len, code_len) = {
         let body = &s.buf[body_at..body_end];
         (
             json_string(body, b"challenge_token", &mut token),
             json_string(body, b"code_verifier", &mut verifier),
             json_string(body, b"pop_sig", &mut signature_b64),
             canonical_device_jwk(body, &mut canonical).unwrap_or(0),
+            json_string(body, b"code", &mut code),
         )
     };
+    // The mailed code is required. Everything else in this request proves
+    // continuity with the client that started and possession of the device
+    // key; none of it says anything about the mailbox.
+    if code_len != CODE_DIGITS || !code.iter().all(u8::is_ascii_digit) {
+        return Err(Refusal::Malformed);
+    }
+    s.redeem_code = code;
     if token_len == 0 || canonical_len == 0 || sig_len == 0 {
         return Err(Refusal::Malformed);
     }
@@ -595,19 +1213,52 @@ unsafe fn redeem(
     if b64::decode(jws.signature_b64, &mut sig) != Some(64) {
         return Err(Refusal::BadChallenge);
     }
-    if !ed25519_verify(&ed25519_public_key(&s.seed), jws.signing_input, &sig) {
+    // The public half as the vault exported it: there is no scalar here to
+    // derive it from any more, which is the point.
+    let mut pk = [0u8; 32];
+    if s.key.public_key().len() != 32 {
+        return Err(Refusal::BadChallenge);
+    }
+    pk.copy_from_slice(s.key.public_key());
+    if !ed25519_verify(&pk, jws.signing_input, &sig) {
         return Err(Refusal::BadChallenge);
     }
     let mut claims = [0u8; 1024];
     let claims_len = b64::decode(jws.payload_b64, &mut claims).ok_or(Refusal::BadChallenge)?;
     let claims = &claims[..claims_len];
 
-    let now = dev_unix_millis(sys) / 1000;
+    // Checking the challenge's own window. A clock reading 0 makes
+    // `now >= exp` false for every challenge ever issued, so an expired one
+    // would be redeemed — the exact shape this migration exists to close.
+    let obs = dev_trusted_unix(sys);
+    let now = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs)
+        .ok_or(Refusal::BadChallenge)?;
     let exp = jose::claim_u64(claims, b"exp").ok_or(Refusal::BadChallenge)?;
     let nbf = jose::claim_u64(claims, b"nbf").ok_or(Refusal::BadChallenge)?;
     if now >= exp || nbf > now.saturating_add(CLOCK_SKEW_SECS) {
         return Err(Refusal::BadChallenge);
     }
+
+    // The nonce identifies this exchange, and identifies it uniquely: it is
+    // 32 CSPRNG bytes chosen at `/start`, and `/start` refuses outright
+    // rather than answer with a predictable one. Consuming it is therefore
+    // what makes a redemption single-use, and it is captured here — after
+    // the signature has been checked, so an attacker cannot burn an honest
+    // client's nonce by presenting a forged token that names it.
+    let nonce = jose::claim_str(claims, b"nonce").ok_or(Refusal::BadChallenge)?;
+    if nonce.is_empty() || nonce.len() > MAX_NONCE {
+        return Err(Refusal::BadChallenge);
+    }
+    s.redeem_nonce = [0u8; MAX_NONCE];
+    s.redeem_nonce[..nonce.len()].copy_from_slice(nonce);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by MAX_NONCE above"
+    )]
+    {
+        s.redeem_nonce_len = nonce.len() as u8;
+    }
+    s.redeem_exp = exp;
 
     // ── the same party that started is redeeming ─────────────────────────
     let stored_challenge =
@@ -684,51 +1335,713 @@ unsafe fn redeem(
     //
     // The record is the certificate's own claims: what was enrolled is
     // exactly what was attested, with no second rendering to disagree.
-    record_device(s, sys, &device_id, &out[..at]);
+    // Held, not written. The record is committed by the staged path below,
+    // after the challenge has been consumed and before the certificate is
+    // released — so a device the ledger never heard of cannot be handed a
+    // working credential.
+    s.redeem_device_id = [0u8; 4 + ids::DEVICE_ID_LENGTH];
+    s.redeem_device_id[..4].copy_from_slice(b"dev_");
+    s.redeem_device_id[4..].copy_from_slice(&device_id);
+    let claims_len = at.min(s.redeem_claims.len());
+    s.redeem_claims[..claims_len].copy_from_slice(&out[..claims_len]);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by the buffer above"
+    )]
+    {
+        s.redeem_claims_len = claims_len as u16;
+    }
 
     Ok(certificate_len)
 }
 
-/// Write the enrolled device through `secret_store`.
-///
-/// Best effort by design. The store may be absent from a graph that has no
-/// durable tier, and a deployment that wired one has a `directory_out` edge;
-/// refusing the enrolment because a write queue was momentarily full would
-/// turn a storage hiccup into a device that cannot enrol at all.
-/// `enrol_recorded` is what tells an operator the two are keeping pace.
+/// A helper that sends one ledger request and records the pending entry.
 ///
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn record_device(s: &mut ModuleState, sys: &SyscallTable, device_id: &[u8], claims: &[u8]) {
-    if s.out_directory < 0 || !chan::can_write(sys, s.out_directory) {
+unsafe fn dispatch(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    msg_type: u8,
+    request: &state_wire::StateRequest<'_>,
+    mut entry: Pending,
+) -> bool {
+    let mut frame = [0u8; 2048];
+    let Ok(n) = state_wire::encode_request(&mut frame, msg_type, request) else {
+        return false;
+    };
+    let Ok((wire_type, payload)) = auth_wire::read_envelope(&frame[..n]) else {
+        return false;
+    };
+    if s.out_state < 0 || chan::channel_write_msg(sys, s.out_state, wire_type, payload) <= 0 {
+        return false;
+    }
+    let Some(slot) = s.pending.iter().position(|p| !p.live) else {
+        return false;
+    };
+    entry.live = true;
+    entry.corr = request.correlation;
+    s.pending[slot] = entry;
+    true
+}
+
+/// Take the next correlation id.
+fn next_corr(s: &mut ModuleState) -> u32 {
+    let corr = s.next_corr;
+    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    corr
+}
+
+/// Commit the transaction `/start` created, then answer and mail the code.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn begin_start(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    token: &[u8],
+) {
+    if s.out_state < 0 || s.start_nonce_len == 0 {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
         return;
     }
-    let mut payload = [0u8; 1024 + 64];
+    if s.start_adopted {
+        // The QR ceremony. The transaction already exists — an operator
+        // minted it — so there is nothing to write and no mail to send, and
+        // the challenge token can go back immediately.
+        //
+        // Writing it again would be worse than redundant: `put_if_absent`
+        // would lose to the operator's own record and this would answer 503
+        // for a ceremony that is perfectly valid.
+        s.enrol_started = s.enrol_started.saturating_add(1);
+        respond_token(s, sys, conn, stream, token);
+        return;
+    }
+    let nonce_len = usize::from(s.start_nonce_len);
+    let mut nonce = [0u8; MAX_NONCE];
+    nonce[..nonce_len].copy_from_slice(&s.start_nonce[..nonce_len]);
+    let hash = code_hash(&s.code_key, &nonce[..nonce_len], &s.start_code);
+
+    // `{"attempts":0,"code_hash":"…","state":"pending"}` — the record the
+    // redemption reads back. The code itself is never stored.
+    let mut value = [0u8; 128];
     let mut at = 0usize;
-    // `[corr u32][id f8][version f8][value f16]`
-    if put_u32_le(&mut payload, &mut at, 0).is_err() {
-        return;
-    }
-    let mut id = [0u8; 4 + ids::DEVICE_ID_LENGTH];
-    id[..4].copy_from_slice(b"dev_");
-    id[4..].copy_from_slice(device_id);
-    if put_field8(&mut payload, &mut at, &id).is_err()
-        || put_field8(&mut payload, &mut at, b"1").is_err()
-        || put_field16(&mut payload, &mut at, claims).is_err()
+    let _ = put(&mut value, &mut at, br#"{"attempts":0,"code_hash":""#);
+    let _ = put(&mut value, &mut at, &hash);
+    let _ = put(&mut value, &mut at, br#"","state":"pending"}"#);
+
+    let corr = next_corr(s);
+    let request = state_wire::put_if_absent(
+        corr,
+        STATE_CLIENT,
+        state_wire::NS_ENROL_TXN,
+        &nonce[..nonce_len],
+        &value[..at],
+        s.start_exp,
+    );
+
+    let mut entry = Pending::zero();
+    entry.stage = STAGE_START;
+    entry.conn = conn;
+    entry.stream = stream;
+    entry.nonce = nonce;
+    entry.nonce_len = s.start_nonce_len;
+    entry.code = s.start_code;
+    let len = token.len().min(MAX_TOKEN);
+    entry.cert[..len].copy_from_slice(&token[..len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_TOKEN")]
     {
-        return;
+        entry.cert_len = len as u16;
     }
-    if chan::channel_write_msg(
-        sys,
-        s.out_directory,
-        auth_wire::MSG_SECRET_PUT,
-        &payload[..at],
-    ) > 0
-    {
-        s.enrol_recorded = s.enrol_recorded.saturating_add(1);
+    entry.claims_len = s.start_email_len;
+    entry.claims[..usize::from(s.start_email_len)]
+        .copy_from_slice(&s.start_email[..usize::from(s.start_email_len)]);
+
+    if !dispatch(s, sys, state_wire::MSG_STATE_PUT_ABS, &request, entry) {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
     }
 }
+
+/// Answer one operator request on the control plane.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn drain_auth(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_auth < 0 {
+        return;
+    }
+    for _ in 0..2 {
+        if !chan::can_read(sys, s.in_auth) {
+            break;
+        }
+        let mut buf = [0u8; 512];
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_auth, &mut buf);
+        if msg_type != auth_wire::MSG_ENROL_AUTH_REQ {
+            continue;
+        }
+        let Ok(req) = auth_wire::EnrolAuthRequest::decode(&buf[..plen as usize]) else {
+            continue;
+        };
+        mint_authorisation(s, sys, req.correlation, req.ttl_seconds);
+    }
+}
+
+/// Draw an authorisation and stage its durable record.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn mint_authorisation(s: &mut ModuleState, sys: &SyscallTable, corr: u32, ttl: u32) {
+    // No signing key means no ceremony can be completed, so an authorisation
+    // would be something that cannot be spent.
+    if !s.key.is_open() || s.out_state < 0 {
+        reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
+        return;
+    }
+
+    // The transaction's nonce, drawn exactly as `/start` draws it.
+    let mut nonce_bytes = [0u8; auth_wire::ENROL_AUTH_ID_BYTES];
+    if (sys.provider_call)(-1, 0x0C3C, nonce_bytes.as_mut_ptr(), nonce_bytes.len()) < 0 {
+        reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
+        return;
+    }
+    let mut nonce = [0u8; 32];
+    let Some(nonce_len) = b64::encode(&nonce_bytes, &mut nonce) else {
+        reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
+        return;
+    };
+
+    // And the code, by the same rejection sampling the mail path uses. This
+    // is the one the operator will show; nothing else ever sees it.
+    let mut code = [0u8; CODE_DIGITS];
+    if draw_code(sys, &mut code).is_err() {
+        reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
+        return;
+    }
+
+    let obs = dev_trusted_unix(sys);
+    let now = time_policy::now_for(time_policy::Decision::EnrolmentCeremony, &obs).unwrap_or(0);
+    if now == 0 {
+        // A transaction dated from nothing is one nothing can expire.
+        reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
+        return;
+    }
+    // CLAMPED, not refused: an operator who asks for an hour should get a
+    // working authorisation that expires in five minutes, not an error they
+    // work around by asking again.
+    let ttl = if ttl == 0 || ttl > auth_wire::MAX_ENROL_AUTH_TTL_SECS {
+        auth_wire::MAX_ENROL_AUTH_TTL_SECS
+    } else {
+        ttl
+    };
+    let exp = now + u64::from(ttl);
+
+    // Byte-for-byte the record `/start` writes. That is the point: a
+    // QR-delivered transaction and a mail-delivered one are the same object,
+    // so `/redeem` needs no idea which it is looking at and cannot get that
+    // question wrong.
+    let hash = code_hash(&s.code_key, &nonce[..nonce_len], &code);
+    let mut value = [0u8; 128];
+    let mut at = 0usize;
+    let _ = put(&mut value, &mut at, br#"{"attempts":0,"code_hash":""#);
+    let _ = put(&mut value, &mut at, &hash);
+    let _ = put(&mut value, &mut at, br#"","state":"pending"}"#);
+
+    let state_corr = next_corr(s);
+    let request = state_wire::put_if_absent(
+        state_corr,
+        STATE_CLIENT,
+        state_wire::NS_ENROL_TXN,
+        &nonce[..nonce_len],
+        &value[..at],
+        exp,
+    );
+
+    let mut entry = Pending::zero();
+    entry.stage = STAGE_AUTH_MINT;
+    entry.caller_corr = corr;
+    entry.auth_exp = exp;
+    entry.nonce[..nonce_len].copy_from_slice(&nonce[..nonce_len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_NONCE")]
+    {
+        entry.nonce_len = nonce_len as u8;
+    }
+    entry.code = code;
+
+    if !dispatch(s, sys, state_wire::MSG_STATE_PUT_ABS, &request, entry) {
+        reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
+    }
+}
+
+/// The ledger answered the authorisation write.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn auth_mint_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, status: u8) {
+    if status != auth_wire::ST_OK {
+        // Including `ST_CONFLICT`: an id that already exists is not an
+        // authorisation this call created, and answering OK would hand the
+        // operator a secret that opens somebody else's record — or nothing.
+        reply_auth_refused(s, sys, entry.caller_corr, auth_wire::ST_UNAVAILABLE);
+        return;
+    }
+    let id_len = usize::from(entry.nonce_len);
+    let resp = auth_wire::EnrolAuthResponse {
+        correlation: entry.caller_corr,
+        status: auth_wire::ST_OK,
+        auth_id: &entry.nonce[..id_len],
+        secret: &entry.code,
+        expires_at: entry.auth_exp,
+    };
+    let mut out = [0u8; 256];
+    if let Ok(n) = resp.encode(&mut out) {
+        if s.out_auth >= 0 {
+            let _ = (sys.channel_write)(s.out_auth, out.as_ptr(), n);
+        }
+    }
+}
+
+/// Tell the operator no, carrying nothing spendable.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn reply_auth_refused(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
+    if s.out_auth < 0 {
+        return;
+    }
+    let resp = auth_wire::EnrolAuthResponse::refused(corr, status);
+    let mut out = [0u8; 128];
+    if let Ok(n) = resp.encode(&mut out) {
+        let _ = (sys.channel_write)(s.out_auth, out.as_ptr(), n);
+    }
+}
+
+/// Read the transaction back so the presented code can be checked against it.
+///
+/// The lookup comes before anything is spent. A redemption carrying the wrong
+/// code must cost an attempt and nothing else — spending the transaction on a
+/// wrong guess would hand an attacker a denial of service against the very
+/// mailbox they failed to prove control of.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn begin_lookup(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    certificate: &[u8],
+) {
+    if s.out_state < 0 || s.redeem_nonce_len == 0 {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        return;
+    }
+    let nonce_len = usize::from(s.redeem_nonce_len);
+    let mut nonce = [0u8; MAX_NONCE];
+    nonce[..nonce_len].copy_from_slice(&s.redeem_nonce[..nonce_len]);
+
+    let corr = next_corr(s);
+    let request = state_wire::get(
+        corr,
+        STATE_CLIENT,
+        state_wire::NS_ENROL_TXN,
+        &nonce[..nonce_len],
+    );
+
+    let mut entry = Pending::zero();
+    entry.stage = STAGE_LOOKUP;
+    entry.conn = conn;
+    entry.stream = stream;
+    entry.nonce = nonce;
+    entry.nonce_len = s.redeem_nonce_len;
+    entry.code = s.redeem_code;
+    entry.device_id = s.redeem_device_id;
+    entry.claims = s.redeem_claims;
+    entry.claims_len = s.redeem_claims_len;
+    let len = certificate.len().min(MAX_TOKEN);
+    entry.cert[..len].copy_from_slice(&certificate[..len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_TOKEN")]
+    {
+        entry.cert_len = len as u16;
+    }
+
+    if !dispatch(s, sys, state_wire::MSG_STATE_GET, &request, entry) {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+    }
+}
+
+/// Answer redemptions whose consume has come back.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_state < 0 {
+        return;
+    }
+    while chan::can_read(sys, s.in_state) {
+        let mut frame = [0u8; 512];
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_state, &mut frame);
+        if msg_type == 0 {
+            break;
+        }
+        let Ok(reply) = state_wire::StateReply::decode(msg_type, &frame[..plen as usize]) else {
+            continue;
+        };
+        // The ledger's reply port fans out to every consumer, so a reply
+        // addressed to another module is not this module's to act on.
+        if reply.client != STATE_CLIENT {
+            continue;
+        }
+        let Some(slot) = s
+            .pending
+            .iter()
+            .position(|p| p.live && p.corr == reply.correlation)
+        else {
+            continue;
+        };
+        let entry = s.pending[slot];
+        s.pending[slot] = Pending::zero();
+        let mut value = [0u8; 256];
+        let vlen = reply.value.len().min(value.len());
+        value[..vlen].copy_from_slice(&reply.value[..vlen]);
+        let mut etag = [0u8; state_wire::MAX_ETAG];
+        let elen = reply.etag.len().min(etag.len());
+        etag[..elen].copy_from_slice(&reply.etag[..elen]);
+        complete(s, sys, &entry, reply.status, &value[..vlen], &etag[..elen]);
+    }
+}
+
+/// Turn a ledger verdict into the next step, or the client's answer.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn complete(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &Pending,
+    status: u8,
+    value: &[u8],
+    etag: &[u8],
+) {
+    match entry.stage {
+        STAGE_START => start_done(s, sys, entry, status),
+        STAGE_LOOKUP => lookup_done(s, sys, entry, status, value, etag),
+        STAGE_CONSUME => consume_done(s, sys, entry, status),
+        STAGE_AUTH_MINT => auth_mint_done(s, sys, entry, status),
+        _ => commit_done(s, sys, entry, status),
+    }
+}
+
+/// The transaction is recorded: answer `/start` and mail the code.
+///
+/// The mail goes out only now. Submitting before the record existed would
+/// send somebody a code that opens nothing.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn start_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, status: u8) {
+    if status != auth_wire::ST_OK {
+        // A nonce collision is not a thing that happens with 32 CSPRNG bytes,
+        // so a conflict here means the ledger is answering about something
+        // else. Either way there is no transaction, so there is no enrolment.
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    }
+    let email_len = usize::from(entry.claims_len);
+    let mut email = [0u8; MAX_FIELD];
+    email[..email_len].copy_from_slice(&entry.claims[..email_len]);
+    let cid = entry.corr;
+    submit_mail(s, sys, &email[..email_len], &entry.code, cid);
+
+    s.enrol_started = s.enrol_started.saturating_add(1);
+    let len = usize::from(entry.cert_len);
+    let mut token = [0u8; MAX_TOKEN];
+    token[..len].copy_from_slice(&entry.cert[..len]);
+    respond_token(s, sys, entry.conn, entry.stream, &token[..len]);
+}
+
+/// Hand back the challenge token — the answer to a successful `/start`,
+/// whichever ceremony produced it.
+///
+/// One writer for both paths on purpose: a mailed ceremony and an adopted
+/// one must be indistinguishable from outside, and two response builders is
+/// how they would drift apart.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn respond_token(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    token: &[u8],
+) {
+    let mut body = [0u8; MAX_TOKEN + 64];
+    let n = write_json_field(&mut body, b"challenge_token", token);
+    respond(s, sys, conn, stream, 200, &body[..n]);
+}
+
+/// The transaction came back: check the code, then spend it.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn lookup_done(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &Pending,
+    status: u8,
+    value: &[u8],
+    etag: &[u8],
+) {
+    if status == auth_wire::ST_NOT_FOUND {
+        // No transaction: either it expired, or it was burned by too many
+        // wrong codes. Answered exactly as a wrong code is, so probing for
+        // which one it was tells an attacker nothing.
+        s.enrol_code_bad = s.enrol_code_bad.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 401, CODE_BODY);
+        return;
+    }
+    if status != auth_wire::ST_OK {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    }
+    // A transaction that is not `pending` has already been spent.
+    match jose::claim_str(value, b"state") {
+        Some(state) if state == b"pending" => {}
+        _ => {
+            s.enrol_replayed = s.enrol_replayed.saturating_add(1);
+            respond(s, sys, entry.conn, entry.stream, 409, CONSUMED_BODY);
+            return;
+        }
+    }
+    let attempts = jose::claim_u64(value, b"attempts").unwrap_or(0);
+    let Some(stored) = jose::claim_str(value, b"code_hash") else {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    };
+
+    let nonce_len = usize::from(entry.nonce_len);
+    let presented = code_hash(&s.code_key, &entry.nonce[..nonce_len], &entry.code);
+    if !hashes_equal(stored, &presented) {
+        s.enrol_code_bad = s.enrol_code_bad.saturating_add(1);
+        let mut kept = [0u8; 43];
+        let keep = stored.len().min(kept.len());
+        kept[..keep].copy_from_slice(&stored[..keep]);
+        burn_or_count(s, sys, entry, etag, attempts, &kept[..keep]);
+        return;
+    }
+
+    // The code is right. Spend the transaction, conditional on the revision
+    // the code was checked against — so two redemptions racing the same
+    // correct code cannot both win.
+    let corr = next_corr(s);
+    let request = state_wire::compare_and_swap(
+        corr,
+        STATE_CLIENT,
+        state_wire::NS_ENROL_TXN,
+        &entry.nonce[..nonce_len],
+        etag,
+        br#"{"attempts":0,"code_hash":"","state":"consumed"}"#,
+        0,
+    );
+    let mut next = *entry;
+    next.stage = STAGE_CONSUME;
+    if !dispatch(s, sys, state_wire::MSG_STATE_CAS, &request, next) {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+    }
+}
+
+/// Record a wrong guess, burning the transaction once the cap is reached.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn burn_or_count(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &Pending,
+    etag: &[u8],
+    attempts: u64,
+    stored_hash: &[u8],
+) {
+    let nonce_len = usize::from(entry.nonce_len);
+    let next_attempts = attempts.saturating_add(1);
+    let burned = next_attempts >= u64::from(MAX_CODE_ATTEMPTS);
+    if burned {
+        s.enrol_txn_burned = s.enrol_txn_burned.saturating_add(1);
+    }
+    let mut value = [0u8; 128];
+    let mut at = 0usize;
+    let _ = put(&mut value, &mut at, br#"{"attempts":"#);
+    let _ = put_u64(&mut value, &mut at, next_attempts);
+    if burned {
+        let _ = put(&mut value, &mut at, br#","code_hash":"","state":"burned"}"#);
+    } else {
+        // The hash is carried through unchanged. Rewriting the record
+        // without it would make every later correct code fail — a wrong
+        // guess would lock the transaction rather than cost an attempt.
+        let _ = put(&mut value, &mut at, br#","code_hash":""#);
+        let _ = put(&mut value, &mut at, stored_hash);
+        let _ = put(&mut value, &mut at, br#"","state":"pending"}"#);
+    }
+
+    // Best effort, and deliberately so: the answer to the client is the same
+    // either way, and a counter that failed to increment costs an attempt of
+    // slack rather than a security property. Refusing the request because the
+    // counter could not be written would turn a storage hiccup into an
+    // enrolment nobody can complete.
+    let corr = next_corr(s);
+    let request = state_wire::compare_and_swap(
+        corr,
+        STATE_CLIENT,
+        state_wire::NS_ENROL_TXN,
+        &entry.nonce[..nonce_len],
+        etag,
+        &value[..at],
+        0,
+    );
+    let mut frame = [0u8; 512];
+    if let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_CAS, &request) {
+        if let Ok((wire_type, payload)) = auth_wire::read_envelope(&frame[..n]) {
+            let _ = chan::channel_write_msg(sys, s.out_state, wire_type, payload);
+        }
+    }
+    respond(s, sys, entry.conn, entry.stream, 401, CODE_BODY);
+}
+
+/// The transaction is spent: commit the device.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn consume_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, status: u8) {
+    match status {
+        auth_wire::ST_OK => begin_commit(s, sys, entry),
+        auth_wire::ST_CONFLICT => {
+            // Somebody else spent it between the read and the swap.
+            s.enrol_replayed = s.enrol_replayed.saturating_add(1);
+            respond(s, sys, entry.conn, entry.stream, 409, CONSUMED_BODY);
+        }
+        _ => {
+            s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+            respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        }
+    }
+}
+
+/// The body a wrong or unusable code is answered with. Identical for a wrong
+/// code, an expired transaction and a burned one, so probing cannot
+/// distinguish them.
+const CODE_BODY: &[u8] = br#"{"error":"invalid_grant","detail":"code"}"#;
+/// The body a spent transaction is answered with.
+const CONSUMED_BODY: &[u8] = br#"{"error":"invalid_grant","detail":"consumed"}"#;
+
+/// Commit the device record, with the answer still held.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn begin_commit(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending) {
+    let Some(slot) = s.pending.iter().position(|p| !p.live) else {
+        // The nonce is already spent, so this enrolment cannot be retried
+        // with the same challenge — but a spent challenge is recoverable by
+        // starting a new one, where a device issued a certificate and never
+        // recorded is not. Refusing is the safe direction.
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    };
+
+    let corr = s.next_corr;
+    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+
+    let claims_len = usize::from(entry.claims_len);
+    let request = state_wire::put_if_absent(
+        corr,
+        STATE_CLIENT,
+        state_wire::NS_DEVICE,
+        &entry.device_id,
+        &entry.claims[..claims_len],
+        // Device membership does not expire with the challenge that created
+        // it; revocation, not a timer, is what ends it.
+        0,
+    );
+    let mut frame = [0u8; 2048];
+    let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)
+    else {
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    };
+    let Ok((msg_type, payload)) = auth_wire::read_envelope(&frame[..n]) else {
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    };
+    if chan::channel_write_msg(sys, s.out_state, msg_type, payload) <= 0 {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    }
+
+    let mut next = *entry;
+    next.live = true;
+    next.stage = STAGE_COMMIT;
+    next.corr = corr;
+    s.pending[slot] = next;
+}
+
+/// Release the certificate once the device is durably recorded.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn commit_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, status: u8) {
+    match status {
+        // `ST_CONFLICT` means the record is already there, which is what a
+        // device re-enrolling with the same key looks like: the device id is
+        // derived from that key, so the row it would write is the row that
+        // exists. The invariant this step protects — the device is in the
+        // ledger before the certificate is released — holds either way.
+        auth_wire::ST_OK | auth_wire::ST_CONFLICT => {
+            s.enrol_redeemed = s.enrol_redeemed.saturating_add(1);
+            s.enrol_recorded = s.enrol_recorded.saturating_add(1);
+            let len = usize::from(entry.cert_len);
+            let mut body = [0u8; MAX_TOKEN + 64];
+            let n = write_json_field(&mut body, b"device_certificate", &entry.cert[..len]);
+            respond(s, sys, entry.conn, entry.stream, 200, &body[..n]);
+        }
+        _ => {
+            // The write did not land. The challenge is spent and no
+            // certificate is issued — an enrolment that has to be restarted,
+            // rather than a device holding a credential nothing can revoke.
+            s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+            respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        }
+    }
+}
+
+/// The body a refusal caused by an unreachable ledger carries.
+const UNAVAILABLE_BODY: &[u8] = br#"{"error":"temporarily_unavailable","detail":"durability"}"#;
 
 fn put_u32_le(out: &mut [u8], at: &mut usize, value: u32) -> Result<(), Refusal> {
     put(out, at, &value.to_le_bytes())
@@ -803,7 +2116,12 @@ fn sign_jws(s: &mut ModuleState, cty: &[u8], claims: &[u8]) -> Result<usize, Ref
     let claims_len = b64::encode(claims, &mut token[n..]).ok_or(Refusal::Malformed)?;
     n += claims_len;
 
-    let signature = ed25519_sign(&s.seed, &token[..n]);
+    // SAFETY: `s.syscalls` is the table handed to `module_new`;
+    // `sign_scratch` does not alias `token`.
+    let sys = unsafe { &*s.syscalls };
+    let key = s.key;
+    let signature =
+        unsafe { key.sign(sys, &mut s.sign_scratch, &token[..n]) }.ok_or(Refusal::Malformed)?;
     put(&mut token, &mut n, b".")?;
     let sig_len = b64::encode(&signature, &mut token[n..]).ok_or(Refusal::Malformed)?;
     n += sig_len;

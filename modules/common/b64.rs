@@ -100,6 +100,50 @@ fn decode_char(c: u8) -> Option<u8> {
     }
 }
 
+/// Decode STANDARD base64 (`+/`, `=` padding) into `out`.
+///
+/// JOSE is base64url everywhere except `x5c`, which RFC 7515 §4.1.6 defines
+/// as standard base64 with padding — the DER goes on the wire in the same
+/// encoding a PEM file uses. Decoding it with the url-safe alphabet fails on
+/// any certificate whose DER happens to produce a `+` or `/`, which is most
+/// of them, and fails at a byte offset that says nothing about why.
+///
+/// A separate function rather than an alphabet-tolerant one: a decoder that
+/// accepted both alphabets would give every input two valid spellings, and
+/// two spellings of a certificate is two certificates as far as anything
+/// comparing bytes is concerned.
+pub fn decode_standard(input: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut o = 0usize;
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in input {
+        if c == b'=' {
+            // Padding only ever ends the input; anything after it would be
+            // a second encoding of the same bytes.
+            continue;
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            if o >= out.len() {
+                return None;
+            }
+            out[o] = (acc >> bits) as u8;
+            o += 1;
+        }
+    }
+    Some(o)
+}
+
 /// Encode a 32-byte digest into the fixed 43-char base64url form.
 pub fn encode_digest32(digest: &[u8; 32]) -> [u8; 43] {
     let mut out = [0u8; 43];

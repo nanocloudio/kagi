@@ -18,7 +18,7 @@ content_type = "HttpResponse"
 buffer_size = 16384
 
 # The seed this endpoint signs challenges and certificates with, in the same
-# MSG_MINT_KEY shape `token_mint` takes. Until one arrives every request is
+# MSG_KEY_ADD shape `token_mint` takes. Until one arrives every request is
 # refused: an enrolment endpoint that answered without a key would hand out
 # challenges nothing could later verify.
 [[ports]]
@@ -27,12 +27,67 @@ direction = "input"
 content_type = "OctetStream"
 buffer_size = 512
 
-# The enrolled device, written through `secret_store`. A directory is durable
-# storage keyed by an identifier, which is what that module already is —
-# a second store would be a second thing to keep consistent.
+# The security-state ledger. Redemption consumes the challenge's nonce here
+# before any certificate is signed, which is what makes a redemption
+# single-use across restarts and replicas rather than merely once per live
+# module instance.
+#
+# There is no fallback when this is unwired or the store is unavailable: the
+# redemption is refused. A challenge that could be redeemed twice because the
+# ledger was absent is exactly the defect this closes, so "no ledger" has to
+# mean "no enrolment" rather than "enrol without recording".
 [[ports]]
-name = "directory_out"
+name = "state_out"
+index = 1
 direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "state_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The mail path. `/start` submits a message carrying the enrolment code to
+# the address the request named; the result comes back so a submission the
+# relay refused can burn its transaction rather than leave a code nobody
+# will ever receive waiting to be guessed.
+[[ports]]
+name = "mail_out"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+
+# Operator requests for enrolment AUTHORISATIONS, from the control plane.
+#
+# The QR ceremony's authorisation: enrolment normally proves control of a
+# mailbox, and a device enrolled from a displayed code proves no such thing,
+# so an operator-minted single-use secret carries the authorisation instead.
+#
+# It rides the control plane because that socket already pushes MSG_KEY_ADD
+# into the mint — an operator credential can already install a signing key
+# and mint anything — so permission to authorise ONE enrolment adds no
+# authority it did not already carry.
+[[ports]]
+name = "auth_requests"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+
+# The authorisation, once. The secret is never stored and never re-sent.
+[[ports]]
+name = "auth_replies"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "mail_in"
+index = 3
+direction = "input"
 content_type = "OctetStream"
 buffer_size = 4096
 
@@ -46,4 +101,22 @@ metrics = [
   "enrol_pkce_mismatch",
   "enrol_bad_possession",
   "enrol_recorded",
+  "enrol_replayed",
+  "enrol_state_unavailable",
+  "enrol_mail_submitted",
+  "enrol_mail_failed",
+  "enrol_code_bad",
+  "enrol_txn_burned",
 ]
+
+# This signer's public half, as a VERIFY `MSG_KEY_ADD`.
+#
+# It signs both the enrolment challenge and the device certificate, and the
+# certificate is what `mint_admission` verifies — so this is the only place
+# that key's public half can come from.
+[[ports]]
+name = "key_announce"
+index = 4
+direction = "output"
+content_type = "OctetStream"
+max_record = 512

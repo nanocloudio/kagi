@@ -2,7 +2,7 @@
 //!
 //! The on-target counterpart to `token_mint`: consumes MSG_VERIFY_REQ on
 //! `verify_requests` and replies MSG_VERIFY_RESP on `results`. The
-//! verifying key arrives on `verify_key` as MSG_VERIFY_KEY
+//! verifying key arrives on `verify_key` as MSG_KEY_ADD
 //! (`[alg u8][kid_len u8][kid][pubkey_len u8][pubkey]` — the SEC1 public
 //! point for ES256, the 32-byte RFC 8032 public key for Ed25519); until
 //! one lands every request replies ST_NO_KEY. Tokens are split with the
@@ -48,6 +48,8 @@ mod b64;
 mod chan;
 #[path = "../../common/jose.rs"]
 mod jose;
+#[path = "../../common/time_policy.rs"]
+mod time_policy;
 
 use auth_wire::{PayloadReader, PayloadWriter};
 
@@ -62,20 +64,113 @@ const MAX_CLAIMS_BYTES: usize = 1024;
 /// WCET bound: verify requests handled per step (one signature each).
 const MAX_REQS_PER_STEP: usize = 4;
 
+const MAX_KID_LEN: usize = 64;
+const MAX_ISSUER_LEN: usize = 64;
+/// Verification keys held at once. Sized to match the mint's keyset: a
+/// verifier that can hold fewer keys than the issuer can sign under would
+/// reject live credentials and report an unknown kid.
+const MAX_KEYS: usize = 8;
+
+/// One verification key.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VerifyKey {
+    live: bool,
+    issuer: [u8; MAX_ISSUER_LEN],
+    issuer_len: u8,
+    profile_id: u16,
+    kid: [u8; MAX_KID_LEN],
+    kid_len: u8,
+    suite: u16,
+    state: u8,
+    generation: u32,
+    remove_after_unix: u64,
+    pubkey: [u8; MAX_PUBKEY_LEN],
+    pubkey_len: u8,
+}
+
+impl VerifyKey {
+    const fn empty() -> Self {
+        Self {
+            live: false,
+            issuer: [0; MAX_ISSUER_LEN],
+            issuer_len: 0,
+            profile_id: 0,
+            kid: [0; MAX_KID_LEN],
+            kid_len: 0,
+            suite: 0,
+            state: auth_wire::key_state::ADDED,
+            generation: 0,
+            remove_after_unix: 0,
+            pubkey: [0; MAX_PUBKEY_LEN],
+            pubkey_len: 0,
+        }
+    }
+}
+
+/// Copy a decoded record into a verification-key slot.
+fn fill_key(slot: &mut VerifyKey, rec: &auth_wire::KeyRecord<'_>) -> bool {
+    if rec.key_use != auth_wire::key_use::VERIFY {
+        return false;
+    }
+    if !auth_wire::suite::is_implemented(rec.suite) {
+        return false;
+    }
+    // ES256 accepts a SEC1 point (33 compressed / 65 uncompressed).
+    let ok_len = match rec.suite {
+        auth_wire::suite::ES256 => rec.key_ref.len() == 33 || rec.key_ref.len() == 65,
+        auth_wire::suite::ED25519 => rec.key_ref.len() == 32,
+        _ => false,
+    };
+    if !ok_len
+        || rec.key_ref.len() > MAX_PUBKEY_LEN
+        || rec.issuer.is_empty()
+        || rec.issuer.len() > MAX_ISSUER_LEN
+        || rec.kid.is_empty()
+        || rec.kid.len() > MAX_KID_LEN
+    {
+        return false;
+    }
+    *slot = VerifyKey::empty();
+    slot.live = true;
+    slot.issuer[..rec.issuer.len()].copy_from_slice(rec.issuer);
+    slot.kid[..rec.kid.len()].copy_from_slice(rec.kid);
+    slot.pubkey[..rec.key_ref.len()].copy_from_slice(rec.key_ref);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "all three lengths bounded immediately above"
+    )]
+    {
+        slot.issuer_len = rec.issuer.len() as u8;
+        slot.kid_len = rec.kid.len() as u8;
+        slot.pubkey_len = rec.key_ref.len() as u8;
+    }
+    slot.profile_id = rec.profile_id;
+    slot.suite = rec.suite;
+    slot.state = rec.state;
+    slot.generation = rec.generation;
+    slot.remove_after_unix = rec.remove_after_unix;
+    true
+}
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_requests: i32, // in[0]: MSG_VERIFY_REQ
     out_results: i32, // out[0]: MSG_VERIFY_RESP
-    in_key: i32,      // in[1]: MSG_VERIFY_KEY
+    in_key: i32,      // in[1]: MSG_KEY_ADD
 
     /// SEC1 public point (ES256) or 32-byte public key (Ed25519).
-    /// Valid iff `has_key`; interpreted per `key_alg`.
-    pubkey: [u8; MAX_PUBKEY_LEN],
-    pubkey_len: u8,
-    /// `auth_wire::MINT_ALG_*` of the loaded key.
-    key_alg: u8,
-    has_key: bool,
+    /// The keyset, indexed by `(issuer, profile_id, kid)`.
+    ///
+    /// More than one key, which is what makes rotation possible: a token
+    /// signed under a retired key keeps verifying until that key's removal
+    /// deadline, so credentials already in flight are not invalidated the
+    /// moment a new key is activated. The predecessor held exactly one
+    /// public key and overwrote it, and discarded the `kid` it was
+    /// delivered with — so nothing could be indexed and every token was
+    /// checked against whichever key happened to have arrived last.
+    keys: [VerifyKey; MAX_KEYS],
 
     // Metrics (names mirror manifest [observability])
     verify_ok: u32,
@@ -130,10 +225,7 @@ pub extern "C" fn module_new(
         s.out_results = out_chan;
         s.in_key = dev_channel_port(sys, 0, 1);
 
-        s.pubkey = [0; MAX_PUBKEY_LEN];
-        s.pubkey_len = 0;
-        s.key_alg = 0;
-        s.has_key = false;
+        s.keys = [VerifyKey::empty(); MAX_KEYS];
         s.verify_ok = 0;
         s.verify_bad_sig = 0;
         s.verify_expired = 0;
@@ -182,7 +274,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Drain `verify_key`, keeping the latest valid MSG_VERIFY_KEY
+/// Drain `verify_key`, keeping the key lifecycle into the keyset
 /// (`[alg u8][kid_len u8][kid][pubkey_len u8][pubkey]`).
 ///
 /// # Safety
@@ -194,45 +286,126 @@ unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_key < 0 {
         return;
     }
-    for _ in 0..4 {
+    for _ in 0..8 {
         if !chan::can_read(sys, s.in_key) {
             break;
         }
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 8192];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
-        if msg_type != auth_wire::MSG_VERIFY_KEY {
-            continue;
+        let payload = &buf[..plen as usize];
+        match msg_type {
+            auth_wire::MSG_KEY_ADD => {
+                if let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) {
+                    // Re-adding the same (issuer, profile, kid) replaces it
+                    // rather than consuming a second slot.
+                    let idx = find_key(s, rec.issuer, rec.profile_id, rec.kid)
+                        .or_else(|| s.keys.iter().position(|k| !k.live));
+                    if let Some(i) = idx {
+                        let mut slot = VerifyKey::empty();
+                        if fill_key(&mut slot, &rec) {
+                            s.keys[i] = slot;
+                        }
+                    }
+                }
+            }
+            auth_wire::MSG_KEYSET_SNAPSHOT => {
+                let mut r = PayloadReader::new(payload);
+                let Ok(count) = r.u16() else { continue };
+                if usize::from(count) > MAX_KEYS {
+                    continue;
+                }
+                let mut fresh = [VerifyKey::empty(); MAX_KEYS];
+                let mut ok = true;
+                for slot in fresh.iter_mut().take(usize::from(count)) {
+                    match auth_wire::KeyRecord::read(&mut r) {
+                        Ok(rec) if fill_key(slot, &rec) => {}
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                // All or nothing. A half-applied snapshot would leave the
+                // verifier holding a set neither end believes in — and the
+                // keys it dropped are the ones live tokens need.
+                if ok {
+                    s.keys = fresh;
+                }
+            }
+            auth_wire::MSG_KEY_ACTIVATE => {
+                if let Ok(kr) = auth_wire::KeyRef::decode(payload) {
+                    if let Some(i) = find_key(s, kr.issuer, kr.profile_id, kr.kid) {
+                        s.keys[i].state = auth_wire::key_state::ACTIVE;
+                    }
+                }
+            }
+            auth_wire::MSG_KEY_RETIRE => {
+                if let Ok(kr) = auth_wire::KeyRef::decode(payload) {
+                    if let Some(i) = find_key(s, kr.issuer, kr.profile_id, kr.kid) {
+                        // A retired key keeps VERIFYING. That is the whole
+                        // point of the state: it stops signing new tokens
+                        // while the ones it already signed age out.
+                        s.keys[i].state = auth_wire::key_state::RETIRED;
+                        s.keys[i].remove_after_unix = kr.arg;
+                    }
+                }
+            }
+            auth_wire::MSG_KEY_REMOVE => {
+                if let Ok(kr) = auth_wire::KeyRef::decode(payload) {
+                    if let Some(i) = find_key(s, kr.issuer, kr.profile_id, kr.kid) {
+                        s.keys[i] = VerifyKey::empty();
+                    }
+                }
+            }
+            _ => {}
         }
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(alg), Ok(_kid), Ok(pubkey)) = (r.u8(), r.field8(), r.field8()) else {
-            continue;
-        };
-        // ES256 accepts a SEC1 point (33 compressed / 65 uncompressed);
-        // Ed25519 wants exactly the 32-byte public key.
-        let valid = match alg {
-            auth_wire::MINT_ALG_ES256 => pubkey.len() == 33 || pubkey.len() == 65,
-            auth_wire::MINT_ALG_ED25519 => pubkey.len() == 32,
-            _ => false,
-        };
-        if !valid || pubkey.len() > MAX_PUBKEY_LEN {
-            continue;
-        }
-        s.pubkey = [0; MAX_PUBKEY_LEN];
-        s.pubkey[..pubkey.len()].copy_from_slice(pubkey);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "bounded by MAX_PUBKEY_LEN (65)"
-        )]
-        {
-            s.pubkey_len = pubkey.len() as u8;
-        }
-        s.key_alg = alg;
-        s.has_key = true;
     }
 }
 
-/// Handle one MSG_VERIFY_REQ payload sitting in `s.msg_buf[..plen]`:
-/// `[corr u32][token f16]`.
+fn find_key(s: &ModuleState, issuer: &[u8], profile_id: u16, kid: &[u8]) -> Option<usize> {
+    for (i, k) in s.keys.iter().enumerate() {
+        if k.live
+            && k.profile_id == profile_id
+            && &k.issuer[..usize::from(k.issuer_len)] == issuer
+            && &k.kid[..usize::from(k.kid_len)] == kid
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Select the key a token names, by the `kid` in its JOSE header.
+///
+/// An unknown kid returns `None` and the token is refused. It is NOT
+/// checked against some other key: falling back to "whatever key we have"
+/// is what makes a kid decorative, and it means a token signed by a key
+/// the verifier never trusted can still be accepted if the header is
+/// ignored.
+///
+/// A key past its removal deadline is not selectable even while it is
+/// still in the table, so an operator that set a deadline gets it.
+fn select_key(s: &ModuleState, kid: &[u8], now: u64) -> Option<usize> {
+    for (i, k) in s.keys.iter().enumerate() {
+        if !k.live {
+            continue;
+        }
+        if k.remove_after_unix != 0 && now >= k.remove_after_unix {
+            continue;
+        }
+        if &k.kid[..usize::from(k.kid_len)] == kid {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Handle one `MSG_VERIFY_REQ` payload sitting in `s.msg_buf[..plen]`.
+///
+/// Returns a typed `VerifiedIdentity`, never claims JSON. The policy the
+/// credential must satisfy — audience, issuer, profile, assurance —
+/// travels in the request and is checked here, once, rather than by each
+/// caller afterwards in its own way.
 ///
 /// # Safety
 ///
@@ -246,24 +419,27 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     }
     let corr = u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
 
-    // A missing key is recoverable — the key may still arrive later — so
-    // it is reported before any parse of the request body.
-    if !s.has_key {
+    // An empty keyset is recoverable — keys may still arrive — so it is
+    // reported before any parse of the request body.
+    if !s.keys.iter().any(|k| k.live) {
         s.no_key_errors = s.no_key_errors.saturating_add(1);
-        reply(s, sys, corr, auth_wire::ST_NO_KEY, &[]);
+        refuse(s, sys, corr, auth_wire::verify_err::NO_KEY);
         return;
     }
 
-    let mut r = PayloadReader::new(&s.msg_buf[..plen]);
-    let (Ok(_corr), Ok(token)) = (r.u32(), r.field16()) else {
+    let mut req_buf = [0u8; MAX_CLAIMS_BYTES];
+    let req_len = plen.min(req_buf.len());
+    req_buf[..req_len].copy_from_slice(&s.msg_buf[..req_len]);
+    let Ok(req) = auth_wire::VerifyRequest::decode(&req_buf[..req_len]) else {
         s.verify_malformed = s.verify_malformed.saturating_add(1);
-        reply(s, sys, corr, auth_wire::ST_MALFORMED, &[]);
+        refuse(s, sys, corr, auth_wire::verify_err::MALFORMED);
         return;
     };
+    let token = req.credential;
 
     let Some(jws) = jose::Jws::split(token) else {
         s.verify_malformed = s.verify_malformed.saturating_add(1);
-        reply(s, sys, corr, auth_wire::ST_MALFORMED, &[]);
+        refuse(s, sys, corr, auth_wire::verify_err::MALFORMED);
         return;
     };
 
@@ -271,15 +447,46 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let mut sig = [0u8; 64];
     let sig_ok = b64::decode(jws.signature_b64, &mut sig) == Some(64);
 
-    let alg = s.key_alg;
-    let pubkey = &s.pubkey[..usize::from(s.pubkey_len)];
+    // Which key signed this is the token's own claim, in its header. It is
+    // looked up, never guessed: an unknown kid fails closed rather than
+    // falling through to whatever key is loaded.
+    let mut header_json = [0u8; 512];
+    let hdr_len = b64::decode(jws.header_b64, &mut header_json).unwrap_or(0);
+    let kid = jose::claim_str(&header_json[..hdr_len], b"kid").unwrap_or(b"");
+    // See `resource_gate`: a window check against a clock that reads 0
+    // concludes "not yet expired" for every credential ever issued.
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
+        s.verify_expired = s.verify_expired.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::NO_CLOCK);
+        return;
+    };
+    let Some(slot) = select_key(s, kid, now) else {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::UNKNOWN_KID);
+        return;
+    };
+
+    // The header's `alg` must agree with the suite the key was delivered
+    // under. A token is otherwise free to name an algorithm the key was
+    // never intended for, which is the algorithm-confusion class of bug.
+    let hdr_alg = jose::claim_str(&header_json[..hdr_len], b"alg").unwrap_or(b"");
+    let suite = s.keys[slot].suite;
+    if auth_wire::suite::from_jose_alg(hdr_alg) != suite {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::SUITE_MISMATCH);
+        return;
+    }
+
+    let pubkey_bytes = s.keys[slot].pubkey;
+    let pubkey = &pubkey_bytes[..usize::from(s.keys[slot].pubkey_len)];
     let verified = sig_ok
-        && match alg {
-            auth_wire::MINT_ALG_ES256 => {
+        && match suite {
+            auth_wire::suite::ES256 => {
                 let hash = sha256(jws.signing_input);
                 ecdsa_verify(pubkey, &hash, &sig)
             }
-            auth_wire::MINT_ALG_ED25519 => match pubkey.try_into() {
+            auth_wire::suite::ED25519 => match pubkey.try_into() {
                 Ok(pk32) => ed25519_verify(pk32, jws.signing_input, &sig),
                 Err(_) => false,
             },
@@ -287,57 +494,149 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         };
     if !verified {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        reply(s, sys, corr, auth_wire::ST_BAD_SIGNATURE, &[]);
+        refuse(s, sys, corr, auth_wire::verify_err::BAD_SIGNATURE);
         return;
     }
 
-    // Signature is valid; now the token must be live. Decode the payload
-    // segment and range-check its iat/exp. A missing claim reads as 0,
-    // which `within_window` treats as out-of-window (fail closed). A
-    // payload larger than the decode buffer (`b64::decode` → None) also
-    // fails closed. On success the decoded claims are returned so the
-    // caller can authorize on iss/aud/scope/custom claims.
+    // Signature is valid; now the token must be live and must satisfy the
+    // policy the request named. Decoding the payload is this module's job
+    // because it already had to: doing it here once, and handing back typed
+    // fields, is what stops every consumer re-parsing attacker-controlled
+    // JSON to decide who somebody is.
     let mut payload_json = [0u8; MAX_CLAIMS_BYTES];
     let Some(payload_len) = b64::decode(jws.payload_b64, &mut payload_json) else {
-        s.verify_expired = s.verify_expired.saturating_add(1);
-        reply(s, sys, corr, auth_wire::ST_EXPIRED, &[]);
+        s.verify_malformed = s.verify_malformed.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::MALFORMED);
         return;
     };
     let json = &payload_json[..payload_len];
     let iat = jose::claim_u64(json, b"iat").unwrap_or(0);
     let exp = jose::claim_u64(json, b"exp").unwrap_or(0);
-    let now = dev_unix_millis(sys) / 1000;
     if !jose::within_window(now, iat, exp, CLOCK_SKEW_SECS) {
         s.verify_expired = s.verify_expired.saturating_add(1);
-        reply(s, sys, corr, auth_wire::ST_EXPIRED, &[]);
+        refuse(s, sys, corr, auth_wire::verify_err::EXPIRED);
         return;
     }
 
+    let issuer = jose::claim_str(json, b"iss").unwrap_or(b"");
+    let subject = jose::claim_str(json, b"sub").unwrap_or(b"");
+    let audience = jose::claim_str(json, b"aud").unwrap_or(b"");
+    let scope = jose::claim_str(json, b"scope").unwrap_or(b"");
+    let credential_id = jose::claim_str(json, b"jti").unwrap_or(b"");
+
+    // The policy checks, in one place. Each was previously the caller's
+    // job, and an audience check written five times is an audience check
+    // that is subtly different five times.
+    //
+    // An empty expectation means "no rule", which a caller states by
+    // writing it — not by forgetting a field.
+    if !req.expected_issuer.is_empty() && issuer != req.expected_issuer {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::WRONG_ISSUER);
+        return;
+    }
+    if !req.expected_audience.is_empty() && audience != req.expected_audience {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::WRONG_AUDIENCE);
+        return;
+    }
+    if req.expected_profile != auth_wire::suite::profile::NONE
+        && req.expected_profile != s.keys[slot].profile_id
+    {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::WRONG_PROFILE);
+        return;
+    }
+
+    // A `cnf.jkt` binding is what makes a credential non-bearer, so a
+    // credential that carries one was authenticated to proof-of-possession
+    // and one that does not was not. Reported rather than assumed: the
+    // caller's floor is checked against what the credential actually says.
+    let cnf = jose::claim_str(json, b"cnf").unwrap_or(b"");
+    let jkt = jose::claim_str(json, b"jkt").unwrap_or(b"");
+    let bound = !jkt.is_empty() || !cnf.is_empty();
+    let (level, methods) = if bound {
+        (
+            auth_wire::assurance::PROOF_OF_POSSESSION,
+            auth_wire::auth_method::PROOF_OF_POSSESSION,
+        )
+    } else {
+        (auth_wire::assurance::SINGLE_FACTOR, 0u16)
+    };
+    if level < req.min_assurance {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
+        return;
+    }
+
+    let kid_bytes = s.keys[slot].kid;
+    let kid_out = &kid_bytes[..usize::from(s.keys[slot].kid_len)];
+    let identity = auth_wire::VerifiedIdentity {
+        correlation: corr,
+        status: auth_wire::verify_err::OK,
+        profile_id: s.keys[slot].profile_id,
+        issuer,
+        kid: kid_out,
+        suite,
+        subject,
+        thumbprint_alg: if jkt.is_empty() {
+            auth_wire::suite::thumbprint::NONE
+        } else {
+            auth_wire::suite::thumbprint::JWK_SHA256
+        },
+        key_thumbprint: jkt,
+        audience,
+        scope,
+        issued_at: iat,
+        expires_at: exp,
+        // Absent `auth_time` falls back to `iat`. A re-issue that carries
+        // one gets the real authentication instant; one that does not is
+        // reported as authenticated when it was issued, which is the most
+        // a credential that says nothing else can support.
+        auth_time: jose::claim_u64(json, b"auth_time").unwrap_or(iat),
+        assurance: level,
+        auth_methods: methods,
+        credential_id,
+        // Empty: this module does not record replays. `device_auth` does,
+        // for the credentials presented with a proof, and reporting an id
+        // here that nothing had recorded would be a claim about state this
+        // module does not hold.
+        replay_id: &[],
+        // The raw payload, for a consumer that needs an application claim.
+        // NOT an authorization input — everything a decision is made on is
+        // above, typed.
+        application: json,
+    };
+
     s.verify_ok = s.verify_ok.saturating_add(1);
-    // `json` borrows `payload_json` (a local), disjoint from `s`.
-    reply(s, sys, corr, auth_wire::ST_OK, json);
+    emit(s, sys, &identity);
 }
 
-/// Emit MSG_VERIFY_RESP = `[corr u32][status u8][claims f16]`. `claims` is
-/// the decoded JWS payload JSON on `ST_OK`, empty otherwise.
+/// Emit a `MSG_VERIFY_RESP`.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn reply(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8, claims: &[u8]) {
-    // corr(4) + status(1) + f16 length(2) + claims.
-    let mut payload = [0u8; 7 + MAX_CLAIMS_BYTES];
-    let mut w = PayloadWriter::new(&mut payload);
-    let _ = w.u32(corr);
-    let _ = w.u8(status);
-    let _ = w.field16(claims);
-    let n = w.len();
-    chan::channel_write_msg(
-        sys,
-        s.out_results,
-        auth_wire::MSG_VERIFY_RESP,
-        &payload[..n],
-    );
+unsafe fn emit(s: &mut ModuleState, sys: &SyscallTable, id: &auth_wire::VerifiedIdentity<'_>) {
+    let mut framed = [0u8; MAX_CLAIMS_BYTES + 512];
+    let Ok(n) = id.encode(&mut framed) else {
+        return;
+    };
+    // `encode` writes the whole envelope; hand the channel the payload so
+    // it is not wrapped in a second one.
+    let Ok((_, payload)) = auth_wire::read_envelope(&framed[..n]) else {
+        return;
+    };
+    chan::channel_write_msg(sys, s.out_results, auth_wire::MSG_VERIFY_RESP, payload);
+}
+
+/// Emit a refusal, which carries no identity.
+///
+/// # Safety
+///
+/// As [`emit`].
+unsafe fn refuse(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
+    emit(s, sys, &auth_wire::VerifiedIdentity::refused(corr, status));
 }

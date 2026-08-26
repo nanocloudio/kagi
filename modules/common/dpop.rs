@@ -94,43 +94,100 @@ pub fn check_proof(
     Ok(ProofFacts { jti_digest, iat })
 }
 
-/// A bounded replay window over `jti` digests — a fixed-size ring that holds
-/// the most recent `N` seen digests. `check_and_record` returns `true` if the
-/// digest is new (and records it), `false` if it is a replay of one still in
-/// the window. Sized so its coverage exceeds the proof freshness window: a
-/// proof older than `max_age` is rejected by [`check_proof`] regardless, so an
-/// attacker cannot outrun the ring with stale proofs.
+/// The outcome of offering a proof to the replay window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Replay {
+    /// New, and recorded.
+    Recorded,
+    /// Already seen inside its freshness window.
+    Seen,
+    /// The window is full of entries that are all still fresh.
+    ///
+    /// A refusal, and a DIFFERENT one from `Seen`: the caller refuses either
+    /// way, but an operator needs to tell "somebody replayed a proof" from
+    /// "the window is saturated", because the second means the deployment is
+    /// under a load its window cannot cover and the first does not.
+    Full,
+}
+
+/// A bounded replay window over `jti` digests.
+///
+/// # Why this fails closed instead of evicting
+///
+/// It used to be a plain ring: `next = (next + 1) % N`, overwriting the
+/// oldest entry when full. The argument written here was that the ring was
+/// "sized so its coverage exceeds the proof freshness window", so an evicted
+/// entry's proof would already be too old to reuse.
+///
+/// **That argument did not hold at the sizes actually deployed.** Every
+/// consumer used `N = 128` against a `proof_max_age_secs` of 300. An
+/// attacker sending 129 distinct proofs inside those five minutes — fewer
+/// than one per second — evicted the earliest entry, whose proof was still
+/// comfortably inside its own freshness window and could then be replayed.
+/// The ring could be outrun by anyone who could make a request.
+///
+/// A slot is now reusable only once the proof it holds has aged past its own
+/// freshness window, at which point `check_proof` would refuse that proof
+/// anyway and forgetting it costs nothing. When no slot has aged out, the
+/// window answers [`Replay::Full`] and the caller refuses. An eviction under
+/// load is an admission under load, so the load has to be what breaks.
 pub struct ReplayWindow<const N: usize> {
     digests: [[u8; 32]; N],
-    /// Number of live entries (until the ring first fills).
-    len: usize,
-    /// Next write position (wraps at N).
-    next: usize,
+    /// When each entry stops mattering: the proof's `iat` plus the freshness
+    /// window it was checked under. `0` marks a free slot.
+    ///
+    /// Held per entry rather than derived, because the window a proof was
+    /// checked under is a property of the policy that admitted it, and a
+    /// policy change must not retroactively shorten what is remembered.
+    expires_at: [u64; N],
 }
 
 impl<const N: usize> ReplayWindow<N> {
     pub const fn new() -> Self {
         Self {
             digests: [[0u8; 32]; N],
-            len: 0,
-            next: 0,
+            expires_at: [0u64; N],
         }
     }
 
-    /// Record `digest` if unseen; return `true` when newly recorded, `false`
-    /// on replay.
-    pub fn check_and_record(&mut self, digest: &[u8; 32]) -> bool {
-        for existing in &self.digests[..self.len] {
-            if existing == digest {
-                return false;
+    /// Offer `digest` to the window.
+    ///
+    /// `expires_at` is when this proof stops being replayable — its `iat`
+    /// plus the freshness window it was checked under. `now` is the current
+    /// time in seconds.
+    pub fn offer(&mut self, digest: &[u8; 32], now: u64, expires_at: u64) -> Replay {
+        let mut free: Option<usize> = None;
+        for i in 0..N {
+            let live = self.expires_at[i] != 0 && now < self.expires_at[i];
+            if live {
+                if self.digests[i] == *digest {
+                    return Replay::Seen;
+                }
+            } else if free.is_none() {
+                // A free slot, or one whose proof has aged past the point
+                // where `check_proof` would accept it anyway.
+                free = Some(i);
             }
         }
-        self.digests[self.next] = *digest;
-        self.next = (self.next + 1) % N;
-        if self.len < N {
-            self.len += 1;
+        match free {
+            Some(i) => {
+                self.digests[i] = *digest;
+                self.expires_at[i] = expires_at;
+                Replay::Recorded
+            }
+            None => Replay::Full,
         }
-        true
+    }
+
+    /// How many entries are still live at `now`.
+    ///
+    /// For an operator gauge: a window sitting near `N` is one about to
+    /// start refusing, which is worth knowing before it does.
+    #[must_use]
+    pub fn live(&self, now: u64) -> usize {
+        (0..N)
+            .filter(|&i| self.expires_at[i] != 0 && now < self.expires_at[i])
+            .count()
     }
 }
 

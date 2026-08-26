@@ -26,6 +26,25 @@ direction = "input"
 content_type = "OctetStream"
 buffer_size = 512
 
+# The security-state ledger. A revocation marks the device there BEFORE its
+# bits reach the published document, because the document is a projection of
+# the ledger and not the authority: minting consults the ledger, and a
+# revocation that only ever reached the filter would be one the mint never
+# hears about.
+[[ports]]
+name = "state_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "state_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
 [observability]
 metrics = [
   "jwks_served",
@@ -33,5 +52,6 @@ metrics = [
   "jwks_not_found",
   "revocation_served",
   "revocation_recorded",
+  "revocation_uncommitted",
   "revocation_saturated",
 ]

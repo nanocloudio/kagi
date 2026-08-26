@@ -1,0 +1,46 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# One `HttpRequest` in, the same envelope out on one of three ports.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+
+[[ports]]
+name = "credential_out"
+direction = "output"
+content_type = "HttpRequest"
+buffer_size = 8192
+
+[[ports]]
+name = "keypkg_out"
+index = 1
+direction = "output"
+content_type = "HttpRequest"
+buffer_size = 8192
+
+[[ports]]
+name = "state_out"
+index = 2
+direction = "output"
+content_type = "HttpRequest"
+buffer_size = 8192
+
+# A path this router does not recognise is answered here rather than
+# forwarded: an unrouted request that simply vanished would leave the
+# connection open until the listener timed it out, which reads to a client as
+# a hung server rather than a 404.
+[[ports]]
+name = "response_out"
+index = 3
+direction = "output"
+content_type = "HttpResponse"
+buffer_size = 4096
+
+[observability]
+metrics = ["routed_credential", "routed_keypackage", "routed_state", "unrouted"]

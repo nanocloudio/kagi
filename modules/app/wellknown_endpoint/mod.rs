@@ -15,7 +15,7 @@
 //! this is.
 //!
 //! `GET /jwks` (or `/.well-known/jwks.json`) is answered with an RFC 7517
-//! JWK Set built from whatever keys have arrived — the same MSG_VERIFY_KEY
+//! JWK Set built from whatever keys have arrived — the same MSG_KEY_ADD
 //! frames `token_verify` and `resource_gate` take, so one key distribution
 //! reaches everything that needs it and there is no second shape to keep in
 //! step.
@@ -72,6 +72,8 @@ mod b64;
 mod chan;
 #[path = "../../common/jwk.rs"]
 mod jwk;
+#[path = "../../common/state_wire.rs"]
+mod state_wire;
 
 use auth_wire::PayloadReader;
 
@@ -110,7 +112,41 @@ const MAX_REQS_PER_STEP: usize = 4;
 /// A new message type rather than a reuse: a revocation is not a key and not
 /// a mint, and giving it its own tag means a frame delivered to the wrong
 /// channel is dropped rather than misread.
-const MSG_REVOKE: u8 = 0x51;
+use auth_wire::MSG_REVOKE;
+
+/// Revocations in flight at once.
+const MAX_REVOKING: usize = 4;
+
+/// A revocation waiting on the ledger.
+#[derive(Clone, Copy)]
+struct Revoking {
+    live: bool,
+    corr: u32,
+    /// `false` while the device record is being read, `true` while the
+    /// swap that marks it revoked is in flight.
+    swapping: bool,
+    id: [u8; MAX_ID],
+    id_len: u8,
+    etag: [u8; state_wire::MAX_ETAG],
+    etag_len: u8,
+}
+
+impl Revoking {
+    const fn zero() -> Self {
+        Self {
+            live: false,
+            corr: 0,
+            swapping: false,
+            id: [0u8; MAX_ID],
+            id_len: 0,
+            etag: [0u8; state_wire::MAX_ETAG],
+            etag_len: 0,
+        }
+    }
+}
+
+/// This module's client id on the ledger's shared reply port.
+const STATE_CLIENT: u8 = 4;
 
 /// Bitmap size in bits.
 ///
@@ -158,7 +194,8 @@ struct PublishedKey {
     kid_len: u8,
     pubkey: [u8; MAX_PUBKEY_LEN],
     pubkey_len: u8,
-    alg: u8,
+    /// The credential suite, from `auth_wire::suite`.
+    suite: u16,
     live: bool,
 }
 
@@ -169,7 +206,7 @@ impl PublishedKey {
             kid_len: 0,
             pubkey: [0; MAX_PUBKEY_LEN],
             pubkey_len: 0,
-            alg: 0,
+            suite: 0,
             live: false,
         }
     }
@@ -180,7 +217,13 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_requests: i32,   // in[0]:  HttpRequest
     out_responses: i32, // out[0]: HttpResponse
-    in_key: i32,        // in[1]:  MSG_VERIFY_KEY
+    in_key: i32,        // in[1]:  MSG_KEY_ADD
+    out_state: i32,     // out[1]: ledger requests
+    in_state: i32,      // in[2]:  ledger replies
+
+    /// Revocations that have reached the ledger but not yet the document.
+    revoking: [Revoking; MAX_REVOKING],
+    next_corr: u32,
 
     keys: [PublishedKey; MAX_KEYS],
     /// Where the next key lands once the set is full: oldest out first, so a
@@ -192,6 +235,15 @@ struct ModuleState {
     /// to learn that they revoked the same device.
     salt: [u8; 8],
     inserted: u32,
+    /// When the revocation document was last rebuilt, published in it.
+    ///
+    /// The one time reading in this module that stays on `dev_unix_millis`,
+    /// and deliberately: it is a freshness stamp a relying party reads to
+    /// decide whether to refetch, not an input to any decision made here. A
+    /// zero from a clockless platform makes the document look stale, which
+    /// is the safe direction — a consumer refetches. Every reading that
+    /// gates a credential went through `time_policy`, because there a zero
+    /// makes an expired thing look live.
     updated_at: u64,
 
     jwks_served: u32,
@@ -199,6 +251,7 @@ struct ModuleState {
     jwks_not_found: u32,
     revocation_served: u32,
     revocation_recorded: u32,
+    revocation_uncommitted: u32,
     revocation_saturated: u32,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -261,6 +314,11 @@ pub extern "C" fn module_new(
         s.jwks_not_found = 0;
         s.revocation_served = 0;
         s.revocation_recorded = 0;
+        s.revocation_uncommitted = 0;
+        s.out_state = dev_channel_port(sys, 1, 1);
+        s.in_state = dev_channel_port(sys, 0, 2);
+        s.revoking = [Revoking::zero(); MAX_REVOKING];
+        s.next_corr = 1;
         s.revocation_saturated = 0;
 
         dev_log(sys, 3, b"[wellknown] init".as_ptr(), 16);
@@ -278,6 +336,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Keys first, so a same-step request sees the latest set.
         drain_keys(s, sys);
+        // Then ledger replies, so a revocation whose commit came back this
+        // step reaches the document in the same step rather than the next.
+        drain_revocation_state(s, sys);
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
@@ -305,7 +366,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Take every MSG_VERIFY_KEY that has arrived.
+/// Take every MSG_KEY_ADD that has arrived.
 ///
 /// A key whose `kid` is already published replaces it in place rather than
 /// taking a second slot: re-announcing a key is how a deployment says "still
@@ -332,19 +393,63 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
             record_revocation(s, sys, &buf[..plen as usize]);
             continue;
         }
-        if msg_type != auth_wire::MSG_VERIFY_KEY {
+        // JWKS publishes verification keys, so it takes the key lifecycle
+        // rather than a single delivery. A REMOVE unpublishes; a RETIRE
+        // does NOT — a retired key still verifies credentials already
+        // issued under it, and dropping it from JWKS would make every one
+        // of them unverifiable to a relying party that fetches the set.
+        let payload = &buf[..plen as usize];
+        let rec = match msg_type {
+            auth_wire::MSG_KEY_ADD => match auth_wire::KeyRecord::decode_add(payload) {
+                Ok(rec) => rec,
+                Err(_) => continue,
+            },
+            auth_wire::MSG_KEY_REMOVE => {
+                if let Ok(kr) = auth_wire::KeyRef::decode(payload) {
+                    if let Some(i) = s
+                        .keys
+                        .iter()
+                        .position(|k| k.live && &k.kid[..usize::from(k.kid_len)] == kr.kid)
+                    {
+                        s.keys[i] = PublishedKey::empty();
+                    }
+                }
+                continue;
+            }
+            auth_wire::MSG_KEYSET_SNAPSHOT => {
+                let mut r = PayloadReader::new(payload);
+                let Ok(count) = r.u16() else { continue };
+                if usize::from(count) > MAX_KEYS {
+                    continue;
+                }
+                let mut fresh = [PublishedKey::empty(); MAX_KEYS];
+                let mut ok = true;
+                for slot in fresh.iter_mut().take(usize::from(count)) {
+                    match auth_wire::KeyRecord::read(&mut r) {
+                        Ok(rec) if fill_published(slot, &rec) => {}
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    s.keys = fresh;
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let (kid, pubkey, suite) = (rec.kid, rec.key_ref, rec.suite);
+        if rec.key_use != auth_wire::key_use::VERIFY {
             continue;
         }
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(alg), Ok(kid), Ok(pubkey)) = (r.u8(), r.field8(), r.field8()) else {
-            continue;
-        };
-        let valid = match alg {
-            auth_wire::MINT_ALG_ES256 => pubkey.len() == 33 || pubkey.len() == 65,
-            auth_wire::MINT_ALG_ED25519 => pubkey.len() == 32,
+        let valid = match suite {
+            auth_wire::suite::ES256 => pubkey.len() == 33 || pubkey.len() == 65,
+            auth_wire::suite::ED25519 => pubkey.len() == 32,
             _ => false,
         };
-        if !valid || kid.len() > MAX_KID || pubkey.len() > MAX_PUBKEY_LEN {
+        if !valid || kid.is_empty() || kid.len() > MAX_KID || pubkey.len() > MAX_PUBKEY_LEN {
             continue;
         }
 
@@ -375,10 +480,40 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
             key.kid_len = kid.len() as u8;
             key.pubkey_len = pubkey.len() as u8;
         }
-        key.alg = alg;
+        key.suite = suite;
         key.live = true;
         s.keys[slot] = key;
     }
+}
+
+/// Copy a decoded record into a published-key slot.
+fn fill_published(slot: &mut PublishedKey, rec: &auth_wire::KeyRecord<'_>) -> bool {
+    if rec.key_use != auth_wire::key_use::VERIFY {
+        return false;
+    }
+    let valid = match rec.suite {
+        auth_wire::suite::ES256 => rec.key_ref.len() == 33 || rec.key_ref.len() == 65,
+        auth_wire::suite::ED25519 => rec.key_ref.len() == 32,
+        _ => false,
+    };
+    if !valid || rec.kid.is_empty() || rec.kid.len() > MAX_KID || rec.key_ref.len() > MAX_PUBKEY_LEN
+    {
+        return false;
+    }
+    *slot = PublishedKey::empty();
+    slot.kid[..rec.kid.len()].copy_from_slice(rec.kid);
+    slot.pubkey[..rec.key_ref.len()].copy_from_slice(rec.key_ref);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both lengths bounded immediately above"
+    )]
+    {
+        slot.kid_len = rec.kid.len() as u8;
+        slot.pubkey_len = rec.key_ref.len() as u8;
+    }
+    slot.suite = rec.suite;
+    slot.live = true;
+    true
 }
 
 /// Record one MSG_REVOKE frame (`[id f8]`).
@@ -396,7 +531,62 @@ unsafe fn record_revocation(s: &mut ModuleState, sys: &SyscallTable, payload: &[
     }
     let mut id = [0u8; MAX_ID];
     id[..len].copy_from_slice(&payload[1..=len]);
-    insert(s, &id[..len]);
+
+    // The ledger first, the document second.
+    //
+    // The Bloom filter is a projection of the ledger and not the authority:
+    // minting consults the ledger, so a revocation that only ever reached the
+    // filter would be one the mint never hears about — and the document would
+    // be claiming a revocation the system does not actually hold. Publishing
+    // second means the two can never disagree in that direction.
+    if s.out_state < 0 {
+        // No ledger. The bits are still set, because dropping a revocation is
+        // the unsafe direction, but the divergence is counted rather than
+        // hidden: this document now claims something the mint cannot see.
+        s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+        publish_revocation(s, sys, &id[..len]);
+        return;
+    }
+    let corr = s.next_corr;
+    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    let request = state_wire::get(corr, STATE_CLIENT, state_wire::NS_DEVICE, &id[..len]);
+    let mut frame = [0u8; 256];
+    let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_GET, &request) else {
+        s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+        publish_revocation(s, sys, &id[..len]);
+        return;
+    };
+    let Ok((wire_type, body)) = auth_wire::read_envelope(&frame[..n]) else {
+        return;
+    };
+    let Some(slot) = s.revoking.iter().position(|r| !r.live) else {
+        s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+        publish_revocation(s, sys, &id[..len]);
+        return;
+    };
+    if chan::channel_write_msg(sys, s.out_state, wire_type, body) <= 0 {
+        s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+        publish_revocation(s, sys, &id[..len]);
+        return;
+    }
+    let mut entry = Revoking::zero();
+    entry.live = true;
+    entry.corr = corr;
+    entry.id[..len].copy_from_slice(&id[..len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_ID")]
+    {
+        entry.id_len = len as u8;
+    }
+    s.revoking[slot] = entry;
+}
+
+/// Set the identifier's bits and stamp the document.
+///
+/// # Safety
+///
+/// As `record_revocation`.
+unsafe fn publish_revocation(s: &mut ModuleState, sys: &SyscallTable, id: &[u8]) {
+    insert(s, id);
     s.updated_at = dev_unix_millis(sys) / 1000;
     s.revocation_recorded = s.revocation_recorded.saturating_add(1);
     s.inserted = s.inserted.saturating_add(1);
@@ -405,6 +595,136 @@ unsafe fn record_revocation(s: &mut ModuleState, sys: &SyscallTable, payload: &[
         // claims. Counted rather than refused: dropping a revocation would be
         // the unsafe direction.
         s.revocation_saturated = s.revocation_saturated.saturating_add(1);
+    }
+}
+
+/// Drain ledger replies: mark the device revoked, then publish.
+///
+/// # Safety
+///
+/// As `record_revocation`.
+unsafe fn drain_revocation_state(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_state < 0 {
+        return;
+    }
+    while chan::can_read(sys, s.in_state) {
+        let mut buf = [0u8; 1024];
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_state, &mut buf);
+        if msg_type == 0 {
+            break;
+        }
+        let Ok(reply) = state_wire::StateReply::decode(msg_type, &buf[..plen as usize]) else {
+            continue;
+        };
+        if reply.client != STATE_CLIENT {
+            continue;
+        }
+        let Some(slot) = s
+            .revoking
+            .iter()
+            .position(|r| r.live && r.corr == reply.correlation)
+        else {
+            continue;
+        };
+        let entry = s.revoking[slot];
+        s.revoking[slot] = Revoking::zero();
+        let id_len = usize::from(entry.id_len);
+        let mut id = [0u8; MAX_ID];
+        id[..id_len].copy_from_slice(&entry.id[..id_len]);
+
+        if entry.swapping {
+            // The swap came back. Whatever it says, the document is published
+            // now — a revocation the operator asked for is not dropped.
+            if reply.status != auth_wire::ST_OK {
+                s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+            }
+            publish_revocation(s, sys, &id[..id_len]);
+            continue;
+        }
+
+        if reply.status != auth_wire::ST_OK {
+            // No such device. Revoking an identifier the ledger never held is
+            // not an error — an operator may be revoking something issued
+            // before this ledger existed — but the mint will never see it, so
+            // it is counted.
+            s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+            publish_revocation(s, sys, &id[..id_len]);
+            continue;
+        }
+
+        // Rewrite the record with `"status":"revoked"`, conditional on the
+        // revision just read. The revoked record keeps its identity rather
+        // than being deleted: history is what makes a revocation auditable.
+        let mut value = [0u8; 256];
+        let mut at = 0usize;
+        let src = reply.value;
+        // Splice the status in ahead of the record's first member, so the
+        // rest of the certificate's claims survive untouched.
+        if src.first() == Some(&b'{') && src.len() + 24 < value.len() {
+            // Byte loops rather than `copy_from_slice`: the lengths are equal
+            // by construction, but the compiler cannot fold that away, and
+            // the panic path it emits for a mismatch links against a symbol
+            // this `no_std` PIC build does not have.
+            value[at] = b'{';
+            at += 1;
+            const STATUS: &[u8] = br#""status":"revoked","#;
+            let mut i = 0usize;
+            while i < STATUS.len() {
+                value[at] = STATUS[i];
+                at += 1;
+                i += 1;
+            }
+            let mut j = 1usize;
+            while j < src.len() {
+                value[at] = src[j];
+                at += 1;
+                j += 1;
+            }
+        } else {
+            // The stored record was not an object this build can splice
+            // into. A minimal record still marks the device revoked, which is
+            // the fact the mint reads; the claims it loses are already
+            // published in the certificate itself.
+            const MINIMAL: &[u8] = br#"{"status":"revoked"}"#;
+            let mut i = 0usize;
+            while i < MINIMAL.len() {
+                value[i] = MINIMAL[i];
+                i += 1;
+            }
+            at = MINIMAL.len();
+        }
+
+        let corr = s.next_corr;
+        s.next_corr = s.next_corr.wrapping_add(1).max(1);
+        let request = state_wire::compare_and_swap(
+            corr,
+            STATE_CLIENT,
+            state_wire::NS_DEVICE,
+            &id[..id_len],
+            reply.etag,
+            &value[..at],
+            0,
+        );
+        let mut frame = [0u8; 512];
+        let sent = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_CAS, &request)
+            .ok()
+            .and_then(|n| auth_wire::read_envelope(&frame[..n]).ok())
+            .is_some_and(|(t, b)| chan::channel_write_msg(sys, s.out_state, t, b) > 0);
+        if !sent {
+            s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+            publish_revocation(s, sys, &id[..id_len]);
+            continue;
+        }
+        let Some(next_slot) = s.revoking.iter().position(|r| !r.live) else {
+            s.revocation_uncommitted = s.revocation_uncommitted.saturating_add(1);
+            publish_revocation(s, sys, &id[..id_len]);
+            continue;
+        };
+        let mut next = entry;
+        next.live = true;
+        next.swapping = true;
+        next.corr = corr;
+        s.revoking[next_slot] = next;
     }
 }
 
@@ -615,8 +935,8 @@ fn write_key(key: &PublishedKey, out: &mut [u8]) -> Option<usize> {
     let mut record = jwk::JwkRecord::new();
     record.kid = jwk::Field::set(&key.kid[..usize::from(key.kid_len)]).ok()?;
     let pubkey = &key.pubkey[..usize::from(key.pubkey_len)];
-    match key.alg {
-        auth_wire::MINT_ALG_ED25519 => {
+    match key.suite {
+        auth_wire::suite::ED25519 => {
             record.kty = jwk::Field::set(b"OKP").ok()?;
             record.crv = jwk::Field::set(b"Ed25519").ok()?;
             record.alg = jwk::Field::set(b"EdDSA").ok()?;
@@ -624,7 +944,7 @@ fn write_key(key: &PublishedKey, out: &mut [u8]) -> Option<usize> {
             let n = b64::encode(pubkey, &mut x)?;
             record.x = jwk::Field::set(&x[..n]).ok()?;
         }
-        auth_wire::MINT_ALG_ES256 => {
+        auth_wire::suite::ES256 => {
             record.kty = jwk::Field::set(b"EC").ok()?;
             record.crv = jwk::Field::set(b"P-256").ok()?;
             record.alg = jwk::Field::set(b"ES256").ok()?;

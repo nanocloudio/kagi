@@ -1,0 +1,49 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# bcm2712 only. The wasm object provider refuses every conditional write, so
+# a browser build of this module could answer nothing but ST_UNAVAILABLE —
+# and a store that cannot be conditional is not this module. A browser-hosted
+# kagi verifies credentials; it does not hold the authority's ledger.
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "replies"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + VALUE header (corr 4 + client 1 + status 1) + etag f8
+# (1 + 64) + value f16 (2 + 2048).
+max_record = 4096
+
+# The durable ledger. `storage.object` is required, not optional: this module
+# refuses service when no provider answers rather than degrading to memory,
+# because a security-state store that silently forgets is worse than one that
+# says it is absent.
+#
+# On Linux the conditional-write provider is the versioned store, which is
+# active only when `FLUXOR_STORE_DIR` is set. That is an environment
+# variable rather than a graph declaration, so a deployment that forgets it
+# gets the HTTP-backed object provider whose PUT is unimplemented — the
+# start-up probe below turns that into a refusal instead of a surprise.
+[[resources]]
+requires_contract = "storage.object"
+access = "write"
+
+[observability]
+metrics = [
+    "state_get",
+    "state_put_absent",
+    "state_cas",
+    "state_delete",
+    "state_conflict",
+    "state_unavailable",
+    "state_malformed",
+]

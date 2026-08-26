@@ -1,0 +1,51 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The upgrade decision, back to wave's `http` (its in[7]).
+[[ports]]
+name = "admit_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The verified peer identity, from fluxor's `tls` module.
+#
+# This is the only evidence the gate has. wave's `http` sits ABOVE whatever
+# terminated TLS and its admission record deliberately carries no transport
+# facts — no peer address, no "secure" flag — so the peer's identity has to
+# arrive on its own edge and be correlated by connection id.
+[[ports]]
+name = "peer_in"
+index = 0
+direction = "input"
+content_type = "OctetStream"
+
+# The upgrade request, from wave's `http` (its out[7]).
+[[ports]]
+name = "admit_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+# Connection lifecycle, from wave's `http` (its out[8]). A close releases the
+# connection's latched identity; without it the table fills with identities
+# for connections that are long gone.
+[[ports]]
+name = "event_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+metrics = [
+    "admit_granted",
+    "admit_refused_unverified",
+    "admit_refused_not_allowed",
+    "admit_refused_path",
+    "admit_refused_timeout",
+    "peer_identities",
+]

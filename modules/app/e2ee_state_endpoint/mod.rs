@@ -28,12 +28,20 @@
 //! is what an optimistic retry after an ambiguous failure looks like. Both
 //! are refused; only one is evidence that something is wrong.
 //!
-//! The host store this replaces kept a separate high-water mark, written to
-//! its own file after the state, so that restoring a backup of the state file
-//! alone would be caught. Module-resident state has no second file to fall
-//! out of step with — the mark would live in the same memory as the state it
-//! attests to, and could not disagree with it. So the furthest position ever
-//! reached IS the committed marker here, and the check is against that.
+//! There is no separate high-water mark. A store that keeps its state in a
+//! file wants one in a second file, so that restoring a backup of the first
+//! alone is caught by the second; here the state lives in this module's own
+//! memory, where a mark would sit in the same memory as the state it attests
+//! to and could never disagree with it. The committed marker IS the furthest
+//! position ever reached, and the check is against that.
+//!
+//! **What that does not survive is a restart.** The table is memory and
+//! nothing else: a module that restarts comes back with every endpoint at
+//! revision 0 and no marker, and will accept a first commit at any position
+//! — including one already used. Nothing here can detect that, because the
+//! evidence went with the state. An endpoint whose module has restarted must
+//! rejoin the group rather than resume, and a deployment that cannot promise
+//! a restart is rare needs the marker somewhere that outlives the module.
 //!
 //! Two paths:
 //!
@@ -59,6 +67,11 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -66,8 +79,18 @@ mod auth_wire;
 mod b64;
 #[path = "../../common/chan.rs"]
 mod chan;
+#[path = "../../common/device_auth.rs"]
+mod device_auth;
+#[path = "../../common/dpop.rs"]
+mod dpop;
 #[path = "../../common/jose.rs"]
 mod jose;
+#[path = "../../common/jwk.rs"]
+mod jwk;
+#[path = "../../common/time_policy.rs"]
+mod time_policy;
+#[path = "../../common/verify_keyset.rs"]
+mod verify_keyset;
 
 const STEP_DID_WORK: i32 = 2;
 const REQ_HDR: usize = 12;
@@ -142,10 +165,29 @@ impl Endpoint {
     }
 }
 
+/// How long a DPoP proof stays fresh, and therefore how long its `jti`
+/// must be remembered.
+///
+/// One constant for both, because they are one number: remembering a proof
+/// for less than its freshness window leaves a replayable gap, and
+/// remembering it for longer wastes a slot on a proof `check_proof` would
+/// refuse anyway.
+const PROOF_WINDOW_SECS: u64 = 300;
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_requests: i32,
+    in_verify_key: i32,
+
+    /// The issuer keyset. More than one key, indexed by the `kid` a
+    /// credential names — see `verify_keyset.rs` for why a single
+    /// overwritten key made rotation destructive here.
+    keyset: verify_keyset::Keyset,
+    replay: dpop::ReplayWindow<128>,
+
+    state_unauthenticated: u32,
+    state_not_owner: u32,
     out_responses: i32,
 
     endpoints: [Endpoint; MAX_ENDPOINTS],
@@ -198,6 +240,11 @@ pub extern "C" fn module_new(
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
         s.in_requests = in_chan;
+        s.in_verify_key = dev_channel_port(sys, 0, 1);
+        s.keyset = verify_keyset::Keyset::new();
+        s.replay = dpop::ReplayWindow::new();
+        s.state_unauthenticated = 0;
+        s.state_not_owner = 0;
         s.out_responses = out_chan;
         s.endpoints = [Endpoint::empty(); MAX_ENDPOINTS];
         s.state_loaded = 0;
@@ -220,6 +267,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+
+        drain_verify_key(s, sys);
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
@@ -282,10 +331,52 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     }
 
+    // ── who is asking about whose state ──────────────────────────────────
+    //
+    // This endpoint held the high-water mark that makes rollback detectable
+    // and served it to anyone: a load returned another party's state and a
+    // commit advanced it. It is the one endpoint where exposure is least
+    // acceptable, because the state it holds is what a rollback attack has to
+    // defeat — and it was the one with no authentication at all.
+    let mut route = [0u8; MAX_KEY];
+    let route_len = path_len.min(MAX_KEY);
+    route[..route_len].copy_from_slice(&s.buf[REQ_HDR..REQ_HDR + route_len]);
+    let Some(device) = authenticate(s, sys, conn, stream, &route[..route_len], body_at) else {
+        return;
+    };
+
     if loading {
-        load(s, sys, conn, stream, body_at, body_end);
+        load(s, sys, conn, stream, body_at, body_end, &device);
     } else {
-        commit(s, sys, conn, stream, body_at, body_end);
+        commit(s, sys, conn, stream, body_at, body_end, &device);
+    }
+}
+
+/// The device a verified certificate names.
+#[derive(Clone, Copy)]
+struct AuthenticatedDevice {
+    id: [u8; MAX_KEY],
+    len: usize,
+}
+
+impl AuthenticatedDevice {
+    fn as_bytes(&self) -> &[u8] {
+        &self.id[..self.len]
+    }
+
+    /// Whether `key` is state this device owns.
+    ///
+    /// Ownership is a prefix rule: an endpoint key belongs to the device
+    /// whose id it starts with. That lets one device hold several endpoints
+    /// — one per group it is in — without needing a registry, while keeping
+    /// every one of them out of reach of anybody else.
+    ///
+    /// This is what closes both the cross-device read and the deliberate
+    /// poisoning: only the owner can trip its own ratchet, so the poisoned
+    /// flag stops being a denial-of-service primitive anyone can reach for.
+    fn owns(&self, key: &[u8]) -> bool {
+        let id = self.as_bytes();
+        key.len() >= id.len() && &key[..id.len()] == id
     }
 }
 
@@ -301,6 +392,7 @@ unsafe fn load(
     stream: u16,
     body_at: usize,
     body_end: usize,
+    device: &AuthenticatedDevice,
 ) {
     let mut key = [0u8; MAX_KEY];
     let key_len = {
@@ -312,6 +404,14 @@ unsafe fn load(
         return;
     }
 
+    // The endpoint has to be one this device owns. Without this a caller
+    // could read another party's high-water mark, or advance it — and the
+    // poisoned flag would be a denial-of-service anybody could reach.
+    if !device.owns(&key[..key_len]) {
+        s.state_not_owner = s.state_not_owner.saturating_add(1);
+        respond(s, sys, conn, stream, 403, br#"{"error":"forbidden"}"#);
+        return;
+    }
     let Some(index) = find(s, &key[..key_len]) else {
         // Nothing committed yet is not a refusal: it is the ordinary state of
         // an endpoint that has not sent anything. The caller commits against
@@ -391,6 +491,7 @@ unsafe fn commit(
     stream: u16,
     body_at: usize,
     body_end: usize,
+    device: &AuthenticatedDevice,
 ) {
     let mut key = [0u8; MAX_KEY];
     let mut payload = [0u8; MAX_PAYLOAD];
@@ -423,7 +524,81 @@ unsafe fn commit(
     }
     let offered = Marker { epoch, generation };
 
-    let index = match find(s, &key[..key_len]) {
+    // ── validate first, allocate second ──────────────────────────────────
+    //
+    // Nothing is allocated here: a miss is evaluated as revision 0 with no
+    // state, and the slot is taken only in the write step. Claiming a slot
+    // before the `expected` comparison below would let an invalid first
+    // commit for an unknown key hold one permanently, and MAX_ENDPOINTS of
+    // them would exhaust the table for every legitimate endpoint.
+
+    // The endpoint has to be one this device owns. Without this a caller
+    // could read another party's high-water mark, or advance it — and the
+    // poisoned flag would be a denial-of-service anybody could reach.
+    if !device.owns(&key[..key_len]) {
+        s.state_not_owner = s.state_not_owner.saturating_add(1);
+        respond(s, sys, conn, stream, 403, br#"{"error":"forbidden"}"#);
+        return;
+    }
+    let existing = find(s, &key[..key_len]);
+    let (held_revision, held_marker, held_has_state, held_poisoned) = match existing {
+        Some(index) => (
+            s.endpoints[index].revision,
+            s.endpoints[index].marker,
+            s.endpoints[index].has_state,
+            s.endpoints[index].poisoned,
+        ),
+        None => (0, Marker::ZERO, false, false),
+    };
+
+    if held_poisoned {
+        s.state_poisoned = s.state_poisoned.saturating_add(1);
+        respond(s, sys, conn, stream, 409, br#"{"error":"poisoned"}"#);
+        return;
+    }
+
+    // The condition, before anything else: a commit that lost the race has
+    // not been evaluated against the state that won, so nothing it says about
+    // advancing means anything yet.
+    if expected != held_revision {
+        s.state_superseded = s.state_superseded.saturating_add(1);
+        let mut body = [0u8; 128];
+        let mut at = 0usize;
+        let _ = put(&mut body, &mut at, br#"{"error":"superseded","found":"#);
+        let _ = put_u64(&mut body, &mut at, held_revision);
+        let _ = put(&mut body, &mut at, b"}");
+        respond(s, sys, conn, stream, 409, &body[..at]);
+        return;
+    }
+
+    if held_has_state && !offered.advances_on(held_marker) {
+        let held = held_marker;
+        if offered == held {
+            // The same position again: an optimistic retry after an ambiguous
+            // failure. Refused — committing a position twice is how a retry
+            // turns into a reused generation — but it is not evidence that
+            // anything is wrong, so the endpoint keeps running.
+            s.state_not_advancing = s.state_not_advancing.saturating_add(1);
+            respond(s, sys, conn, stream, 409, br#"{"error":"not_advancing"}"#);
+        } else {
+            // Behind the current position, while quoting the current
+            // revision: the caller loaded this state and is offering
+            // something older than it. Its ratchet has gone backwards.
+            //
+            // Only a slot that already exists can be poisoned. A first commit
+            // cannot roll anything back — there is nothing behind it — so an
+            // unknown key never reaches here with `held_has_state`.
+            if let Some(index) = existing {
+                s.endpoints[index].poisoned = true;
+            }
+            s.state_rolled_back = s.state_rolled_back.saturating_add(1);
+            respond(s, sys, conn, stream, 409, br#"{"error":"rolled_back"}"#);
+        }
+        return;
+    }
+
+    // Allocation happens here, once the commit has been shown to be valid.
+    let index = match existing {
         Some(index) => index,
         None => {
             let Some(free) = s.endpoints.iter().position(|e| !e.live) else {
@@ -449,46 +624,6 @@ unsafe fn commit(
             free
         }
     };
-
-    if s.endpoints[index].poisoned {
-        s.state_poisoned = s.state_poisoned.saturating_add(1);
-        respond(s, sys, conn, stream, 409, br#"{"error":"poisoned"}"#);
-        return;
-    }
-
-    // The condition, before anything else: a commit that lost the race has
-    // not been evaluated against the state that won, so nothing it says about
-    // advancing means anything yet.
-    if expected != s.endpoints[index].revision {
-        s.state_superseded = s.state_superseded.saturating_add(1);
-        let mut body = [0u8; 128];
-        let mut at = 0usize;
-        let _ = put(&mut body, &mut at, br#"{"error":"superseded","found":"#);
-        let _ = put_u64(&mut body, &mut at, s.endpoints[index].revision);
-        let _ = put(&mut body, &mut at, b"}");
-        respond(s, sys, conn, stream, 409, &body[..at]);
-        return;
-    }
-
-    if s.endpoints[index].has_state && !offered.advances_on(s.endpoints[index].marker) {
-        let held = s.endpoints[index].marker;
-        if offered == held {
-            // The same position again: an optimistic retry after an ambiguous
-            // failure. Refused — committing a position twice is how a retry
-            // turns into a reused generation — but it is not evidence that
-            // anything is wrong, so the endpoint keeps running.
-            s.state_not_advancing = s.state_not_advancing.saturating_add(1);
-            respond(s, sys, conn, stream, 409, br#"{"error":"not_advancing"}"#);
-        } else {
-            // Behind the current position, while quoting the current
-            // revision: the caller loaded this state and is offering
-            // something older than it. Its ratchet has gone backwards.
-            s.endpoints[index].poisoned = true;
-            s.state_rolled_back = s.state_rolled_back.saturating_add(1);
-            respond(s, sys, conn, stream, 409, br#"{"error":"rolled_back"}"#);
-        }
-        return;
-    }
 
     let endpoint = &mut s.endpoints[index];
     endpoint.marker = offered;
@@ -592,6 +727,243 @@ unsafe fn respond(
     s.out[RESP_HDR + CT.len()..total].copy_from_slice(body);
 
     (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+}
+
+/// The primitives the shared authentication fragment is given.
+const VERIFIERS: device_auth::Verifiers = device_auth::Verifiers {
+    sha256: sha256_into,
+    ecdsa_verify,
+    ed25519_verify,
+};
+
+/// Device certificates only.
+const POLICY: device_auth::Policy = device_auth::Policy {
+    proof_max_age_secs: PROOF_WINDOW_SECS,
+    clock_skew_secs: 60,
+    expected_cty: Some(b"dc+jwt"),
+};
+
+fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
+    *out = sha256(data);
+}
+
+/// Verify the presented device certificate and return the device it names.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn authenticate(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    path: &[u8],
+    body_at: usize,
+) -> Option<AuthenticatedDevice> {
+    if s.keyset.is_empty() {
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            503,
+            br#"{"error":"temporarily_unavailable"}"#,
+        );
+        return None;
+    }
+    let path_len = path.len();
+    let mut credential = [0u8; device_auth::MAX_SEGMENT];
+    let mut proof = [0u8; device_auth::MAX_SEGMENT];
+    let (credential_len, proof_len) = {
+        let headers = &s.buf[REQ_HDR + path_len..body_at];
+        (
+            header_value(headers, b"authorization")
+                .and_then(strip_dpop_scheme)
+                .map_or(0, |v| copy_into(v, &mut credential)),
+            header_value(headers, b"dpop").map_or(0, |v| copy_into(v, &mut proof)),
+        )
+    };
+    if credential_len == 0 || proof_len == 0 {
+        s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
+        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        return None;
+    }
+
+    // A credential's validity window is a statement about a date, so it
+    // needs a clock worth believing — and 503 rather than 401, because a
+    // deployment without a trustworthy clock has not been given what it
+    // needs, which is not the caller's fault.
+    //
+    // `dev_unix_millis(sys) / 1000` returns 0 on a platform with no RTC,
+    // and 0 is a NUMBER: it flowed into the window comparison and the
+    // comparison answered. Every `exp` exceeds 0, so a missing clock read
+    // as "not yet expired".
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
+        s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            503,
+            br#"{"error":"temporarily_unavailable"}"#,
+        );
+        return None;
+    };
+    let mut claims_buf = [0u8; device_auth::MAX_SEGMENT];
+    // Which key signed the credential is the credential's own claim, in
+    // its JOSE header. It is looked up, never guessed: an unknown kid is
+    // refused rather than checked against whatever key is loaded.
+    let mut pubkey = [0u8; 65];
+    let mut pubkey_len = 0usize;
+    let mut key_suite = 0u16;
+    let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
+    if let Some(kid_len) = device_auth::credential_kid(&credential[..credential_len], &mut kid) {
+        if let Some(k) = s.keyset.select(&kid[..kid_len], now) {
+            pubkey_len = k.pubkey_bytes().len();
+            pubkey[..pubkey_len].copy_from_slice(k.pubkey_bytes());
+            key_suite = k.suite;
+        }
+    }
+
+    let admitted = {
+        // The window fails closed: a saturated one refuses rather than
+        // evicting a live entry, because an eviction under load is an
+        // admission under load. Both refusals reach `device_auth` as
+        // `false`; the counters below keep them apart for an operator,
+        // since "somebody replayed a proof" and "the window is saturated"
+        // are different problems.
+        let mut replay = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+            dpop::Replay::Recorded => true,
+            dpop::Replay::Seen => false,
+            dpop::Replay::Full => false,
+        };
+        device_auth::authenticate(
+            &VERIFIERS,
+            &device_auth::IssuerKey {
+                suite: key_suite,
+                public: &pubkey[..pubkey_len],
+            },
+            &device_auth::Presentation {
+                credential: &credential[..credential_len],
+                proof: &proof[..proof_len],
+            },
+            &device_auth::Request {
+                method: b"POST",
+                uri: path,
+                now,
+            },
+            &POLICY,
+            &mut claims_buf,
+            &mut replay,
+        )
+    };
+    let Ok(admitted) = admitted else {
+        s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
+        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        return None;
+    };
+    let Some(device_id) = jose::claim_str(admitted.claims, b"device_id") else {
+        s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
+        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        return None;
+    };
+    let mut out = AuthenticatedDevice {
+        id: [0u8; MAX_KEY],
+        len: 0,
+    };
+    let n = device_id.len().min(MAX_KEY);
+    out.id[..n].copy_from_slice(&device_id[..n]);
+    out.len = n;
+    Some(out)
+}
+
+/// Drain `verify_key`, keeping the key lifecycle into the keyset.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn drain_verify_key(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_verify_key < 0 {
+        return;
+    }
+    for _ in 0..4 {
+        if !chan::can_read(sys, s.in_verify_key) {
+            break;
+        }
+        let mut buf = [0u8; 256];
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_verify_key, &mut buf);
+        let payload = &buf[..plen as usize];
+        // The whole key lifecycle, not a single overwriting delivery. See
+        // `verify_keyset.rs`: a store holding one key and discarding the kid
+        // cannot rotate — the new key invalidates every live credential the
+        // moment it lands, and an unknown kid is checked against whatever
+        // arrived last.
+        s.keyset.apply(msg_type, payload);
+    }
+}
+
+/// A header value by lowercase name.
+fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut at = 0usize;
+    while at < headers.len() {
+        let end = headers[at..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(headers.len(), |p| at + p);
+        let line = &headers[at..end];
+        if let Some(colon) = line.iter().position(|b| *b == b':') {
+            let (key, value) = line.split_at(colon);
+            if key.len() == name.len()
+                && key
+                    .iter()
+                    .zip(name)
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+            {
+                return Some(trim(&value[1..]));
+            }
+        }
+        at = end + 1;
+    }
+    None
+}
+
+fn strip_dpop_scheme(value: &[u8]) -> Option<&[u8]> {
+    let scheme = b"DPoP ";
+    if value.len() > scheme.len() && value[..scheme.len()].eq_ignore_ascii_case(scheme) {
+        Some(trim(&value[scheme.len()..]))
+    } else {
+        None
+    }
+}
+
+fn copy_into(value: &[u8], out: &mut [u8]) -> usize {
+    let n = value.len().min(out.len());
+    out[..n].copy_from_slice(&value[..n]);
+    if value.len() > out.len() {
+        0
+    } else {
+        n
+    }
+}
+
+fn trim(mut bytes: &[u8]) -> &[u8] {
+    while let Some((first, rest)) = bytes.split_first() {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let Some((last, rest)) = bytes.split_last() {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
 }
 
 #[no_mangle]

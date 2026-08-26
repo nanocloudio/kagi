@@ -17,7 +17,7 @@ direction = "output"
 content_type = "HttpResponse"
 buffer_size = 8192
 
-# The issuer's public key, in the same MSG_VERIFY_KEY shape `token_verify`
+# The issuer's public key, in the same MSG_KEY_ADD shape `token_verify`
 # takes. Until one lands every request is refused: a gate that admitted
 # while it had nothing to verify against would be a gate in name only.
 [[ports]]

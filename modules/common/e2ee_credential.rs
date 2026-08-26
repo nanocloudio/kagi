@@ -54,7 +54,7 @@ pub const MAX_PROOF_INPUT: usize = 512;
 
 /// Verify a JWS signature. `(alg_code, pubkey, signing_input, signature)`.
 ///
-/// `alg_code` is `auth_wire::MINT_ALG_*`. The curve implementation is the
+/// `alg_code` is `auth_wire::suite`. The curve implementation is the
 /// caller's: a module wires the SDK's, an issuer wires the one its key
 /// custody speaks.
 pub type VerifyFn = fn(u8, &[u8], &[u8], &[u8]) -> bool;
@@ -218,10 +218,17 @@ pub fn check_credential<'a>(
         Some(cty) if cty == CREDENTIAL_CONTENT_TYPE => {}
         _ => return Err(CredentialError::WrongContentType),
     }
+    // The header must SAY what signed it, but what actually verifies is
+    // `issuer_alg` — the suite the caller holds the key under. A credential
+    // therefore cannot talk a verifier into a weaker algorithm by naming
+    // one, which is the whole of the JOSE `alg` confusion class.
     if jose::claim_str(header, b"alg").is_none() {
         return Err(CredentialError::UnknownAlgorithm);
     }
 
+    // 64 bytes: both suites kagi signs credentials under — Ed25519 and
+    // ES256 — produce exactly that, and a longer one belongs to a suite this
+    // build does not issue.
     let mut signature = [0u8; 64];
     if b64::decode(jws.signature_b64, &mut signature) != Some(64) {
         return Err(CredentialError::Segment);

@@ -26,5 +26,19 @@ name = "key_material"
 direction = "input"
 content_type = "OctetStream"
 
+# The public half of every signing key, as a VERIFY `MSG_KEY_ADD`.
+#
+# A signing record names a vault LABEL and carries no key material, so the
+# private half is generated inside the vault and the operator distributing
+# the record never sees the public half either. This mint is the only
+# component that does, which makes announcing it the mint's job. Wire this to
+# whatever verifies — `token_verify`, `wellknown_endpoint` — the same way the
+# operator's own VERIFY records are wired.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+max_record = 512
+
 [observability]
 metrics = ["mint_ok", "mint_err", "no_key_errors", "sign_ops"]

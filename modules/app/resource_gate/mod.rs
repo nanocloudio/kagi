@@ -79,12 +79,18 @@ mod auth_wire;
 mod b64;
 #[path = "../../common/chan.rs"]
 mod chan;
+#[path = "../../common/device_auth.rs"]
+mod device_auth;
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/jose.rs"]
 mod jose;
 #[path = "../../common/jwk.rs"]
 mod jwk;
+#[path = "../../common/time_policy.rs"]
+mod time_policy;
+#[path = "../../common/verify_keyset.rs"]
+mod verify_keyset;
 
 use assurance::AssuranceLevel;
 use auth_wire::PayloadReader;
@@ -106,6 +112,10 @@ const MAX_PUBKEY_LEN: usize = 65;
 const CLOCK_SKEW_SECS: u64 = 60;
 /// Freshness window (seconds) for a DPoP proof's `iat`.
 const PROOF_MAX_AGE_SECS: u64 = 300;
+/// Alias tying the replay window to the freshness policy: they are one
+/// number, and remembering a proof for less than its window leaves a
+/// replayable gap.
+const PROOF_WINDOW_SECS: u64 = PROOF_MAX_AGE_SECS;
 /// Decoded JOSE segment ceiling. A token or proof whose header or payload
 /// exceeds it fails closed rather than being parsed from a truncated copy.
 const MAX_SEGMENT: usize = 1024;
@@ -122,20 +132,32 @@ const MAX_REQS_PER_STEP: usize = 2;
 /// Longest subject echoed back on admission.
 const MAX_SUBJECT: usize = 128;
 
+/// The primitives the shared authentication fragment is given. On target
+/// these are the SDK's; the host suites inject their own.
+const VERIFIERS: device_auth::Verifiers = device_auth::Verifiers {
+    sha256: sha256_into,
+    ecdsa_verify,
+    ed25519_verify,
+};
+
+/// The windows this gate admits under. A resource server's access token
+/// names no `cty`, so none is required of it.
+const POLICY: device_auth::Policy = device_auth::Policy {
+    proof_max_age_secs: PROOF_MAX_AGE_SECS,
+    clock_skew_secs: CLOCK_SKEW_SECS,
+    expected_cty: None,
+};
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_requests: i32,   // in[0]:  HttpRequest
     out_responses: i32, // out[0]: HttpResponse
-    in_key: i32,        // in[1]:  MSG_VERIFY_KEY
+    in_key: i32,        // in[1]:  MSG_KEY_ADD
 
-    /// SEC1 public point (ES256) or 32-byte public key (Ed25519).
-    /// Valid iff `has_key`; interpreted per `key_alg`.
-    pubkey: [u8; MAX_PUBKEY_LEN],
-    pubkey_len: u8,
-    /// `auth_wire::MINT_ALG_*` of the loaded key.
-    key_alg: u8,
-    has_key: bool,
+    /// The issuer keyset. More than one key, indexed by the `kid` the
+    /// presented token names — see `verify_keyset.rs`.
+    keyset: verify_keyset::Keyset,
 
     /// The assurance floor every admitted request must meet.
     ///
@@ -273,10 +295,7 @@ pub extern "C" fn module_new(
         s.out_responses = out_chan;
         s.in_key = dev_channel_port(sys, 0, 1);
 
-        s.pubkey = [0; MAX_PUBKEY_LEN];
-        s.pubkey_len = 0;
-        s.key_alg = 0;
-        s.has_key = false;
+        s.keyset = verify_keyset::Keyset::new();
         s.replay = dpop::ReplayWindow::new();
         s.gate_admitted = 0;
         s.gate_no_key = 0;
@@ -347,7 +366,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Drain `verify_key`, keeping the latest valid MSG_VERIFY_KEY
+/// Drain `verify_key`, keeping the key lifecycle into the keyset
 /// (`[alg u8][kid_len u8][kid][pubkey_len u8][pubkey]`).
 ///
 /// # Safety
@@ -365,34 +384,12 @@ unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
         }
         let mut buf = [0u8; 256];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
-        if msg_type != auth_wire::MSG_VERIFY_KEY {
-            continue;
-        }
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(alg), Ok(_kid), Ok(pubkey)) = (r.u8(), r.field8(), r.field8()) else {
-            continue;
-        };
-        // ES256 accepts a SEC1 point (33 compressed / 65 uncompressed);
-        // Ed25519 wants exactly the 32-byte public key.
-        let valid = match alg {
-            auth_wire::MINT_ALG_ES256 => pubkey.len() == 33 || pubkey.len() == 65,
-            auth_wire::MINT_ALG_ED25519 => pubkey.len() == 32,
-            _ => false,
-        };
-        if !valid || pubkey.len() > MAX_PUBKEY_LEN {
-            continue;
-        }
-        s.pubkey = [0; MAX_PUBKEY_LEN];
-        s.pubkey[..pubkey.len()].copy_from_slice(pubkey);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "bounded by MAX_PUBKEY_LEN (65)"
-        )]
-        {
-            s.pubkey_len = pubkey.len() as u8;
-        }
-        s.key_alg = alg;
-        s.has_key = true;
+        let payload = &buf[..plen as usize];
+        // The whole key lifecycle, not a single overwriting delivery. See
+        // `verify_keyset.rs`: the predecessor kept one key and discarded
+        // the kid, so a rotation invalidated every live credential and an
+        // unknown kid was checked against whatever key had arrived last.
+        s.keyset.apply(msg_type, payload);
     }
 }
 
@@ -439,7 +436,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 ///
 /// As `drain_key_material`.
 unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<usize, Refusal> {
-    if !s.has_key {
+    if s.keyset.is_empty() {
         return Err(Refusal::NoKey);
     }
 
@@ -469,62 +466,83 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<
     let token = &token[..token_len];
     let proof = &proof[..proof_len];
 
-    let now = dev_unix_millis(sys) / 1000;
+    // A credential's validity window is a statement about a date, so it
+    // needs a clock worth believing. Without one this refuses.
+    //
+    // It used to be `dev_unix_millis(sys) / 1000`, which returns 0 on a
+    // platform with no RTC — and 0 is a NUMBER, so it flowed into the
+    // window comparison and the comparison answered. Every `exp` is greater
+    // than 0, so a missing clock read as "not yet expired" and admitted
+    // every expired credential.
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
+        return Err(Refusal::Proof);
+    };
 
-    // ── 1. the access token verifies and is live ──────────────────────────
-    let token_jws = jose::Jws::split(token).ok_or(Refusal::Token)?;
-    if !verify_with_issuer_key(s, &token_jws) {
-        return Err(Refusal::Token);
+    // ── 1 to 4: the shared device-authentication fragment ─────────────────
+    //
+    // The order, the failure directions and the position of the replay record
+    // are the fragment's contract, so every module that authenticates a
+    // presented credential performs them identically.
+    // Which key signed the token is the token's own claim, in its header.
+    // Looked up, never guessed: an unknown kid is refused rather than
+    // checked against whatever key is loaded.
+    let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
+    let mut pubkey = [0u8; verify_keyset::MAX_PUBKEY_LEN];
+    let mut pubkey_len = 0usize;
+    let mut key_suite = 0u16;
+    if let Some(kid_len) = device_auth::credential_kid(token, &mut kid) {
+        if let Some(k) = s.keyset.select(&kid[..kid_len], now) {
+            pubkey_len = k.pubkey_bytes().len();
+            pubkey[..pubkey_len].copy_from_slice(k.pubkey_bytes());
+            key_suite = k.suite;
+        }
     }
+
     let mut token_payload = [0u8; MAX_SEGMENT];
-    let token_payload_len =
-        b64::decode(token_jws.payload_b64, &mut token_payload).ok_or(Refusal::Token)?;
-    let token_json = &token_payload[..token_payload_len];
-    let iat = jose::claim_u64(token_json, b"iat").unwrap_or(0);
-    let exp = jose::claim_u64(token_json, b"exp").unwrap_or(0);
-    if !jose::within_window(now, iat, exp, CLOCK_SKEW_SECS) {
-        return Err(Refusal::Token);
-    }
-
-    // ── 2. the proof verifies under the key its own header carries ────────
-    let proof_jws = jose::Jws::split(proof).ok_or(Refusal::Proof)?;
-    let mut proof_header = [0u8; MAX_SEGMENT];
-    let proof_header_len =
-        b64::decode(proof_jws.header_b64, &mut proof_header).ok_or(Refusal::Proof)?;
-    let proof_header = &proof_header[..proof_header_len];
-    let mut canonical = [0u8; jwk::MAX_CANONICAL];
-    let canonical_len = canonical_header_jwk(proof_header, &mut canonical).ok_or(Refusal::Proof)?;
-    if !verify_with_header_jwk(proof_header, &canonical[..canonical_len], &proof_jws) {
-        return Err(Refusal::Proof);
-    }
-
-    // ── 3. the proof's claims bind it to this request, and it is fresh ────
-    let mut proof_payload = [0u8; MAX_SEGMENT];
-    let proof_payload_len =
-        b64::decode(proof_jws.payload_b64, &mut proof_payload).ok_or(Refusal::Proof)?;
-    let facts = dpop::check_proof(
-        sha256_into,
-        proof_header,
-        &proof_payload[..proof_payload_len],
-        method_name(method),
-        &s.buf[path_at..hdr_at],
-        now,
-        PROOF_MAX_AGE_SECS,
-    )
-    .map_err(|_| Refusal::Proof)?;
-    // Recorded only now: a `jti` taken from an unverified proof would let
-    // anyone burn an honest client's identifiers.
-    if !s.replay.check_and_record(&facts.jti_digest) {
-        return Err(Refusal::Proof);
-    }
-
-    // ── 4. the proof key is the key the token was issued against ──────────
-    let thumbprint = jwk::thumbprint_from_canonical(sha256_into, &canonical[..canonical_len]);
-    let bound = jose::claim_str(token_json, b"jkt").ok_or(Refusal::Token)?;
-    if bound != thumbprint {
-        s.gate_not_bound = s.gate_not_bound.saturating_add(1);
-        return Err(Refusal::Proof);
-    }
+    // The window fails closed: a saturated one refuses rather than
+    // evicting a live entry, because an eviction under load is an
+    // admission under load. Both refusals reach `device_auth` as
+    // `false`; the counters below keep them apart for an operator,
+    // since "somebody replayed a proof" and "the window is saturated"
+    // are different problems.
+    let mut replay = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+        dpop::Replay::Recorded => true,
+        dpop::Replay::Seen => false,
+        dpop::Replay::Full => false,
+    };
+    let authenticated = device_auth::authenticate(
+        &VERIFIERS,
+        &device_auth::IssuerKey {
+            suite: key_suite,
+            public: &pubkey[..pubkey_len],
+        },
+        &device_auth::Presentation {
+            credential: token,
+            proof,
+        },
+        &device_auth::Request {
+            method: method_name(method),
+            uri: &s.buf[path_at..hdr_at],
+            now,
+        },
+        &POLICY,
+        &mut token_payload,
+        &mut replay,
+    );
+    let token_json = match authenticated {
+        Ok(ref ok) => ok.claims,
+        Err(device_auth::AuthError::NotBound) => {
+            s.gate_not_bound = s.gate_not_bound.saturating_add(1);
+            return Err(Refusal::Proof);
+        }
+        Err(device_auth::AuthError::Proof | device_auth::AuthError::Replay) => {
+            return Err(Refusal::Proof);
+        }
+        Err(device_auth::AuthError::Credential | device_auth::AuthError::Overflow) => {
+            return Err(Refusal::Token);
+        }
+    };
 
     // ── 5. the token meets the assurance floor ────────────────────────────
     let acr = jose::claim_str(token_json, b"acr");
@@ -565,97 +583,6 @@ fn check_assurance(
         }
     }
     Ok(())
-}
-
-/// Verify a JWS under the loaded issuer key.
-fn verify_with_issuer_key(s: &ModuleState, jws: &jose::Jws<'_>) -> bool {
-    let mut sig = [0u8; 64];
-    if b64::decode(jws.signature_b64, &mut sig) != Some(64) {
-        return false;
-    }
-    let pubkey = &s.pubkey[..usize::from(s.pubkey_len)];
-    match s.key_alg {
-        auth_wire::MINT_ALG_ES256 => {
-            let hash = sha256(jws.signing_input);
-            ecdsa_verify(pubkey, &hash, &sig)
-        }
-        auth_wire::MINT_ALG_ED25519 => match pubkey.try_into() {
-            Ok(pk32) => ed25519_verify(pk32, jws.signing_input, &sig),
-            Err(_) => false,
-        },
-        _ => false,
-    }
-}
-
-/// Verify a DPoP proof under the public key its own header carries.
-///
-/// The algorithm comes from the header jwk's `kty`, never from the header's
-/// `alg`: `alg` is written by whoever made the proof, and letting it choose
-/// the verifier is the algorithm-confusion path.
-fn verify_with_header_jwk(header_json: &[u8], canonical: &[u8], jws: &jose::Jws<'_>) -> bool {
-    let mut sig = [0u8; 64];
-    if b64::decode(jws.signature_b64, &mut sig) != Some(64) {
-        return false;
-    }
-    let _ = canonical;
-    let Some(kty) = jose::claim_str(header_json, b"kty") else {
-        return false;
-    };
-    match kty {
-        b"OKP" => {
-            let Some(x) = jose::claim_str(header_json, b"x") else {
-                return false;
-            };
-            let mut pk = [0u8; 32];
-            if b64::decode(x, &mut pk) != Some(32) {
-                return false;
-            }
-            ed25519_verify(&pk, jws.signing_input, &sig)
-        }
-        b"EC" => {
-            let (Some(x), Some(y)) = (
-                jose::claim_str(header_json, b"x"),
-                jose::claim_str(header_json, b"y"),
-            ) else {
-                return false;
-            };
-            // SEC1 uncompressed: 0x04 ‖ X ‖ Y.
-            let mut point = [0u8; 65];
-            point[0] = 0x04;
-            if b64::decode(x, &mut point[1..33]) != Some(32) {
-                return false;
-            }
-            if b64::decode(y, &mut point[33..65]) != Some(32) {
-                return false;
-            }
-            let hash = sha256(jws.signing_input);
-            ecdsa_verify(&point, &hash, &sig)
-        }
-        _ => false,
-    }
-}
-
-/// Rebuild the header's `jwk` in the canonical member order a thumbprint is
-/// taken over.
-///
-/// The proof's own spelling of the JWK is not used: RFC 7638 thumbprints are
-/// defined over a canonical form, and hashing whatever order the presenter
-/// happened to write would let the same key produce two thumbprints.
-fn canonical_header_jwk(header_json: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut record = jwk::JwkRecord::new();
-    if let Some(v) = jose::claim_str(header_json, b"crv") {
-        record.crv = jwk::Field::set(v).ok()?;
-    }
-    if let Some(v) = jose::claim_str(header_json, b"kty") {
-        record.kty = jwk::Field::set(v).ok()?;
-    }
-    if let Some(v) = jose::claim_str(header_json, b"x") {
-        record.x = jwk::Field::set(v).ok()?;
-    }
-    if let Some(v) = jose::claim_str(header_json, b"y") {
-        record.y = jwk::Field::set(v).ok()?;
-    }
-    record.canonical_json(out).ok()
 }
 
 /// The `Sha256Fn` shape the fragments take, over the SDK's hasher.

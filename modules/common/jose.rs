@@ -41,7 +41,7 @@ pub const ALG_EDDSA: &[u8] = b"EdDSA";
 pub const ALG_ES256: &[u8] = b"ES256";
 
 /// Claims for the kagi access token. String values are borrowed raw bytes.
-/// `jkt` is the 43-char base64url JWK thumbprint for `DPoP` binding; `None`
+/// `jkt` is the base64url JWK thumbprint for `DPoP` binding; `None`
 /// omits the `cnf` claim entirely (e.g. `ServiceAccount` / id-token-shaped
 /// tokens with no proof-of-possession binding).
 pub struct AccessClaims<'a> {
@@ -49,7 +49,13 @@ pub struct AccessClaims<'a> {
     pub sub: &'a [u8],
     pub aud: &'a [u8],
     pub scope: &'a [u8],
-    pub jkt: Option<&'a [u8; 43]>,
+    /// Its length follows from the thumbprint algorithm the caller used —
+    /// 43 characters for SHA-256, 64 for SHA-384 — so this is a slice
+    /// rather than a fixed `[u8; 43]`. The fixed form made a SHA-384
+    /// thumbprint inexpressible and accepted any other 43-byte value as a
+    /// SHA-256 one; `auth_wire` checks the length against the named
+    /// algorithm before a value ever reaches here.
+    pub jkt: Option<&'a [u8]>,
     pub iat: u64,
     pub exp: u64,
 }
@@ -218,7 +224,7 @@ fn emit_reserved(
         }
         1 => {
             // Only reached when `jkt` is present (see the active-key filter).
-            let jkt = claims.jkt.unwrap_or(&[0u8; 43]);
+            let jkt = claims.jkt.unwrap_or(b"");
             w.raw(b"\"cnf\":{\"jkt\":")?;
             w.string(jkt)?;
             w.raw(b"}")
@@ -527,4 +533,56 @@ impl JsonWriter<'_> {
         }
         self.raw(&digits[i..])
     }
+}
+
+/// The first string element of a JSON array claim, e.g. `x5c`'s leaf.
+///
+/// Only the first: a carrier presents a leaf, never a chain, and reading
+/// past it would let a client supply intermediates that reach an anchor it
+/// was never meant to reach.
+#[must_use]
+pub fn claim_array_first_str<'a>(json: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    // Find `"key"` at an object position and step to its value.
+    let mut i = 0usize;
+    let at = loop {
+        if i + key.len() + 2 > json.len() {
+            return None;
+        }
+        if json[i] == b'"'
+            && json[i + 1..].starts_with(key)
+            && json.get(i + 1 + key.len()) == Some(&b'"')
+        {
+            break i + key.len() + 2;
+        }
+        i += 1;
+    };
+    let mut p = at;
+    while p < json.len() && (json[p] == b' ' || json[p] == b':') {
+        p += 1;
+    }
+    if json.get(p) != Some(&b'[') {
+        return None;
+    }
+    p += 1;
+    while p < json.len() && json[p] == b' ' {
+        p += 1;
+    }
+    if json.get(p) != Some(&b'"') {
+        return None;
+    }
+    p += 1;
+    let start = p;
+    while p < json.len() && json[p] != b'"' {
+        // No escape handling: a base64 element has no escapable character,
+        // and accepting an escape here would mean two spellings of one
+        // certificate.
+        if json[p] == b'\\' {
+            return None;
+        }
+        p += 1;
+    }
+    if p >= json.len() {
+        return None;
+    }
+    Some(&json[start..p])
 }

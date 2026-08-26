@@ -68,10 +68,16 @@ mod b64;
 mod chan;
 #[path = "../../common/der.rs"]
 mod der;
+#[path = "../../common/issuer_key.rs"]
+mod issuer_key;
 #[path = "../../common/jose.rs"]
 mod jose;
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
+mod key_vault;
 #[path = "../../common/spiffe.rs"]
 mod spiffe;
+#[path = "../../common/time_policy.rs"]
+mod time_policy;
 
 use auth_wire::PayloadReader;
 
@@ -100,10 +106,17 @@ struct ModuleState {
     in_key: i32,
 
     /// The CA's private key: an Ed25519 seed, or a P-256 scalar.
-    seed: [u8; 32],
-    /// `auth_wire::MINT_ALG_*` of the loaded key.
-    key_alg: u8,
-    has_key: bool,
+    /// out[1]: the CA's public half, as a VERIFY KEY_ADD.
+    out_key_announce: i32,
+    /// The CA signing key, held in the vault under the label the keyset
+    /// record names. This module never holds a private key.
+    key: issuer_key::IssuerKey,
+    /// Scratch for one vault SIGN over a TBSCertificate, kept in module
+    /// state rather than on the PIC stack.
+    sign_scratch: [u8; MAX_DER + issuer_key::SIGN_SCRATCH_OVERHEAD],
+    /// `auth_wire::suite` of the loaded key.
+    /// The credential suite of the loaded key.
+    key_suite: u16,
 
     /// The CA's own name, and the trust domain its SPIFFE ids belong to.
     /// Graph parameters: a caller that could name its own issuer could get a
@@ -193,9 +206,9 @@ pub extern "C" fn module_new(
         s.in_requests = in_chan;
         s.out_responses = out_chan;
         s.in_key = dev_channel_port(sys, 0, 1);
-        s.seed = [0; 32];
-        s.key_alg = 0;
-        s.has_key = false;
+        s.out_key_announce = dev_channel_port(sys, 1, 1);
+        s.key = issuer_key::IssuerKey::empty();
+        s.key_suite = 0;
         s.issuer_cn = [0; MAX_FIELD];
         s.issuer_cn_len = 0;
         s.trust_domain = [0; MAX_FIELD];
@@ -256,22 +269,37 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         }
         let mut buf = [0u8; 256];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
-        if msg_type != auth_wire::MSG_MINT_KEY {
+        // The key lifecycle, not a single raw-key delivery. This endpoint
+        // signs one artefact shape and holds one key for it, so it takes
+        // the ADD for its own profile and ignores everything else on the
+        // channel — the channel carries the whole issuer keyset.
+        let payload = &buf[..plen as usize];
+        if msg_type != auth_wire::MSG_KEY_ADD {
             continue;
         }
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(alg), Ok(_kid)) = (r.u8(), r.field8()) else {
+        let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
             continue;
         };
-        let seed = r.rest();
-        if (alg != auth_wire::MINT_ALG_ED25519 && alg != auth_wire::MINT_ALG_ES256)
-            || seed.len() < 32
+        if rec.key_use != auth_wire::key_use::SIGN
+            || rec.profile_id != auth_wire::suite::profile::DEVICE_CERTIFICATE
         {
             continue;
         }
-        s.seed.copy_from_slice(&seed[..32]);
-        s.key_alg = alg;
-        s.has_key = true;
+        if !auth_wire::suite::is_implemented(rec.suite)
+            || rec.key_ref.is_empty()
+            || rec.key_ref.len() > auth_wire::MAX_KEY_LABEL
+        {
+            continue;
+        }
+        // The record names a LABEL. A CA key is the one key in this system
+        // whose compromise forges every identity it ever issued, so it is
+        // the last one that should have travelled as bytes.
+        s.key.close(sys);
+        if !s.key.open(sys, rec.suite, rec.key_ref) {
+            continue;
+        }
+        s.key_suite = rec.suite;
+        announce_public_key(s, sys, rec.issuer, rec.kid, rec.profile_id);
     }
 }
 
@@ -341,7 +369,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         );
         return;
     }
-    if !s.has_key {
+    if !s.key.is_open() {
         s.certificate_no_key = s.certificate_no_key.saturating_add(1);
         respond(
             s,
@@ -442,7 +470,25 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     };
 
-    let now = dev_unix_millis(sys) / 1000;
+    // A certificate's validity window is stamped here, so it needs a clock
+    // worth believing. Stamping one from a clock that reads 0 issues a
+    // certificate valid from 1970 — which, with an issuer-owned lifetime
+    // added, is a certificate that expired before it was signed and would
+    // be refused by every verifier including this issuer's own.
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CertificateValidity, &obs) else {
+        s.certificate_malformed = s.certificate_malformed.saturating_add(1);
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            503,
+            b"application/json",
+            br#"{"error":"temporarily_unavailable"}"#,
+        );
+        return;
+    };
     let serial = s.next_serial;
 
     let mut tbs = [0u8; MAX_DER];
@@ -453,7 +499,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             &s.issuer_cn[..usize::from(s.issuer_cn_len)],
             &subject[..subject_len],
             subject_key,
-            algorithm(s.key_alg),
+            algorithm(s.key_suite),
             now,
             now + CERTIFICATE_TTL_SECS,
             &san[..san_len],
@@ -519,8 +565,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 }
 
 /// The algorithm the loaded key signs with.
-const fn algorithm(key_alg: u8) -> der::SigningAlgorithm {
-    if key_alg == auth_wire::MINT_ALG_ES256 {
+const fn algorithm(key_suite: u16) -> der::SigningAlgorithm {
+    if key_suite == auth_wire::suite::ES256 {
         der::SigningAlgorithm::P256
     } else {
         der::SigningAlgorithm::Ed25519
@@ -528,8 +574,8 @@ const fn algorithm(key_alg: u8) -> der::SigningAlgorithm {
 }
 
 /// Sign `tbs` and wrap it into a whole certificate in `out`.
-fn seal(s: &ModuleState, tbs: &[u8], out: &mut [u8]) -> Option<usize> {
-    let algorithm = algorithm(s.key_alg);
+fn seal(s: &mut ModuleState, tbs: &[u8], out: &mut [u8]) -> Option<usize> {
+    let algorithm = algorithm(s.key_suite);
     let mut w = der::Writer::new(out);
     w.constructed(0x30, |cert| {
         // The TBS goes in byte for byte as it was signed. Re-encoding it from
@@ -538,10 +584,12 @@ fn seal(s: &ModuleState, tbs: &[u8], out: &mut [u8]) -> Option<usize> {
         cert.raw(tbs)?;
         cert.signature_algorithm(algorithm)?;
         match algorithm {
-            der::SigningAlgorithm::Ed25519 => cert.bit_string(&ed25519_sign(&s.seed, tbs)),
+            der::SigningAlgorithm::Ed25519 => {
+                let sig = sign_tbs(s, tbs, false).ok_or(der::DerError::TooLong)?;
+                cert.bit_string(&sig)
+            }
             der::SigningAlgorithm::P256 => {
-                let raw =
-                    ecdsa_sign(&s.seed, &sha256(tbs), &[0u8; 32]).ok_or(der::DerError::TooLong)?;
+                let raw = sign_tbs(s, tbs, true).ok_or(der::DerError::TooLong)?;
                 let (encoded, len) = encode_der_signature(&raw);
                 cert.ecdsa_signature(encoded.get(..len).ok_or(der::DerError::TooLong)?)
             }
@@ -557,7 +605,7 @@ fn seal(s: &ModuleState, tbs: &[u8], out: &mut [u8]) -> Option<usize> {
 ///
 /// As `drain_key`.
 unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u16) {
-    if !s.has_key {
+    if !s.key.is_open() {
         s.certificate_no_key = s.certificate_no_key.saturating_add(1);
         respond(
             s,
@@ -570,8 +618,35 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
         );
         return;
     }
-    let now = dev_unix_millis(sys) / 1000;
-    let public = ca_public_key(s);
+    // The CA certificate's own validity window, stamped here.
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CertificateValidity, &obs) else {
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            503,
+            b"application/json",
+            br#"{"error":"temporarily_unavailable"}"#,
+        );
+        return;
+    };
+    let Some(public) = ca_public_key(s) else {
+        // The open key's public half does not match the suite it claims.
+        // Refused rather than padded into shape: a CA certificate carrying
+        // the wrong key is one every verifier trusts and nothing can use.
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            503,
+            b"application/json",
+            br#"{"error":"temporarily_unavailable"}"#,
+        );
+        return;
+    };
     let cn_len = usize::from(s.issuer_cn_len);
 
     let mut tbs = [0u8; MAX_DER];
@@ -587,7 +662,7 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
             &1u64.to_be_bytes(),
             &s.issuer_cn[..cn_len],
             subject_key,
-            algorithm(s.key_alg),
+            algorithm(s.key_suite),
             now,
             now + CA_TTL_SECS,
         )
@@ -652,13 +727,97 @@ enum CaPublicKey {
     P256([u8; 65]),
 }
 
-fn ca_public_key(s: &ModuleState) -> CaPublicKey {
-    if s.key_alg == auth_wire::MINT_ALG_ES256 {
-        // `ecdh_keygen` multiplies the base point by the scalar it is given,
-        // which is how a signing key's public half is derived too.
-        CaPublicKey::P256(ecdh_keygen(&s.seed).1)
+/// Emit the CA's public half as a VERIFY [`auth_wire::MSG_KEY_ADD`].
+///
+/// **This edge exists because the operator can no longer supply it.** While
+/// a signing record carried a raw private key, whoever distributed it could
+/// derive the public half and hand it to the verifiers. A key generated
+/// inside the vault has no such moment, so publishing it becomes the
+/// signer's job. The announcement carries nothing secret, which is exactly
+/// why it can travel on an ordinary lane.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn announce_public_key(
+    s: &ModuleState,
+    sys: &SyscallTable,
+    issuer: &[u8],
+    kid: &[u8],
+    profile_id: u16,
+) {
+    if s.out_key_announce < 0 || !s.key.is_open() {
+        return;
+    }
+    // The issuer, kid and profile are echoed from the record that named the
+    // label, NOT rebuilt from this module's own configuration. Verifiers
+    // index on that triple, and a public half filed under a name the signing
+    // record never used is one no verifier will ever look up.
+    let rec = auth_wire::KeyRecord {
+        issuer,
+        profile_id,
+        kid,
+        suite: s.key_suite,
+        state: auth_wire::key_state::ACTIVE,
+        key_use: auth_wire::key_use::VERIFY,
+        generation: 0,
+        activate_after_unix: 0,
+        remove_after_unix: 0,
+        key_ref: s.key.public_key(),
+    };
+    let mut payload = [0u8; 512];
+    let mut w = auth_wire::PayloadWriter::new(&mut payload);
+    if rec.write(&mut w).is_err() {
+        return;
+    }
+    let n = w.len();
+    chan::channel_write_msg(
+        sys,
+        s.out_key_announce,
+        auth_wire::MSG_KEY_ADD,
+        &payload[..n],
+    );
+}
+
+/// Sign a TBSCertificate in the vault.
+///
+/// `digest` selects what the suite signs: ECDSA signs the SHA-256 of the
+/// TBS, Ed25519 signs the TBS itself. The vault refuses a mode its key's
+/// suite does not take, so a mismatch here is a refusal rather than a
+/// signature over the wrong bytes.
+fn sign_tbs(s: &mut ModuleState, tbs: &[u8], digest: bool) -> Option<[u8; 64]> {
+    // SAFETY: `s.syscalls` is the table handed to `module_new` and lives as
+    // long as the module; `sign_scratch` does not alias `tbs`.
+    let sys = unsafe { &*s.syscalls };
+    let key = s.key;
+    if digest {
+        let hash = sha256(tbs);
+        unsafe { key.sign(sys, &mut s.sign_scratch, &hash) }
     } else {
-        CaPublicKey::Ed25519(ed25519_public_key(&s.seed))
+        unsafe { key.sign(sys, &mut s.sign_scratch, tbs) }
+    }
+}
+
+/// The CA's public half, as the vault exported it at open.
+///
+/// Read from the vault rather than derived from a scalar, because there is
+/// no longer a scalar here to derive it from — which is the point.
+fn ca_public_key(s: &ModuleState) -> Option<CaPublicKey> {
+    let pk = s.key.public_key();
+    if s.key_suite == auth_wire::suite::ES256 {
+        let mut out = [0u8; 65];
+        if pk.len() != 65 {
+            return None;
+        }
+        out.copy_from_slice(pk);
+        Some(CaPublicKey::P256(out))
+    } else {
+        let mut out = [0u8; 32];
+        if pk.len() != 32 {
+            return None;
+        }
+        out.copy_from_slice(pk);
+        Some(CaPublicKey::Ed25519(out))
     }
 }
 

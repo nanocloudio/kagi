@@ -17,8 +17,18 @@ direction = "output"
 content_type = "HttpResponse"
 buffer_size = 16384
 
+# The verification key device certificates are checked against.
+[[ports]]
+name = "verify_key"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
 [observability]
 metrics = [
+  "keypkg_unauthenticated",
+  "keypkg_wrong_device",
   "package_published",
   "package_claimed_exclusive",
   "package_claimed_last_resort",

@@ -17,7 +17,7 @@ direction = "output"
 content_type = "HttpResponse"
 buffer_size = 16384
 
-# The CA's signing seed, in the MSG_MINT_KEY shape every kagi module takes.
+# The CA's signing seed, in the MSG_KEY_ADD shape every kagi module takes.
 [[ports]]
 name = "signing_key"
 direction = "input"
@@ -26,3 +26,16 @@ buffer_size = 512
 
 [observability]
 metrics = ["certificate_issued", "certificate_no_key", "certificate_malformed"]
+
+# The CA's public half, as a VERIFY `MSG_KEY_ADD`.
+#
+# The signing record names a vault LABEL and carries no key material, so the
+# private half is generated inside the vault and the operator never sees the
+# public half either. This endpoint is the only component that does, which
+# makes announcing it its job — wire this to whatever validates the device
+# certificates it issues.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+max_record = 512

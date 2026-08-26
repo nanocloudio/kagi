@@ -67,10 +67,16 @@ mod b64;
 mod chan;
 #[path = "../../common/e2ee_credential.rs"]
 mod credential;
+#[path = "../../common/issuer_key.rs"]
+mod issuer_key;
 #[path = "../../common/jose.rs"]
 mod jose;
 #[path = "../../common/jwk.rs"]
 mod jwk;
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
+mod key_vault;
+#[path = "../../common/state_wire.rs"]
+mod state_wire;
 
 use auth_wire::PayloadReader;
 use credential::Ciphersuite;
@@ -89,6 +95,10 @@ const CREDENTIAL_CTY: &[u8] = b"ke+jwt";
 const CREDENTIAL_TTL_SECS: u64 = 24 * 3600;
 
 const MAX_FIELD: usize = 256;
+/// This module's client id on the ledger's shared reply port. Distinct
+/// from every other consumer's, so a fan-out reply reaches exactly one.
+const STATE_CLIENT: u8 = 2;
+
 const MAX_TOKEN: usize = 2048;
 /// Requests awaiting a directory answer.
 const MAX_IN_FLIGHT: usize = 4;
@@ -148,10 +158,15 @@ struct ModuleState {
     out_directory: i32,
     in_directory: i32,
 
-    seed: [u8; 32],
+    /// The signing key, held in the vault under the label the keyset record
+    /// names. This module never holds a private key.
+    key: issuer_key::IssuerKey,
     kid: [u8; 32],
     kid_len: u8,
-    has_key: bool,
+    /// Scratch for one vault SIGN. Sized for the largest signing input this
+    /// module produces plus the request header, and kept in module state
+    /// rather than on the PIC stack.
+    sign_scratch: [u8; MAX_TOKEN + issuer_key::SIGN_SCRATCH_OVERHEAD],
 
     iss: [u8; MAX_FIELD],
     iss_len: u16,
@@ -260,10 +275,9 @@ pub extern "C" fn module_new(
         s.out_directory = dev_channel_port(sys, 1, 1);
         s.in_directory = dev_channel_port(sys, 0, 2);
 
-        s.seed = [0; 32];
+        s.key = issuer_key::IssuerKey::empty();
         s.kid = [0; 32];
         s.kid_len = 0;
-        s.has_key = false;
         s.iss = [0; MAX_FIELD];
         s.iss_len = 0;
         s.next_corr = 1;
@@ -316,7 +330,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Take the latest MSG_MINT_KEY (`[alg u8][kid f8][seed 32]`).
+/// Take this profile's signing key from a `MSG_KEY_ADD`.
 ///
 /// # Safety
 ///
@@ -331,18 +345,41 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         }
         let mut buf = [0u8; 256];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
-        if msg_type != auth_wire::MSG_MINT_KEY {
+        // The key lifecycle, not a single raw-key delivery. This endpoint
+        // signs one artefact shape and holds one key for it, so it takes
+        // the ADD for its own profile and ignores everything else on the
+        // channel — the channel carries the whole issuer keyset.
+        let payload = &buf[..plen as usize];
+        if msg_type != auth_wire::MSG_KEY_ADD {
             continue;
         }
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(alg), Ok(kid)) = (r.u8(), r.field8()) else {
+        let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
             continue;
         };
-        let seed = r.rest();
-        if alg != auth_wire::MINT_ALG_ED25519 || seed.len() < 32 || kid.len() > s.kid.len() {
+        if rec.key_use != auth_wire::key_use::SIGN
+            || rec.profile_id != auth_wire::suite::profile::E2EE_CREDENTIAL
+        {
             continue;
         }
-        s.seed.copy_from_slice(&seed[..32]);
+
+        let (kid, label) = (rec.kid, rec.key_ref);
+        if rec.suite != auth_wire::suite::ED25519
+            || label.is_empty()
+            || label.len() > auth_wire::MAX_KEY_LABEL
+            || kid.is_empty()
+            || kid.len() > s.kid.len()
+        {
+            continue;
+        }
+        // The record names a LABEL; the key is generated inside the vault on
+        // first open and never travels. A label that will not open leaves
+        // the module without a key, which is the same state it was in
+        // before the record arrived — and `has_key` is now simply whether
+        // the vault holds one, so there is no flag to get out of step.
+        s.key.close(sys);
+        if !s.key.open(sys, rec.suite, label) {
+            continue;
+        }
         s.kid = [0; 32];
         s.kid[..kid.len()].copy_from_slice(kid);
         #[expect(
@@ -352,7 +389,6 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         {
             s.kid_len = kid.len() as u8;
         }
-        s.has_key = true;
     }
 }
 
@@ -372,18 +408,20 @@ unsafe fn drain_directory(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         }
         let mut buf = [0u8; abi::CHANNEL_BUFFER_SIZE];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_directory, &mut buf);
-        if msg_type != auth_wire::MSG_SECRET_VALUE {
+        if msg_type != state_wire::MSG_STATE_VALUE {
             continue;
         }
         worked = true;
 
-        // `[corr u32][status u8][id f8][version f8][value f16]`
-        let mut r = PayloadReader::new(&buf[..plen as usize]);
-        let (Ok(corr), Ok(status), Ok(_id), Ok(_ver), Ok(record)) =
-            (r.u32(), r.u8(), r.field8(), r.field8(), r.field16())
-        else {
+        let Ok(reply) = state_wire::StateReply::decode(msg_type, &buf[..plen as usize]) else {
             continue;
         };
+        // The ledger's reply port fans out to every consumer; a reply
+        // addressed to another module is not this module's to act on.
+        if reply.client != STATE_CLIENT {
+            continue;
+        }
+        let (corr, status, record) = (reply.correlation, reply.status, reply.value);
         let Some(slot) = take_pending(s, corr) else {
             continue;
         };
@@ -451,7 +489,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
-    if !s.has_key {
+    if !s.key.is_open() {
         s.credential_no_key = s.credential_no_key.saturating_add(1);
         refuse(s, sys, conn, stream, Refusal::NoKey);
         return;
@@ -556,21 +594,22 @@ unsafe fn accept(
         .position(|p| !p.live)
         .ok_or(Refusal::Busy)?;
 
-    // `MSG_SECRET_GET` = `[corr u32][id f8]`
-    let mut payload = [0u8; MAX_FIELD + 8];
-    let mut at = 0usize;
-    put(&mut payload, &mut at, &slot.corr.to_le_bytes())?;
-    let id_len = u8::try_from(device_len).map_err(|_| Refusal::Malformed)?;
-    put(&mut payload, &mut at, &[id_len])?;
-    put(&mut payload, &mut at, &slot.device_id[..device_len])?;
-
-    if chan::channel_write_msg(
-        sys,
-        s.out_directory,
-        auth_wire::MSG_SECRET_GET,
-        &payload[..at],
-    ) <= 0
-    {
+    // The device directory is the security-state ledger, read through the
+    // same namespace `enrollment_endpoint` writes. Reading a different store
+    // than the one enrolment commits to would let this endpoint issue for a
+    // device the ledger does not hold, or refuse one it does.
+    let request = state_wire::get(
+        slot.corr,
+        STATE_CLIENT,
+        state_wire::NS_DEVICE,
+        &slot.device_id[..device_len],
+    );
+    let mut frame = [0u8; MAX_FIELD + 32];
+    let n = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_GET, &request)
+        .map_err(|_| Refusal::Malformed)?;
+    let (msg_type, payload) =
+        auth_wire::read_envelope(&frame[..n]).map_err(|_| Refusal::Malformed)?;
+    if chan::channel_write_msg(sys, s.out_directory, msg_type, payload) <= 0 {
         return Err(Refusal::Busy);
     }
 
@@ -611,9 +650,7 @@ fn issue(s: &mut ModuleState, slot: &Pending, record: &[u8]) -> Result<usize, Re
         return Err(Refusal::BadPossession);
     }
 
-    let now = jose::claim_u64(record, b"iat").unwrap_or(0);
     let issued_at = current_seconds(s);
-    let _ = now;
 
     let mut claims = [0u8; 1024];
     let mut at = 0usize;
@@ -697,6 +734,9 @@ fn verify_with_jwk(canonical: &[u8], message: &[u8], signature: &[u8; 64]) -> bo
 
 /// Sign `claims` as a JWS typed `cty`, leaving it at the front of `s.out`.
 fn sign_jws(s: &mut ModuleState, cty: &[u8], claims: &[u8]) -> Result<usize, Refusal> {
+    // SAFETY: `s.syscalls` is the table handed to `module_new` and lives as
+    // long as the module.
+    let sys = unsafe { &*s.syscalls };
     let mut header = [0u8; 192];
     let mut at = 0usize;
     put(&mut header, &mut at, br#"{"alg":"EdDSA","cty":"#)?;
@@ -711,7 +751,12 @@ fn sign_jws(s: &mut ModuleState, cty: &[u8], claims: &[u8]) -> Result<usize, Ref
     let claims_len = b64::encode(claims, &mut token[n..]).ok_or(Refusal::Malformed)?;
     n += claims_len;
 
-    let signature = ed25519_sign(&s.seed, &token[..n]);
+    // Ed25519 signs the signing input itself (RFC 8037), and the fragment
+    // reads RAW from the key's own suite.
+    let key = s.key;
+    // SAFETY: as `sys` above; `sign_scratch` does not alias `token`.
+    let signature =
+        unsafe { key.sign(sys, &mut s.sign_scratch, &token[..n]) }.ok_or(Refusal::Malformed)?;
     put(&mut token, &mut n, b".")?;
     let sig_len = b64::encode(&signature, &mut token[n..]).ok_or(Refusal::Malformed)?;
     n += sig_len;
