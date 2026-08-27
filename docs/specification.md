@@ -422,15 +422,7 @@ Do not share this code or click links from other domains.
 
 ---
 
-## 16. Future Extensions
-
-- WebAuthn-style device attestation (stronger binding).
-- Optional recovery key escrow using encrypted payload in analytics channel.
-- Hierarchical tenant-level delegation certificates.
-
----
-
-## 17. Summary
+## 16. Summary
 
 | Goal | Achieved By |
 |------|--------------|

@@ -141,7 +141,7 @@ substrate that carries requests and delivers material differs:
   stable PKI path `/var/lib/<service>/pki/<id>/{leaf.der,leaf.key.der,ca.der}`
   (the constraint sector's PKI contract sets). Rotation is a file rewrite. Simplicity;
   no HTTP surface.
-- **Standalone** (the HTTP issuer, H1): `/start` → `/redeem` → `/token`.
+- **Standalone** (the HTTP issuer): `/start` → `/redeem` → `/token`.
   `/redeem` **returns** the leaf to the client (which stores it), `/token` mints
   JWT-SVIDs. Horizontal scale; the tier for onboarding many untrusted clients.
 
@@ -168,7 +168,7 @@ provisioner/Device-CR admission, which is stronger than inbox possession for
 machine identities and needs no SMTP. Email earns its place only in the managed
 tier, onboarding untrusted humans at scale.
 
-## 5a. Revocation and credential lifetime
+## 6. Revocation and credential lifetime
 
 kagi follows the SPIFFE short-TTL doctrine: **short-lived presented credentials
 plus revocation at the mint gate — no CRL, no OCSP, no per-certificate
@@ -177,64 +177,51 @@ short expiry.
 
 - **Anchor vs. presented.** The device certificate (`dc+jwt`) is the durable
   enrolment *anchor*, presented only to kagi's `/token`, so it is longer-lived
-  (`IDENTITY_DEVICE_CERT_TTL_SECS`, default 30d) and gated by the mint-time
-  revocation check, not by a short TTL. Everything presented to a relying party
-  — the access token, the JWT-SVID, and the **SPIFFE mTLS leaf** — is
-  **short-lived**: the leaf uses `IDENTITY_SPIFFE_LEAF_TTL_SECS` (default 1h),
-  the access token `IDENTITY_ACCESS_TOKEN_TTL_SECS` (default 10m).
-- **Rotation, not re-enrolment.** The device refreshes its short leaf + access
-  token by re-calling `/token` with its device certificate + a fresh `DPoP`
-  proof — no repeat of the email challenge. `/token` mints both.
-- **Revocation = the mint gate.** Revoking a device puts its `device_id` in the
-  revocation filter `wellknown_endpoint` publishes; the mint path then
-  refuses for it. Short TTLs age out whatever it already holds within one
-  window, so a directly-presented leaf a relying party can't revoke simply
-  expires. No revocation state is pushed to relying parties.
+  — 30 days, `CERTIFICATE_TTL_SECS` in `enrollment_endpoint` — and gated by the
+  mint-time revocation check rather than by a short expiry. Everything
+  presented to a relying party is short-lived: the access token defaults to
+  five minutes (`DEFAULT_TTL_SECS` in `token_endpoint`), and the X.509 leaf
+  `certificate_endpoint` issues carries its own bound.
+- **Rotation, not re-enrolment.** The device refreshes its access token by
+  re-calling `/token` with its device certificate and a fresh DPoP proof — no
+  repeat of the enrolment challenge.
+- **Revocation = the mint gate.** Revoking a device records it in the ledger
+  and publishes it in the filter `wellknown_endpoint` serves. Admission reads
+  the ledger on every mint, so a revoked device is refused there; the published
+  filter is what relying parties fetch. Short TTLs age out whatever the device
+  already holds within one window, so a directly-presented leaf a relying party
+  cannot revoke simply expires.
 
 The device *key* — not any certificate — is the identity anchor a hostile holder
 must be denied; the registry denies it once, at the source.
 
-## 6. Current state vs. target
+## 7. What kagi issues
 
-| Piece | Current | Target |
-| --- | --- | --- |
-| Device cert | JWT-form `cty=dc+jwt`, `sub=tenant_<id>` (`enrollment_endpoint`) | P-256 X.509 leaf with SPIFFE SAN (Carrier A) |
-| X.509 issuance | ✅ leaves with a SPIFFE SAN URI (`certificate_endpoint`, `modules/common/der.rs`) | — |
-| Identity naming | `tenant_<id>` / `dev_<id>` strings | `spiffe://<td>/device/<tenant>/<device>` |
-| Access token | `cnf`/DPoP bound (`token_endpoint` → `token_mint`) | + JWT-SVID shape (`x5c`/`aud`/`jti`, Carrier B) |
-| Enrollment | ✅ `/start`/`/redeem` (`enrollment_endpoint`), `/token` (`token_endpoint`) | — |
-| Trust domain | `__TRUST_DOMAIN__` in `configs/pki.yaml` | — |
+| Piece | Where |
+| --- | --- |
+| Device certificate | JWT-form `cty=dc+jwt`, `sub=tenant_<id>` — `enrollment_endpoint` |
+| X.509 leaf with a SPIFFE SAN | `certificate_endpoint`, under a P-256 CA, with `modules/common/der.rs` emitting the profile |
+| Identity naming | `modules/common/spiffe.rs` |
+| Access token | `cnf`/DPoP bound — `token_endpoint` → `mint_admission` → `token_mint` |
+| Trust domain | `__TRUST_DOMAIN__` in `configs/pki.yaml` |
 
-## 7. Build order
+The CA certificate is served at `GET /.well-known/ca.pem` for relying-party
+pinning. Carrier B is client-signed, so kagi's part is the leaf plus P-256
+device-key enrolment, leaving the client holding a usable leaf key; the
+verifier belongs to the relying party, and `tests/harness/src/jwt_svid.rs` is
+the conformance implementation of it.
 
-1. **H1 — standalone enrollment** ✅ done: the gate (`Direct` +
-   `BootstrapToken`, no SMTP) plus `/start`/`/redeem`
-   (`modules/app/enrollment_endpoint`) and `/token`
-   (`modules/app/token_endpoint`). `Email` is the deferred managed
-   backend: the gate exists, nothing here sends mail. Issues the current
-   identity strings; SPIFFE shaping is step 2.
-2. **SPIFFE leaf alignment** ✅ done: naming in
-   `modules/common/spiffe.rs`, the SAN URI and the leaf profile in
-   `modules/common/der.rs`, and Carrier A issuance in
-   `modules/app/certificate_endpoint` under a P-256 CA. The CA cert is
-   served at `GET /.well-known/ca.pem` for relying-party pinning.
-3. **JWT-SVID parity** ✅ done: Carrier B is client-signed, so kagi's
-   part is the leaf plus P-256 device-key enrollment so the client holds
-   a usable leaf key. The verifier is the relying party's, and
-   `tests/harness/src/jwt_svid.rs` is the conformance implementation of
-   it.
-4. **Embedded provisioner**: the writing primitive — generate a node
-   key, obtain the leaf, write `leaf.der`/`leaf.key.der`/`ca.der` to a
-   PKI path — is a client of `certificate_endpoint` rather than
-   something kagi runs. The k8s Device-CR watch loop that would call it
-   per admission is nanocloud control-plane work, not kagi.
+The writing primitive an embedded provisioner needs — generate a node key,
+obtain the leaf, write `leaf.der`/`leaf.key.der`/`ca.der` to a PKI path — is a
+client of `certificate_endpoint` rather than something kagi runs. The
+Kubernetes Device-CR watch loop that calls it per admission is nanocloud
+control-plane work.
 
-## 8. Cross-project reconciliation
+## 8. Naming across the family
 
-Sector's docs currently use `spiffe://nanocloud/sector/<id>` (bare `nanocloud`,
-no TLD, `sector` as the first segment). Under this scheme that becomes
-`spiffe://nanocloud.local/svc/sector/<id>`. Since kagi is the authority that
-defines the trust domain, sector aligns to it — a config/doc edit only (the
-`tls` module derives the SVID from the leaf pubkey regardless of the SAN
-string, so no `tls` code changes). Tracked as a follow-up sector pass, not part
-of H1.
+kagi is the authority that defines the trust domain, so every other project in
+the family names identities by the §2 scheme: a sector workload is
+`spiffe://nanocloud.local/svc/sector/<id>`, not `spiffe://nanocloud/sector/<id>`.
+The SVID is derived from the leaf public key rather than from the SAN string, so
+a name that disagrees is a documentation error rather than a verification
+failure — which is exactly why the scheme has one definition.

@@ -30,8 +30,8 @@ signature and window, `dpop` for the proof, `jwk` for the thumbprint —
 so the gate and the issuer cannot drift apart.
 
 Wire it behind its own listener (`gate_http` in `configs/issuer.yaml`)
-and deliver the issuer's public key on `verify_key`, in the same
-`MSG_VERIFY_KEY` shape `token_verify` takes. **Until a key arrives every
+and deliver the issuer's public key on `verify_key` as a `MSG_KEY_ADD`
+record, the same key lifecycle every other verifier takes. **Until a key arrives every
 request is refused**: a gate that admitted while it had nothing to verify
 against would be a gate in name only.
 

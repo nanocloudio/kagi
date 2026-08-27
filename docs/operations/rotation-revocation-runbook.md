@@ -1,83 +1,110 @@
 # Signing-key rotation and device revocation
 
-How to roll the issuer's signing key without invalidating tokens already
-in flight, and how device revocation behaves.
+How to roll the issuer's signing key without invalidating credentials
+already in flight, and how device revocation behaves.
 
 Source: `modules/app/token_mint`, `modules/app/wellknown_endpoint`,
-`modules/common/auth_wire.rs`.
+`modules/app/mint_admission`, `modules/common/auth_wire.rs`.
 
 ## 0. The control channel
 
-Both operations are messages on the graph's control chain — the
-websocket on `__WS_PORT__` → `ws_stream` → `remote_channel` → the module
-that needs them. There is no config file to edit and no process to
-restart: a module's key material is whatever was last delivered to it.
+Both operations are messages on the graph's control chain — the mutually
+authenticated WebSocket on `__WS_PORT__` → `remote_channel` → the module
+that needs them. There is no config file to edit and no process to restart.
 
 | message | channel | reaches |
 | --- | --- | --- |
-| `MSG_MINT_KEY` | ch0 | `token_mint` — the private seed |
-| `MSG_VERIFY_KEY` | ch1 | `wellknown_endpoint`, `resource_gate` — the public half |
-| `MSG_MINT_KEY` | ch2 | `enrollment_endpoint`, `e2ee_credential_endpoint` |
+| the key lifecycle | ch0 | `token_mint` |
+| the key lifecycle | ch1 | `wellknown_endpoint`, `resource_gate`, `mint_admission`, `keypackage_endpoint` |
+| the key lifecycle | ch2 | `enrollment_endpoint`, `e2ee_credential_endpoint` |
 | `MSG_REVOKE` | ch3 | `wellknown_endpoint` |
 
-That a delivery is not persisted is the point: a graph restarted without
-its key material mints nothing and admits nothing, rather than falling
-back to something stale.
+A signing record names a vault label. The private half is generated inside
+the vault, never travels this socket, and the public half comes back out of
+the signer on its own `key_announce` edge — so distributing a key and
+compromising one are different operations.
+
+Deliveries are not persisted, and that is the point: a graph restarted
+without its key material mints nothing and admits nothing, rather than
+falling back to something stale.
 
 ## 1. Signing keys
 
-`wellknown_endpoint` publishes up to **four** keys at once. A set exists
-to carry a rotation — the key being retired, the one replacing it, and
-briefly a third while a third-party cache catches up. Four is room for
-that and no room for a leak: a module that accumulated every key it had
-ever seen would keep publishing one whose private half was destroyed.
+A keyset is indexed by `(issuer, profile_id, kid)` and holds more than one
+live entry, because a rotation needs two keys at once. Four verbs are the
+whole lifecycle, and the order is the procedure.
 
-Only `token_mint` signs, and it holds one seed: the last `MSG_MINT_KEY`
-it received. So the overlap that makes rotation a non-event lives
-entirely in the published set.
+`wellknown_endpoint` publishes up to four keys at once: the key being
+retired, the one replacing it, and room for a third while a third-party
+cache catches up. Four is room for a rotation and no room for a leak — a
+module accumulating every key it had ever seen would keep publishing one
+whose private half is gone.
 
 ### Before you start
 
-Note the longest lifetime any credential in circulation has. The
-retiring key must stay published until the longest of those has elapsed
-— read the TTLs from the module params in your rendered graph.
+Note the longest lifetime any credential in circulation has. The retiring
+key must stay published until the longest of those has elapsed; read the
+TTLs from the module params in your rendered graph.
 
-### Stage
+### Add
 
-Deliver the incoming key's **public half only**, on ch1. Both keys now
-appear in the set; the original still signs.
+`MSG_KEY_ADD` with the incoming key's record, on every channel that must
+know it. The key is loaded and does not sign. Confirm both `kid`s are in the
+published set before going further:
 
 ```
 curl -s https://issuer.example/.well-known/jwks.json | jq '.keys | map(.kid)'
 ```
 
-Both `kid`s must be present before going further. Mint a token and read
-its header `kid` to confirm the original key is still the one signing.
+Adding and activating are separate steps because every verifier must hold a
+key before anything signs with it. Skip the gap and the first credential
+minted under the new key is unverifiable everywhere that has not caught up.
 
-### Promote
+### Activate
 
-Deliver the incoming key's seed on ch0. `token_mint` replaces its seed
-and new tokens carry the new `kid`. Tokens signed by the outgoing key
-still validate, because its public half is still in the set.
+`MSG_KEY_ACTIVATE` naming the same `(issuer, profile_id, kid)`. New
+credentials carry the new `kid`; there is exactly one active key per
+`(issuer, profile)`. Credentials signed by the outgoing key still verify,
+because it is still in the set.
 
 ### Retire
 
-Once the longest credential lifetime noted above has elapsed, restart
-the graph and deliver only the current key. The set is rebuilt from what
-it is given, so a key not delivered is a key not published.
+`MSG_KEY_RETIRE` with a `remove_after_unix` past the longest credential
+lifetime noted above. The key stops signing and keeps verifying. A retired
+key stays in the published set: dropping it would make every credential
+still inside its own validity window unverifiable to a relying party that
+refetches.
+
+### Remove
+
+`MSG_KEY_REMOVE`, once the deadline has passed. It unpublishes the key and
+credentials signed under it stop verifying. This is also the compromise
+path, where that is the intended effect — immediate and unconditional.
 
 ### Rollback
 
-Deliver the previous seed on ch0. Because both public halves stay
-published throughout, tokens minted at any point during the rotation
-continue to validate, so a rollback costs one message.
+Before the outgoing key is removed, `MSG_KEY_ACTIVATE` naming it again.
+Both public halves are published throughout, so credentials minted at any
+point during the rotation continue to verify and a rollback costs one
+message.
 
 ## 2. Device revocation
 
-`wellknown_endpoint` holds a Bloom filter published at
-`/.well-known/revocations.json`. Its shape is fixed in the module rather
-than configured, because the document's shape is what clients parse and
-a deployment that could change it would change the document under them:
+Send `MSG_REVOKE` with the device identifier on ch3.
+
+`wellknown_endpoint` writes the revocation to the ledger first and publishes
+it second. The ledger is the authority: admission reads the device record on
+every mint, so a revoked device is refused at the next mint rather than at
+the next token expiry. The published document is the projection relying
+parties fetch. Publishing second means the two cannot disagree in the
+dangerous direction — a revocation the document claims but the mint has
+never seen. When the ledger cannot be reached the bits are still set, because
+dropping a revocation is the unsafe direction, and the divergence is counted
+as `revocation_uncommitted` rather than hidden.
+
+The published filter is a Bloom filter at
+`/.well-known/revocations.json`, its shape fixed in the module rather than
+configured, because the document's shape is what clients parse:
 
 | field | value |
 | --- | --- |
@@ -85,34 +112,24 @@ a deployment that could change it would change the document under them:
 | `hash_functions` | 3 |
 | `capacity` | 1 000, at roughly a 1% false-positive rate |
 
-The bitmap is bounded by what one response can carry: the document must
-fit a single `HttpResponse` envelope, since a larger body needs
-`MORE_BODY` chunking and a document that arrives in pieces needs a
-resumption story for the client that fetches it. That bound is not a
-limitation to work around — a document a client fetches on every cold
-start should be small.
+The bitmap is bounded by what one response can carry: the document must fit
+a single `HttpResponse` envelope, since a larger body needs `MORE_BODY`
+chunking and a document arriving in pieces needs a resumption story for the
+client fetching it. A document fetched on every cold start should be small.
 
-The snapshot also carries `bitmap`, `salt`, `inserted` and `updated_at`.
-The salt is why one deployment's document says nothing about another's.
+The snapshot also carries `bitmap`, `salt`, `inserted` and `updated_at`. The
+salt is why one deployment's document says nothing about another's.
 
-Two consequences of the filter's shape are worth stating outright:
+Two consequences of the filter's shape:
 
-- **It is append-only.** An entry cannot be withdrawn. Revoking the
-  wrong device is corrected by restarting the graph and replaying a
-  corrected feed, not by removing the entry.
-- **False positives are possible**, at roughly one in a hundred at
-  capacity, climbing as the filter fills past it. Watch `inserted`
-  against `capacity`; the module also counts `revocation_saturated`.
-  Past capacity a revocation is still recorded, because dropping one
-  would be the unsafe direction.
-
-### Revoking a device
-
-Send `MSG_REVOKE` with the device identifier on ch3.
-
-The filter is in memory, so restarting the graph clears it. Any
-deployment relying on revocation must replay its revocation feed before
-the graph takes traffic.
+- **It is append-only.** An entry cannot be withdrawn. The published filter
+  is rebuilt from what the graph is given, so correcting a mistaken
+  revocation means correcting the ledger record and replaying a corrected
+  feed.
+- **False positives are possible**, at roughly one in a hundred at capacity
+  and climbing past it. Watch `inserted` against `capacity`; the module also
+  counts `revocation_saturated`. Past capacity a revocation is still
+  recorded, because dropping one would be the unsafe direction.
 
 ### Checking a publication
 
@@ -121,22 +138,17 @@ curl -s -H 'Cache-Control: no-cache' \
   https://issuer.example/.well-known/revocations.json | jq
 ```
 
-`inserted` should have grown by one and `updated_at` should be close to
-the current time.
-
-### Who checks it
-
-Nothing in the graph does. The document is published for relying
-parties, and a revoked device keeps working until its current access
-token expires — which is why access tokens are short: their lifetime is
-the revocation delay.
+`inserted` should have grown by one and `updated_at` should be close to the
+current time.
 
 ## 3. What to watch
 
-- `inserted` against `capacity`, and the `revocation_saturated` metric.
-- `wellknown_endpoint`'s published `kid` set, which is the ground truth
-  for what a relying party will accept.
-- `resource_gate`'s `gate_no_key`, which is non-zero exactly when the
-  gate has been given nothing to verify against.
+- `inserted` against `capacity`, and `revocation_saturated`.
+- `revocation_uncommitted`, which is non-zero exactly when the published
+  document claims a revocation the ledger did not take.
+- `wellknown_endpoint`'s published `kid` set, which is the ground truth for
+  what a relying party will accept.
+- `resource_gate`'s `gate_no_key`, non-zero exactly when the gate has been
+  given nothing to verify against.
 - Probes against `/healthz`, `/.well-known/jwks.json` and
   `/.well-known/revocations.json`.
