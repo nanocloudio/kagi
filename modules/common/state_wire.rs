@@ -400,6 +400,67 @@ pub fn compose_key(namespace: u8, key: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(total)
 }
 
+/// Build the replay claim for a proof, as a create-only write.
+///
+/// A replay check that reads and then writes is not a replay check: two
+/// replicas both read "unseen" and both admit. Create-if-absent is the claim
+/// itself — it succeeds for the first caller and returns a conflict to every
+/// other, at one linearization point, which is the property `NS_REPLAY`
+/// declares and the reason it may not be served from a volatile view.
+///
+/// The entry expires with the proof. A proof outside its freshness window is
+/// refused before it is ever offered here, so remembering it past that point
+/// would be paying to store what nothing can present.
+///
+/// `key` is the proof's replay identifier, already in the keyspace's
+/// alphabet — a base64url digest, not the raw `jti`, which is whatever the
+/// client wrote.
+#[must_use]
+pub fn claim_replay<'a>(
+    correlation: u32,
+    client: u8,
+    key: &'a [u8],
+    expires_at: u64,
+) -> StateRequest<'a> {
+    StateRequest {
+        correlation,
+        client,
+        namespace: NS_REPLAY,
+        key,
+        etag: &[],
+        // The record's presence is the whole of its meaning, so it carries
+        // no body: what a reader wants to know is whether the write
+        // succeeded, not what it stored.
+        value: b"{}",
+        expiry_unix: expires_at,
+    }
+}
+
+/// What a replay claim's reply means.
+///
+/// `Unavailable` is deliberately not "probably fine": a claim that could not
+/// be made is a proof whose freshness nothing established, and admitting it
+/// would make the ledger's absence a way to replay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReplayClaim {
+    /// This proof had not been seen. It has now been recorded.
+    Fresh,
+    /// Seen before, by this process or another sharing the ledger.
+    Replayed,
+    /// The ledger could not answer.
+    Unavailable,
+}
+
+/// Read a replay claim's reply status.
+#[must_use]
+pub const fn replay_claim_result(status: u8) -> ReplayClaim {
+    match status {
+        crate::auth_wire::ST_OK => ReplayClaim::Fresh,
+        crate::auth_wire::ST_CONFLICT => ReplayClaim::Replayed,
+        _ => ReplayClaim::Unavailable,
+    }
+}
+
 // ── Durability requirements per state class (C2) ────────────────────────
 //
 // Every namespace above holds a different kind of security state, and they

@@ -112,6 +112,9 @@ const POLICY: device_auth::Policy = device_auth::Policy {
 /// Which flow a Pending entry is running.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flow {
+    /// /authorize: claiming the proof's replay identifier, before anything
+    /// is looked up on its behalf.
+    AuthzClaim,
     /// /authorize: awaiting the client-registry GET.
     AuthzClient,
     /// exchange: awaiting the code GET.
@@ -152,6 +155,9 @@ struct Pending {
     code_len: u16,
     code_etag: [u8; 64],
     code_etag_len: u16,
+    /// The proof's replay identifier, base64url, as the ledger files it.
+    replay_key: [u8; 43],
+    replay_key_len: u8,
     auth_time: u64,
     access_token: [u8; 4096],
     access_len: u16,
@@ -184,6 +190,8 @@ impl Pending {
             code_len: 0,
             code_etag: [0; 64],
             code_etag_len: 0,
+            replay_key: [0; 43],
+            replay_key_len: 0,
             auth_time: 0,
             access_token: [0; 4096],
             access_len: 0,
@@ -501,13 +509,20 @@ unsafe fn handle_authorize(
 
     let mut claims_buf = [0u8; device_auth::MAX_SEGMENT];
     let mut replayed = false;
+    let mut proof_id = [0u8; 32];
     let admitted = {
         let seen = &mut replayed;
-        let mut offer = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
-            dpop::Replay::Recorded => true,
-            dpop::Replay::Seen | dpop::Replay::Full => {
-                *seen = true;
-                false
+        let claimed = &mut proof_id;
+        let mut offer = |jti: &[u8; 32]| {
+            // Kept for the durable claim. The window answers first because
+            // it is free and catches a replay inside this process at once.
+            *claimed = *jti;
+            match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+                dpop::Replay::Recorded => true,
+                dpop::Replay::Seen | dpop::Replay::Full => {
+                    *seen = true;
+                    false
+                }
             }
         };
         device_auth::authenticate(
@@ -559,7 +574,7 @@ unsafe fn handle_authorize(
     // the certificate; scope is deferred to the client-registry reply, where
     // it is CLAMPED.
     let mut e = Pending::zero();
-    e.flow = Flow::AuthzClient;
+    e.flow = Flow::AuthzClaim;
     e.caller_corr = corr;
     e.auth_time = now;
     copy_field(&mut e.sub, &mut e.sub_len, sub);
@@ -577,15 +592,48 @@ unsafe fn handle_authorize(
     // overwritten with the clamped scope once the client is known.
     copy_field(&mut e.scope, &mut e.scope_len, req.code_challenge);
 
+    // The proof's replay identifier, in the keyspace's alphabet — the digest
+    // rather than the client's own `jti`, which is whatever the client wrote.
+    let Some(key_len) = b64::encode(&proof_id, &mut e.replay_key) else {
+        refuse_authz(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
+        return;
+    };
+    #[expect(clippy::cast_possible_truncation, reason = "base64url of 32 bytes is 43")]
+    {
+        e.replay_key_len = key_len as u8;
+    }
+
+    // Claimed BEFORE the client registry is read. The in-process window
+    // catches a proof offered twice to this process; the ledger catches one
+    // offered to a replica, or to this process after a restart, and until
+    // that is settled there is no reason to look anything up.
     let sc = s.next_corr;
     s.next_corr = s.next_corr.wrapping_add(1).max(1);
     e.state_corr = sc;
-    if !state_get(s, sys, sc, state_wire::NS_OAUTH_CLIENT, req.client_id) {
+    if !claim_proof(s, sys, sc, &e) {
         refuse_authz(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     e.live = true;
     s.pending[index] = e;
+}
+
+/// Claim a proof's replay identifier in the ledger.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn claim_proof(s: &ModuleState, sys: &SyscallTable, corr: u32, e: &Pending) -> bool {
+    let request = state_wire::claim_replay(
+        corr,
+        STATE_CLIENT,
+        &e.replay_key[..usize::from(e.replay_key_len)],
+        e.auth_time + PROOF_WINDOW_SECS,
+    );
+    let mut frame = [0u8; 512];
+    state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)
+        .ok()
+        .and_then(|n| auth_wire::read_envelope(&frame[..n]).ok())
+        .is_some_and(|(t, p)| chan::channel_write_msg(sys, s.out_state, t, p) > 0)
 }
 
 /// exchange step 1: start the code lookup.
@@ -804,6 +852,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         worked = true;
         let e = s.pending[index];
         match e.flow {
+            Flow::AuthzClaim => authz_on_claim(s, sys, index, &e, &rep),
             Flow::AuthzClient => authz_on_client(s, sys, index, &e, &rep),
             Flow::XchgCode => xchg_on_code(s, sys, index, &e, &rep),
             Flow::XchgDevice => xchg_on_device(s, sys, index, &e, &rep),
@@ -813,6 +862,62 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         }
     }
     worked
+}
+
+/// /authorize: the replay claim answered.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn authz_on_claim(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    index: usize,
+    e: &Pending,
+    rep: &state_wire::StateReply<'_>,
+) {
+    match state_wire::replay_claim_result(rep.status) {
+        state_wire::ReplayClaim::Fresh => {}
+        state_wire::ReplayClaim::Replayed => {
+            s.pending[index] = Pending::zero();
+            refuse_authz(s, sys, e.caller_corr, auth_wire::authz_err::REPLAY);
+            return;
+        }
+        state_wire::ReplayClaim::Unavailable => {
+            // A claim that could not be made is a proof whose freshness
+            // nothing established.
+            s.pending[index] = Pending::zero();
+            refuse_authz(
+                s,
+                sys,
+                e.caller_corr,
+                auth_wire::authz_err::STATE_UNAVAILABLE,
+            );
+            return;
+        }
+    }
+
+    let sc = s.next_corr;
+    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    let mut next = *e;
+    next.flow = Flow::AuthzClient;
+    next.state_corr = sc;
+    if !state_get(
+        s,
+        sys,
+        sc,
+        state_wire::NS_OAUTH_CLIENT,
+        &next.client_id[..usize::from(next.client_id_len)],
+    ) {
+        s.pending[index] = Pending::zero();
+        refuse_authz(
+            s,
+            sys,
+            e.caller_corr,
+            auth_wire::authz_err::STATE_UNAVAILABLE,
+        );
+        return;
+    }
+    s.pending[index] = next;
 }
 
 /// /authorize: the client registry answered. Verify redirect_uri (exact),

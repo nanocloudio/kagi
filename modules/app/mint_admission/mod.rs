@@ -87,6 +87,8 @@ mod b64;
 mod chan;
 #[path = "../../common/device_auth.rs"]
 mod device_auth;
+#[path = "../../common/totp.rs"]
+mod totp;
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/jose.rs"]
@@ -174,6 +176,16 @@ struct Pending {
     /// stage that sees both halves: the enrolment facts the ledger record
     /// carries, and the possession proof in the request in front of it.
     evidence: auth_wire::assurance::EvidenceWire,
+    /// Which round trip this entry is waiting on.
+    stage: u8,
+    /// The proof's replay identifier, base64url, as the ledger files it.
+    replay_key: [u8; 43],
+    replay_key_len: u8,
+    /// The one-time code presented, if any. Checked against the device
+    /// record when it comes back, because that is where the authenticator
+    /// lives.
+    otp: [u8; MAX_OTP],
+    otp_len: u8,
     /// When the possession proof was verified — the token's `auth_time`.
     ///
     /// Taken at verification rather than when the ledger answers: the round
@@ -202,6 +214,11 @@ impl Pending {
                 flags: 0,
                 auth_time: 0,
             },
+            stage: STAGE_CLAIM_PROOF,
+            replay_key: [0; 43],
+            replay_key_len: 0,
+            otp: [0; MAX_OTP],
+            otp_len: 0,
             proved_at: 0,
         }
     }
@@ -254,6 +271,8 @@ struct ModuleState {
     admit_unavailable: u32,
     admit_in_flight_full: u32,
     admit_unmatched_reply: u32,
+    /// A one-time code was presented and did not hold.
+    admit_bad_otp: u32,
     grant_ok: u32,
     grant_mint_failed: u32,
 
@@ -367,6 +386,7 @@ pub extern "C" fn module_new(
         s.admit_unavailable = 0;
         s.admit_in_flight_full = 0;
         s.admit_unmatched_reply = 0;
+        s.admit_bad_otp = 0;
 
         // No ledger, no admission. Refused at CONSTRUCTION rather than at
         // the first request: without it, enrolment and revocation are both
@@ -553,18 +573,33 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         // fails to decode is dropped, because it carries no trustworthy corr.
         if msg_type == auth_wire::MSG_GRANT_REQ {
             if let Ok(g) = auth_wire::GrantRequest::decode(payload) {
-                handle(s, sys, g.corr, g.method, g.uri, g.credential, g.proof, true);
+                handle(
+                    s,
+                    sys,
+                    &Ask {
+                        corr: g.corr,
+                        method: g.method,
+                        uri: g.uri,
+                        credential: g.credential,
+                        proof: g.proof,
+                        otp: g.otp,
+                        grant: true,
+                    },
+                );
             }
         } else if let Ok(req) = auth_wire::AdmitRequest::decode(payload) {
             handle(
                 s,
                 sys,
-                req.corr,
-                req.method,
-                req.uri,
-                req.credential,
-                req.proof,
-                false,
+                &Ask {
+                    corr: req.corr,
+                    method: req.method,
+                    uri: req.uri,
+                    credential: req.credential,
+                    proof: req.proof,
+                    otp: req.otp,
+                    grant: false,
+                },
             );
         } else {
             // No correlation to answer under. Dropped rather than answered
@@ -581,25 +616,44 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     worked
 }
 
+/// Claiming the proof's replay identifier, so one proof admits once across
+/// every replica sharing the ledger.
+const STAGE_CLAIM_PROOF: u8 = 0;
+/// Reading the device record.
+const STAGE_DEVICE: u8 = 1;
+
+/// Longest one-time code a presenter may offer.
+const MAX_OTP: usize = 8;
+
+/// One presentation, whichever request shape carried it.
+///
+/// The two differ in what they ask for and not in what they present, so the
+/// admission path takes this and neither of them.
+struct Ask<'a> {
+    corr: u32,
+    method: &'a [u8],
+    uri: &'a [u8],
+    credential: &'a [u8],
+    proof: &'a [u8],
+    otp: &'a [u8],
+    grant: bool,
+}
+
 /// Fact 1, and the start of facts 2-3.
 ///
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the five presentation fields     plus the grant flag; a struct here would just be AdmitRequest, which the     grant caller does not have"
-)]
-unsafe fn handle(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    corr: u32,
-    method: &[u8],
-    uri: &[u8],
-    credential: &[u8],
-    proof: &[u8],
-    grant: bool,
-) {
+unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
+    let Ask {
+        corr,
+        method,
+        uri,
+        credential,
+        proof,
+        otp,
+        grant,
+    } = *ask;
     // A GrantRequest decodes with an empty credential so its corr survives to
     // be answered here — a GET /oauth/token, a wrong path, or an empty body
     // must get a refusal, not vanish. (An AdmitRequest never reaches this
@@ -642,6 +696,7 @@ unsafe fn handle(
 
     let mut claims_buf = [0u8; device_auth::MAX_SEGMENT];
     let mut replayed = false;
+    let mut proof_id = [0u8; 32];
     let admitted = {
         // The window fails closed: a saturated one refuses rather than
         // evicting a live entry, because an eviction under load is an
@@ -650,11 +705,18 @@ unsafe fn handle(
         // "somebody replayed a proof" and "the window is saturated" are
         // different operator problems.
         let seen = &mut replayed;
-        let mut offer = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
-            dpop::Replay::Recorded => true,
-            dpop::Replay::Seen | dpop::Replay::Full => {
-                *seen = true;
-                false
+        let claimed = &mut proof_id;
+        let mut offer = |jti: &[u8; 32]| {
+            // Kept for the durable claim below. The local window answers
+            // first because it is free and catches a replay inside this
+            // process immediately; the ledger answers for every process.
+            *claimed = *jti;
+            match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+                dpop::Replay::Recorded => true,
+                dpop::Replay::Seen | dpop::Replay::Full => {
+                    *seen = true;
+                    false
+                }
             }
         };
         device_auth::authenticate(
@@ -709,24 +771,51 @@ unsafe fn handle(
     entry.device_id[..device_len].copy_from_slice(&device_id[..device_len]);
     entry.jkt = admitted.thumbprint;
     entry.proved_at = now;
+    let otp_len = otp.len().min(MAX_OTP);
+    entry.otp[..otp_len].copy_from_slice(&otp[..otp_len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_OTP")]
+    {
+        entry.otp_len = otp_len as u8;
+    }
     #[expect(clippy::cast_possible_truncation, reason = "each bounded by MAX_FIELD")]
     {
         entry.sub_len = sub_len as u16;
         entry.device_id_len = device_len as u16;
     }
 
+    // The proof's replay id, in the keyspace's alphabet. The digest rather
+    // than the client's own `jti`: a `jti` is whatever the client wrote, and
+    // a key built from it would be a key the client chooses.
+    let mut replay_key = [0u8; 43];
+    let Some(replay_key_len) = b64::encode(&proof_id, &mut replay_key) else {
+        s.admit_unavailable = s.admit_unavailable.saturating_add(1);
+        reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
+        return;
+    };
+    entry.replay_key = replay_key;
+    #[expect(clippy::cast_possible_truncation, reason = "base64url of 32 bytes is 43")]
+    {
+        entry.replay_key_len = replay_key_len as u8;
+    }
+
     let state_corr = s.next_corr;
     s.next_corr = s.next_corr.wrapping_add(1).max(1);
     entry.state_corr = state_corr;
+    entry.stage = STAGE_CLAIM_PROOF;
 
-    let request = state_wire::get(
+    // The replay claim goes FIRST, before the device is even looked up. A
+    // proof this authority has already answered is not a request; spending a
+    // ledger round trip on the device record before finding that out would
+    // be doing work for a replay.
+    let request = state_wire::claim_replay(
         state_corr,
         STATE_CLIENT,
-        state_wire::NS_DEVICE,
-        &entry.device_id[..device_len],
+        &replay_key[..replay_key_len],
+        now + PROOF_WINDOW_SECS,
     );
     let mut frame = [0u8; 512];
-    let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_GET, &request) else {
+    let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)
+    else {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
         reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
         return;
@@ -780,6 +869,52 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         let entry = s.pending[index];
         s.pending[index] = Pending::zero();
 
+        // The replay claim's answer, before anything about the device.
+        if entry.stage == STAGE_CLAIM_PROOF {
+            match state_wire::replay_claim_result(rep.status) {
+                state_wire::ReplayClaim::Fresh => {}
+                state_wire::ReplayClaim::Replayed => {
+                    // Seen by this process or another sharing the ledger.
+                    // The local window catches the first case for free; this
+                    // is the one it cannot see.
+                    s.admit_replay = s.admit_replay.saturating_add(1);
+                    reply(
+                        s,
+                        sys,
+                        entry.caller_corr,
+                        auth_wire::admit_err::REPLAY,
+                        entry.grant,
+                    );
+                    continue;
+                }
+                state_wire::ReplayClaim::Unavailable => {
+                    // A claim that could not be made is a proof whose
+                    // freshness nothing established. Admitting anyway would
+                    // make the ledger's absence a way to replay.
+                    s.admit_unavailable = s.admit_unavailable.saturating_add(1);
+                    reply(
+                        s,
+                        sys,
+                        entry.caller_corr,
+                        auth_wire::admit_err::STATE_UNAVAILABLE,
+                        entry.grant,
+                    );
+                    continue;
+                }
+            }
+            if !stage_device_read(s, sys, index, &entry) {
+                s.admit_unavailable = s.admit_unavailable.saturating_add(1);
+                reply(
+                    s,
+                    sys,
+                    entry.caller_corr,
+                    auth_wire::admit_err::STATE_UNAVAILABLE,
+                    entry.grant,
+                );
+            }
+            continue;
+        }
+
         match rep.status {
             auth_wire::ST_OK => {}
             auth_wire::ST_NOT_FOUND => {
@@ -825,13 +960,34 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             continue;
         }
 
+        // A presented code is checked against the authenticator the record
+        // holds. A code that does not hold refuses the request outright:
+        // admitting at the lower level instead would make a wrong code worth
+        // exactly as much as no code, which is how a second factor becomes
+        // optional in practice while looking mandatory in policy.
+        let mut entry = entry;
+        let otp_verified = match verify_presented_otp(&entry, rep.value) {
+            OtpOutcome::NonePresented => false,
+            OtpOutcome::Verified => true,
+            OtpOutcome::Refused => {
+                s.admit_bad_otp = s.admit_bad_otp.saturating_add(1);
+                reply(
+                    s,
+                    sys,
+                    entry.caller_corr,
+                    auth_wire::admit_err::UNAUTHENTICATED,
+                    entry.grant,
+                );
+                continue;
+            }
+        };
+
         // Assemble what the presenter proved, now that both halves are in
         // hand: the enrolment facts the ledger record carries, and the
         // possession proof this request just made. Scoring is the shared
         // fragment's, so what admission establishes and what a relying party
         // later checks are the same ladder.
-        let mut entry = entry;
-        entry.evidence = establish_evidence(rep.value, entry.proved_at);
+        entry.evidence = establish_evidence(rep.value, entry.proved_at, otp_verified);
 
         if entry.grant {
             emit_mint(s, sys, index, &entry);
@@ -856,12 +1012,21 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 ///
 /// Unrecognised methods in the record are dropped rather than carried, so a
 /// record written by a newer build cannot inflate a level this one computes.
-fn establish_evidence(record: &[u8], now: u64) -> auth_wire::assurance::EvidenceWire {
+fn establish_evidence(
+    record: &[u8],
+    now: u64,
+    otp_verified: bool,
+) -> auth_wire::assurance::EvidenceWire {
     use auth_wire::assurance::{AuthMethod, Evidence, KeyBinding};
 
     // The proof this request made. Always present: admission does not reach
     // here without a verified possession proof.
     let mut evidence = Evidence::at(now).with(AuthMethod::Pop);
+    if otp_verified {
+        // Knowledge, against the device key's possession — the second
+        // category, and the whole reason a code was asked for.
+        evidence = evidence.with(AuthMethod::Otp);
+    }
 
     if let Some(amr) = jose::claim_array(record, b"amr") {
         for name in amr {
@@ -879,6 +1044,115 @@ fn establish_evidence(record: &[u8], now: u64) -> auth_wire::assurance::Evidence
         evidence = evidence.user_verified(true);
     }
     evidence.encode()
+}
+
+/// What checking a presented code concluded.
+enum OtpOutcome {
+    /// No code was offered. Not a failure: a second factor is optional, and
+    /// a request without one is admitted at whatever its other proofs reach.
+    NonePresented,
+    /// The code matched a live step this authenticator has not used.
+    Verified,
+    /// A code was offered and did not hold, or there was no confirmed
+    /// authenticator to check it against.
+    Refused,
+}
+
+/// Check a presented code against the authenticator in the device record.
+///
+/// An UNCONFIRMED authenticator verifies nothing. Registration draws a secret
+/// and confirmation proves the device can compute its codes; between the two
+/// there is a secret nobody has demonstrated they hold, and treating it as a
+/// factor would let a registration that never worked raise an assurance
+/// level.
+///
+/// The counter is NOT advanced here. This module reads the record and does
+/// not own it — advancing a counter it cannot conditionally write would be a
+/// claim it cannot keep, and the freshness this check needs comes from the
+/// step window, which is 90 seconds wide. Single use across that window is
+/// the authenticator's own property, enforced where the record is written.
+fn verify_presented_otp(entry: &Pending, record: &[u8]) -> OtpOutcome {
+    let code_bytes = &entry.otp[..usize::from(entry.otp_len)];
+    if code_bytes.is_empty() {
+        return OtpOutcome::NonePresented;
+    }
+    if !matches!(jose::claim_str(record, b"totp_confirmed"), Some(b"true")) {
+        return OtpOutcome::Refused;
+    }
+    let Some(held) = jose::claim_str(record, b"totp_secret") else {
+        return OtpOutcome::Refused;
+    };
+    let Ok(code) = totp::parse_code(code_bytes) else {
+        return OtpOutcome::Refused;
+    };
+    let mut secret = [0u8; totp::MAX_SECRET];
+    let Ok(secret_len) = totp::base32_decode(held, &mut secret) else {
+        return OtpOutcome::Refused;
+    };
+    let last = jose::claim_u64(record, b"totp_counter");
+    match totp::verify_totp(
+        hmac_sha256_into,
+        &secret[..secret_len],
+        code,
+        entry.proved_at,
+        0,
+        TOTP_PERIOD,
+        TOTP_DIGITS,
+        TOTP_SKEW,
+        last,
+    ) {
+        Ok(Some(_)) => OtpOutcome::Verified,
+        _ => OtpOutcome::Refused,
+    }
+}
+
+/// HMAC-SHA256 in the shape the TOTP fragment takes.
+fn hmac_sha256_into(key: &[u8], message: &[u8], out: &mut [u8]) -> usize {
+    let n = out.len().min(32);
+    hmac(HashAlg::Sha256, key, message, &mut out[..n]);
+    n
+}
+
+/// The TOTP profile this issuer verifies under, matching the one
+/// `enrollment_endpoint` registers. Two copies of these numbers would be two
+/// authenticators, one of which works.
+const TOTP_DIGITS: u8 = 6;
+const TOTP_PERIOD: u64 = 30;
+const TOTP_SKEW: u64 = 1;
+
+/// Ask the ledger for the device record, once the proof is claimed.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn stage_device_read(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    index: usize,
+    entry: &Pending,
+) -> bool {
+    let state_corr = s.next_corr;
+    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    let request = state_wire::get(
+        state_corr,
+        STATE_CLIENT,
+        state_wire::NS_DEVICE,
+        &entry.device_id[..usize::from(entry.device_id_len)],
+    );
+    let mut frame = [0u8; 512];
+    let sent = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_GET, &request)
+        .ok()
+        .and_then(|n| auth_wire::read_envelope(&frame[..n]).ok())
+        .is_some_and(|(t, p)| chan::channel_write_msg(sys, s.out_state, t, p) > 0);
+    if !sent {
+        return false;
+    }
+    let mut next = *entry;
+    next.stage = STAGE_DEVICE;
+    next.state_corr = state_corr;
+    next.live = true;
+    s.pending[index] = next;
+    true
 }
 
 /// The presenter is admitted; MINT under the deployment's policy.

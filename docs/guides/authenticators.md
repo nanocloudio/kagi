@@ -134,11 +134,50 @@ ago, and a policy asking for a recent proof should see that.
 A deployment whose devices enrol by mailed code and present a DPoP proof
 reaches `aal1`: both proofs are possession, which is one category however
 many proofs are collected. Reaching `aal2` needs a genuinely different
-factor. The `totp` fragment implements one, pinned against the RFC 4226 and
-6238 vectors, and the `webauthn` fragment another, driven through ceremonies
-assembled in the shapes a browser and authenticator produce — but neither
-has a wired endpoint, so `aal2` is reachable by the ladder and not yet by
-this deployment.
+factor, and TOTP is the one that is wired.
+
+### Registering a TOTP authenticator
+
+`POST /authenticators/totp`, authenticated as the device with its
+certificate and a DPoP proof. The issuer draws the secret — a client-chosen
+secret is a client-chosen factor, since whoever picked it can compute its
+codes — and returns it once, in that response. Nothing reads it back out.
+
+```json
+{"secret":"KYDY…JTEA","algorithm":"SHA256","digits":6,"period":30,"confirmed":false}
+```
+
+`POST /authenticators/totp/confirm` with `{"code":"123456"}` proves the
+device can compute this authenticator's codes. Until it does, the
+authenticator contributes no evidence: a secret nobody has demonstrated they
+hold is not a factor, and a registration that silently did not work would
+otherwise surface as a device locked out of a factor it was told it had.
+
+The profile is **HMAC-SHA256**, which RFC 6238 §1.2 admits and the otpauth
+URI names as `algorithm=SHA256`. An authenticator that ignores that parameter
+computes SHA-1 codes and fails at confirmation — in front of the person who
+just scanned it.
+
+### Presenting one
+
+`POST /token` takes an `otp` form field beside the certificate and proof.
+Admission checks it against the record, and the token that comes back carries
+`otp` in `amr`, `mfa` derived from the two categories, and `acr: aal2`.
+
+A code that does not hold refuses the whole request. Admitting at the lower
+level instead would make a wrong second factor worth exactly as much as no
+second factor — which is how one becomes optional in practice while looking
+mandatory in policy.
+
+A code is single-use: the record remembers the step it last accepted and
+refuses that step and everything below it. The window is one step either
+side, for a phone whose clock runs a little fast, so a code is live for at
+most 90 seconds.
+
+The `webauthn` fragment implements a stronger factor still — hardware
+binding, user verification and origin binding in one ceremony, which is the
+whole of `aal3` — and is driven through ceremonies assembled in the shapes a
+browser and authenticator produce. It has no wired endpoint yet.
 
 ### A claim may not exceed its evidence
 

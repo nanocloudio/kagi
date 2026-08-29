@@ -174,6 +174,20 @@ struct ModuleState {
     /// credential names — see `verify_keyset.rs` for why a single
     /// overwritten key made rotation destructive here.
     keyset: verify_keyset::Keyset,
+    /// Proof replay, for this process.
+    ///
+    /// Time-bounded and fail-closed: an entry lives until the proof it came
+    /// from would be refused as stale anyway, and a saturated window refuses
+    /// rather than evicting — an eviction under load is an admission under
+    /// load.
+    ///
+    /// Process-local, and correctly so: the state this module guards is its
+    /// own memory, so a proof replayed at another replica reaches a
+    /// different pool of state and can take nothing this one holds. The
+    /// modules whose decisions rest on the shared ledger — admission and the
+    /// authorization-code flow — claim their replay identifiers there
+    /// instead, because there a replay at another replica reaches the same
+    /// state.
     replay: dpop::ReplayWindow<128>,
 
     keypkg_unauthenticated: u32,

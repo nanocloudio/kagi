@@ -460,6 +460,16 @@ pub struct AdmitRequest<'a> {
     pub uri: &'a [u8],
     pub credential: &'a [u8],
     pub proof: &'a [u8],
+    /// A one-time code from the presenter's second factor, or empty.
+    ///
+    /// Optional because a second factor is: a deployment that has enrolled
+    /// none, or a caller that does not need the assurance one buys, presents
+    /// nothing and is admitted at whatever level its other proofs reach. A
+    /// code that IS presented and does not hold refuses the whole request —
+    /// admitting at the lower level instead would let a wrong code be worth
+    /// the same as no code, which is how a second factor becomes optional in
+    /// practice while looking mandatory in policy.
+    pub otp: &'a [u8],
 }
 
 impl<'a> AdmitRequest<'a> {
@@ -471,6 +481,7 @@ impl<'a> AdmitRequest<'a> {
         w.field16(self.uri)?;
         w.field16(self.credential)?;
         w.field16(self.proof)?;
+        w.field8(self.otp)?;
         let n = w.len();
         write_envelope(MSG_ADMIT_REQ, &payload[..n], out)
     }
@@ -482,6 +493,7 @@ impl<'a> AdmitRequest<'a> {
         let uri = r.field16()?;
         let credential = r.field16()?;
         let proof = r.field16()?;
+        let otp = r.field8()?;
         // An empty credential or proof is refused at DECODE rather than
         // handed to the authenticator as "absent". The authenticator judges
         // a presentation; nothing was presented here, and a module that has
@@ -496,6 +508,7 @@ impl<'a> AdmitRequest<'a> {
             uri,
             credential,
             proof,
+            otp,
         })
     }
 }
@@ -623,6 +636,9 @@ pub struct GrantRequest<'a> {
     pub uri: &'a [u8],
     pub credential: &'a [u8],
     pub proof: &'a [u8],
+    /// A one-time code from the presenter's second factor, or empty. As
+    /// [`AdmitRequest::otp`].
+    pub otp: &'a [u8],
 }
 
 impl<'a> GrantRequest<'a> {
@@ -634,6 +650,7 @@ impl<'a> GrantRequest<'a> {
         w.field16(self.uri)?;
         w.field16(self.credential)?;
         w.field16(self.proof)?;
+        w.field8(self.otp)?;
         let n = w.len();
         write_envelope(MSG_GRANT_REQ, &payload[..n], out)
     }
@@ -645,12 +662,14 @@ impl<'a> GrantRequest<'a> {
         let uri = r.field16()?;
         let credential = r.field16()?;
         let proof = r.field16()?;
+        let otp = r.field8()?;
         Ok(Self {
             corr,
             method,
             uri,
             credential,
             proof,
+            otp,
         })
     }
 }

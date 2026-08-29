@@ -81,8 +81,16 @@ mod key_vault;
 mod pkce;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
+#[path = "../../common/device_auth.rs"]
+mod device_auth;
+#[path = "../../common/dpop.rs"]
+mod dpop;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/totp.rs"]
+mod totp;
+#[path = "../../common/verify_keyset.rs"]
+mod verify_keyset;
 
 // wave's SMTP connector wire, mounted from the materialised `wave-common`
 // tree. A second copy of a layout is how two repos come to disagree about
@@ -170,6 +178,14 @@ struct ModuleState {
     /// than held as a separate secret, so there is exactly one thing to
     /// provision — and unlike its predecessor it is STABLE across restarts.
     code_key: [u8; 32],
+    /// Proof replay for the authenticator routes, so one DPoP proof admits
+    /// one operation.
+    ///
+    /// Time-bounded and fail-closed: an entry is remembered until the proof
+    /// it came from would be refused as stale anyway, and a saturated window
+    /// refuses rather than evicting — an eviction under load is an admission
+    /// under load.
+    replay: dpop::ReplayWindow<128>,
     /// Scratch for one vault SIGN, kept in module state rather than on the
     /// PIC stack.
     sign_scratch: [u8; MAX_TOKEN + issuer_key::SIGN_SCRATCH_OVERHEAD],
@@ -195,6 +211,10 @@ struct ModuleState {
     enrol_recorded: u32,
     enrol_replayed: u32,
     enrol_state_unavailable: u32,
+    enrol_totp_registered: u32,
+    enrol_totp_confirmed: u32,
+    enrol_totp_conflict: u32,
+    enrol_totp_bad_code: u32,
     enrol_mail_submitted: u32,
     enrol_mail_failed: u32,
     enrol_code_bad: u32,
@@ -297,6 +317,21 @@ struct Pending {
     caller_corr: u32,
     /// When the authorisation being minted expires, echoed to the operator.
     auth_exp: u64,
+    /// The authenticator secret, base32, held only for the reply that returns
+    /// it once at registration.
+    totp_secret: [u8; TOTP_SECRET_B32],
+    totp_secret_len: u8,
+    /// The code presented at confirmation.
+    totp_code: [u8; totp::MAX_DIGITS as usize],
+    totp_code_len: u8,
+    /// True while confirming an authenticator, false while registering one.
+    totp_confirming: bool,
+    /// Proof replay, so one DPoP proof admits one authenticator operation.
+    ///
+    /// Time-bounded and fail-closed: an entry is remembered until the proof
+    /// it came from would be refused as stale anyway, and a full window
+    /// refuses rather than evicting — an eviction under load is an admission
+    /// under load.
     /// The etag the transaction was read at, so the consume can compare and
     /// swap against exactly the revision the code was checked on.
     etag: [u8; state_wire::MAX_ETAG],
@@ -317,12 +352,23 @@ const STAGE_COMMIT: u8 = 3;
 /// than an HTTP connection, because the operator asked over the control
 /// plane and there is no request socket to reply on.
 const STAGE_AUTH_MINT: u8 = 4;
+/// Reading the device record to attach or check an authenticator.
+const STAGE_TOTP_READ: u8 = 5;
+/// Writing the authenticator back, conditional on the revision it was read
+/// at — so two registrations racing produce one winner, and a confirmation
+/// cannot advance a counter another confirmation already advanced.
+const STAGE_TOTP_WRITE: u8 = 6;
 
 impl Pending {
     const fn zero() -> Self {
         Self {
             live: false,
             stage: STAGE_START,
+            totp_secret: [0; TOTP_SECRET_B32],
+            totp_secret_len: 0,
+            totp_code: [0; totp::MAX_DIGITS as usize],
+            totp_code_len: 0,
+            totp_confirming: false,
             caller_corr: 0,
             auth_exp: 0,
             conn: 0,
@@ -649,7 +695,50 @@ enum Refusal {
     BadChallenge,
     PkceMismatch,
     BadPossession,
+    /// The presentation did not authenticate as an enrolled device.
+    Unauthenticated,
+    /// The device already holds an authenticator of this kind. Registering a
+    /// second silently would leave the first unusable and unmentioned.
+    AlreadyRegistered,
+    /// No authenticator to confirm or verify against.
+    NoAuthenticator,
+    /// The code did not match any step in the window, or named a step at or
+    /// below one already used.
+    BadCode,
 }
+
+// ── TOTP profile ────────────────────────────────────────────────────────
+//
+// HMAC-SHA256, not the SHA-1 of RFC 6238's examples. RFC 6238 §1.2 admits
+// SHA-256 and SHA-512, and the SDK's MAC surface offers SHA-256 and SHA-384:
+// serving this one caller would mean adding an arm to a construction eleven
+// modules share, for no security kagi gains — HMAC-SHA1 is not broken, it is
+// simply not what anything else here computes.
+//
+// The `algorithm=SHA256` parameter is how the otpauth URI says so. An
+// authenticator that ignores it computes SHA-1 codes, which fail at
+// confirmation — in front of the person who just scanned it, rather than
+// silently at the first mint that needed a second factor.
+
+/// Bytes of secret drawn per authenticator.
+///
+/// 32, matching the HMAC's block-relevant digest size: a secret shorter than
+/// the digest is the ceiling on the construction's strength, and one longer
+/// is hashed down to it by HMAC anyway.
+const TOTP_SECRET_BYTES: usize = 32;
+/// Digits in a code. Six is what every authenticator shows.
+const TOTP_DIGITS: u8 = 6;
+/// Seconds per step.
+const TOTP_PERIOD: u64 = 30;
+/// Steps either side of the current one that are accepted.
+///
+/// One, so a code is live for at most 90 seconds. The window exists for
+/// clock drift between the issuer and a phone, not for a user who took a
+/// minute to type — and every step it widens is a step an attacker who
+/// observed a code gets to reuse it in.
+const TOTP_SKEW: u64 = 1;
+/// Longest base32 secret this module will read back out of a record.
+const TOTP_SECRET_B32: usize = totp::base32_encoded_len(TOTP_SECRET_BYTES);
 
 impl Refusal {
     const fn status(self) -> u16 {
@@ -662,8 +751,19 @@ impl Refusal {
             // operator seeing them merged would chase the wrong one.
             Self::NoEntropy => 500,
             Self::Malformed => 400,
+            // A device already holding an authenticator is a conflict about
+            // state, not a failed credential: the caller authenticated fine
+            // and asked for something the ledger already answers.
+            Self::AlreadyRegistered => 409,
+            // Nothing to confirm or verify against. 404, because the
+            // authenticator the request names does not exist.
+            Self::NoAuthenticator => 404,
             // Everything else is a credential that did not hold up.
-            Self::BadChallenge | Self::PkceMismatch | Self::BadPossession => 401,
+            Self::BadChallenge
+            | Self::PkceMismatch
+            | Self::BadPossession
+            | Self::Unauthenticated
+            | Self::BadCode => 401,
         }
     }
 
@@ -681,6 +781,13 @@ impl Refusal {
             Self::BadChallenge => br#"{"error":"invalid_grant","detail":"challenge"}"#,
             Self::PkceMismatch => br#"{"error":"invalid_grant","detail":"pkce"}"#,
             Self::BadPossession => br#"{"error":"invalid_grant","detail":"possession"}"#,
+            Self::Unauthenticated => br#"{"error":"invalid_client"}"#,
+            Self::AlreadyRegistered => br#"{"error":"conflict","detail":"authenticator_exists"}"#,
+            Self::NoAuthenticator => br#"{"error":"not_found","detail":"no_authenticator"}"#,
+            // Deliberately the same shape as a bad possession proof: a code
+            // that did not match and a code already used are the same answer
+            // to whoever is guessing.
+            Self::BadCode => br#"{"error":"invalid_grant","detail":"code"}"#,
         }
     }
 }
@@ -734,6 +841,7 @@ pub extern "C" fn module_new(
         s.out_key_announce = dev_channel_port(sys, 1, 4);
 
         s.key = issuer_key::IssuerKey::empty();
+        s.replay = dpop::ReplayWindow::new();
         s.code_key = [0; 32];
         s.kid = [0; 32];
         s.kid_len = 0;
@@ -752,6 +860,10 @@ pub extern "C" fn module_new(
         s.enrol_recorded = 0;
         s.enrol_replayed = 0;
         s.enrol_state_unavailable = 0;
+        s.enrol_totp_registered = 0;
+        s.enrol_totp_confirmed = 0;
+        s.enrol_totp_conflict = 0;
+        s.enrol_totp_bad_code = 0;
         s.enrol_mail_submitted = 0;
         s.enrol_mail_failed = 0;
         s.enrol_code_bad = 0;
@@ -937,21 +1049,32 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     }
 
-    let path_start = if s.buf[REQ_HDR..body_at.min(plen)].starts_with(b"/start") {
+    let path = &s.buf[REQ_HDR..(REQ_HDR + path_len).min(plen)];
+    let confirming = path.starts_with(b"/authenticators/totp/confirm");
+    let registering = !confirming && path.starts_with(b"/authenticators/totp");
+    let path_start = if path.starts_with(b"/start") {
         Some(true)
-    } else if s.buf[REQ_HDR..body_at.min(plen)].starts_with(b"/redeem") {
+    } else if path.starts_with(b"/redeem") {
         Some(false)
     } else {
         None
     };
-    let Some(is_start) = path_start else {
+    if path_start.is_none() && !registering && !confirming {
         respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
         return;
-    };
+    }
     if method != METHOD_POST {
         respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
+    if registering || confirming {
+        totp_route(s, sys, conn, stream, confirming, path_len, body_at, body_end);
+        return;
+    }
+    let Some(is_start) = path_start else {
+        respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
+        return;
+    };
     if !s.key.is_open() {
         s.enrol_no_key = s.enrol_no_key.saturating_add(1);
         refuse(s, sys, conn, stream, Refusal::NoKey);
@@ -1005,10 +1128,129 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
                 Refusal::NoKey | Refusal::NoEntropy => {
                     s.enrol_no_key = s.enrol_no_key.saturating_add(1);
                 }
+                // The authenticator refusals have their own counters, raised
+                // where the decision is made rather than here: this arm sees
+                // only the refusals `/start` and `/redeem` produce.
+                Refusal::Unauthenticated
+                | Refusal::AlreadyRegistered
+                | Refusal::NoAuthenticator
+                | Refusal::BadCode => {}
             }
             refuse(s, sys, conn, stream, refusal);
         }
     }
+}
+
+/// Authenticate a device presenting its certificate and a DPoP proof.
+///
+/// Verified against THIS module's own key. It signed the certificate, so it
+/// holds the public half already — which is why registering an authenticator
+/// needs no verification-key edge of its own. A module that took one would
+/// be trusting an operator to deliver the public half of a key it generated
+/// itself.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn authenticate_device(
+    s: &mut ModuleState,
+    presented: &Presented<'_>,
+    now: u64,
+) -> Result<Authenticated, Refusal> {
+    let Presented {
+        credential,
+        proof,
+        method,
+        uri,
+    } = *presented;
+    if credential.is_empty() || proof.is_empty() || !s.key.is_open() {
+        return Err(Refusal::Unauthenticated);
+    }
+    let mut claims_buf = [0u8; device_auth::MAX_SEGMENT];
+    let claims_out = &mut claims_buf;
+    let verifiers = device_auth::Verifiers {
+        sha256: sha256_into,
+        ecdsa_verify,
+        ed25519_verify,
+    };
+    let policy = device_auth::Policy {
+        proof_max_age_secs: PROOF_WINDOW_SECS,
+        clock_skew_secs: 60,
+        expected_cty: Some(b"dc+jwt"),
+    };
+    let public = s.key.public_key();
+    let mut pubkey = [0u8; 65];
+    let pubkey_len = public.len().min(pubkey.len());
+    pubkey[..pubkey_len].copy_from_slice(&public[..pubkey_len]);
+    let suite = s.key.suite();
+
+    let mut replayed = false;
+    let admitted = {
+        let seen = &mut replayed;
+        let mut offer = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+            dpop::Replay::Recorded => true,
+            dpop::Replay::Seen | dpop::Replay::Full => {
+                *seen = true;
+                false
+            }
+        };
+        device_auth::authenticate(
+            &verifiers,
+            &device_auth::IssuerKey {
+                suite,
+                public: &pubkey[..pubkey_len],
+            },
+            &device_auth::Presentation { credential, proof },
+            &device_auth::Request { method, uri, now },
+            &policy,
+            claims_out,
+            &mut offer,
+        )
+    };
+    let Ok(admitted) = admitted else {
+        return Err(Refusal::Unauthenticated);
+    };
+    let Some(id) = jose::claim_str(admitted.claims, b"device_id") else {
+        return Err(Refusal::Unauthenticated);
+    };
+    let mut device_id = [0u8; MAX_FIELD];
+    let device_id_len = id.len().min(MAX_FIELD);
+    device_id[..device_id_len].copy_from_slice(&id[..device_id_len]);
+    Ok(Authenticated {
+        thumbprint: admitted.thumbprint,
+        device_id,
+        device_id_len,
+    })
+}
+
+/// What a device presented, and the request it presented it for.
+struct Presented<'a> {
+    credential: &'a [u8],
+    proof: &'a [u8],
+    method: &'a [u8],
+    uri: &'a [u8],
+}
+
+/// What authenticating a presentation established.
+struct Authenticated {
+    /// The device key's JWK thumbprint, base64url.
+    thumbprint: [u8; 43],
+    device_id: [u8; MAX_FIELD],
+    device_id_len: usize,
+}
+
+/// How long a DPoP proof presented to this module stays fresh.
+const PROOF_WINDOW_SECS: u64 = 300;
+
+/// HMAC-SHA256 in the shape the TOTP fragment takes.
+///
+/// The fragment is algorithm-agnostic by design — it takes the MAC as a
+/// function — which is what lets one implementation serve the RFC's SHA-1
+/// vectors in the host suite and this profile's SHA-256 on target.
+fn hmac_sha256_into(key: &[u8], message: &[u8], out: &mut [u8]) -> usize {
+    let n = out.len().min(32);
+    hmac(HashAlg::Sha256, key, message, &mut out[..n]);
+    n
 }
 
 /// `/start`: bind an email, a device key and a PKCE challenge into a token.
@@ -1698,6 +1940,273 @@ unsafe fn begin_lookup(
     }
 }
 
+/// One header's value, by lowercase name.
+fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut at = 0usize;
+    while at < headers.len() {
+        let end = headers[at..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(headers.len(), |p| at + p);
+        let line = &headers[at..end];
+        if let Some(colon) = line.iter().position(|b| *b == b':') {
+            let (key, value) = line.split_at(colon);
+            if key.len() == name.len()
+                && key
+                    .iter()
+                    .zip(name)
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+            {
+                return Some(trim_ws(&value[1..]));
+            }
+        }
+        at = end + 1;
+    }
+    None
+}
+
+/// The credential out of a `DPoP <token>` authorization header.
+///
+/// The scheme is required rather than tolerated: a `Bearer` in this position
+/// is a caller presenting a token it expects to be taken on its own, and
+/// answering it as though it had proved possession would be answering a
+/// different request.
+fn strip_dpop_scheme(value: &[u8]) -> Option<&[u8]> {
+    let scheme = b"DPoP ";
+    if value.len() > scheme.len() && value[..scheme.len()].eq_ignore_ascii_case(scheme) {
+        Some(trim_ws(&value[scheme.len()..]))
+    } else {
+        None
+    }
+}
+
+/// Copy what fits, reporting nothing when it does not.
+///
+/// A truncated credential is not a credential: it would fail to verify with
+/// a reason that points at the signature rather than at the size.
+fn copy_into(value: &[u8], out: &mut [u8]) -> usize {
+    if value.len() > out.len() {
+        return 0;
+    }
+    out[..value.len()].copy_from_slice(value);
+    value.len()
+}
+
+fn trim_ws(value: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = value.len();
+    while start < end && (value[start] == b' ' || value[start] == b'\t' || value[start] == b'\r') {
+        start += 1;
+    }
+    while end > start
+        && (value[end - 1] == b' ' || value[end - 1] == b'\t' || value[end - 1] == b'\r')
+    {
+        end -= 1;
+    }
+    &value[start..end]
+}
+
+/// Authenticate the presentation, then run whichever authenticator route the
+/// path named.
+///
+/// The two share everything up to the point they differ: both are a device
+/// proving who it is before touching its own record.
+///
+/// # Safety
+///
+/// As `handle_request`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's own framing (path, body bounds) plus the route;               grouping it would move the same fields through one more type"
+)]
+unsafe fn totp_route(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    confirming: bool,
+    path_len: usize,
+    body_at: usize,
+    body_end: usize,
+) {
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        return;
+    };
+
+    let mut credential = [0u8; MAX_TOKEN];
+    let mut proof = [0u8; MAX_TOKEN];
+    let mut uri = [0u8; MAX_FIELD];
+    let (credential_len, proof_len, uri_len) = {
+        let path = &s.buf[REQ_HDR..REQ_HDR + path_len];
+        let headers = &s.buf[REQ_HDR + path_len..body_at];
+        let uri_len = path.len().min(uri.len());
+        uri[..uri_len].copy_from_slice(&path[..uri_len]);
+        (
+            header_value(headers, b"authorization")
+                .and_then(strip_dpop_scheme)
+                .map_or(0, |v| copy_into(v, &mut credential)),
+            header_value(headers, b"dpop").map_or(0, |v| copy_into(v, &mut proof)),
+            uri_len,
+        )
+    };
+
+    let who = {
+        let presented = Presented {
+            credential: &credential[..credential_len],
+            proof: &proof[..proof_len],
+            method: b"POST",
+            uri: &uri[..uri_len],
+        };
+        match authenticate_device(s, &presented, now) {
+            Ok(who) => who,
+            Err(refusal) => {
+                refuse(s, sys, conn, stream, refusal);
+                return;
+            }
+        }
+    };
+
+    if confirming {
+        // JSON, as `/start` and `/redeem` take: one body shape for one
+        // endpoint, rather than a second parser for one field.
+        let mut code = [0u8; totp::MAX_DIGITS as usize];
+        let code_len = {
+            let body = &s.buf[body_at..body_end];
+            jose::claim_str(body, b"code").map_or(0, |value| copy_into(value, &mut code))
+        };
+        begin_totp_confirm(s, sys, conn, stream, &who, &code[..code_len]);
+    } else {
+        begin_totp_register(s, sys, conn, stream, &who);
+    }
+}
+
+/// `POST /authenticators/totp` — attach a TOTP authenticator to a device.
+///
+/// A second factor has to be something the device does not already have. The
+/// device key it authenticates with is possession; a code from an
+/// authenticator app is knowledge, and the two together are what moves a
+/// deployment off `aal1`.
+///
+/// The secret is drawn HERE, from the platform CSPRNG, not supplied by the
+/// caller. A client-chosen secret is a client-chosen factor: whoever picked
+/// it can compute its codes, so a device could enrol a factor it does not
+/// have to hold.
+///
+/// It is returned exactly once, in this response, and never again. The record
+/// keeps it because verifying a code needs it, and there is deliberately no
+/// route that reads it back out.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn begin_totp_register(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    who: &Authenticated,
+) {
+    if s.out_state < 0 {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        return;
+    }
+    let mut raw = [0u8; TOTP_SECRET_BYTES];
+    if (sys.provider_call)(-1, 0x0C3C, raw.as_mut_ptr(), raw.len()) < 0 {
+        refuse(s, sys, conn, stream, Refusal::NoEntropy);
+        return;
+    }
+    let mut secret = [0u8; TOTP_SECRET_B32];
+    let Ok(secret_len) = totp::base32_encode(&raw, &mut secret) else {
+        refuse(s, sys, conn, stream, Refusal::NoEntropy);
+        return;
+    };
+
+    let mut entry = Pending::zero();
+    entry.stage = STAGE_TOTP_READ;
+    entry.conn = conn;
+    entry.stream = stream;
+    entry.totp_confirming = false;
+    entry.totp_secret = secret;
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by TOTP_SECRET_B32")]
+    {
+        entry.totp_secret_len = secret_len as u8;
+    }
+    stage_device_read(s, sys, conn, stream, who, entry);
+}
+
+/// `POST /authenticators/totp/confirm` — prove the authenticator works.
+///
+/// Registration is not adoption. A device that stored the secret wrongly, or
+/// an authenticator that ignored `algorithm=SHA256` and computed SHA-1
+/// codes, produces an authenticator that exists and cannot be used — and the
+/// first anyone would learn of it is a device locked out of the factor it
+/// was told it had. Confirmation is where that fails instead, in front of
+/// the person who just scanned it.
+///
+/// Until it is confirmed the authenticator contributes no evidence, so an
+/// unconfirmed registration cannot raise a token's assurance.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn begin_totp_confirm(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    who: &Authenticated,
+    code: &[u8],
+) {
+    if s.out_state < 0 {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        return;
+    }
+    if code.is_empty() || code.len() > usize::from(totp::MAX_DIGITS) {
+        refuse(s, sys, conn, stream, Refusal::Malformed);
+        return;
+    }
+    let mut entry = Pending::zero();
+    entry.stage = STAGE_TOTP_READ;
+    entry.conn = conn;
+    entry.stream = stream;
+    entry.totp_confirming = true;
+    entry.totp_code[..code.len()].copy_from_slice(code);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_DIGITS")]
+    {
+        entry.totp_code_len = code.len() as u8;
+    }
+    stage_device_read(s, sys, conn, stream, who, entry);
+}
+
+/// Read the device record both authenticator routes act on.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn stage_device_read(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    who: &Authenticated,
+    mut entry: Pending,
+) {
+    let corr = next_corr(s);
+    let key = &who.device_id[..who.device_id_len];
+    let request = state_wire::get(corr, STATE_CLIENT, state_wire::NS_DEVICE, key);
+
+    let n = key.len().min(entry.device_id.len());
+    entry.device_id[..n].copy_from_slice(&key[..n]);
+    if !dispatch(s, sys, state_wire::MSG_STATE_GET, &request, entry) {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+    }
+}
+
 /// Answer redemptions whose consume has come back.
 ///
 /// # Safety
@@ -1758,7 +2267,303 @@ unsafe fn complete(
         STAGE_LOOKUP => lookup_done(s, sys, entry, status, value, etag),
         STAGE_CONSUME => consume_done(s, sys, entry, status),
         STAGE_AUTH_MINT => auth_mint_done(s, sys, entry, status),
+        STAGE_TOTP_READ => totp_read_done(s, sys, entry, status, value, etag),
+        STAGE_TOTP_WRITE => totp_write_done(s, sys, entry, status),
         _ => commit_done(s, sys, entry, status),
+    }
+}
+
+/// Rewrite a device record with its authenticator fields set.
+///
+/// The record is rebuilt from the one that was read rather than patched: the
+/// reader takes the FIRST match for a key, so appending a second `totp_secret`
+/// would leave the old one winning every read. Everything the ledger held is
+/// carried across; only the authenticator fields are this function's.
+fn write_device_record(
+    out: &mut [u8],
+    held: &[u8],
+    secret: &[u8],
+    confirmed: bool,
+    counter: u64,
+) -> Option<usize> {
+    if !jose::is_record_safe(secret) {
+        return None;
+    }
+    let mut at = 0usize;
+    let carry = |out: &mut [u8], at: &mut usize, key: &[u8], value: &[u8]| -> bool {
+        if value.is_empty() || !jose::is_record_safe(value) {
+            return true;
+        }
+        put(out, at, b"\"").is_ok()
+            && put(out, at, key).is_ok()
+            && put(out, at, br#"":""#).is_ok()
+            && put(out, at, value).is_ok()
+            && put(out, at, br#"","#).is_ok()
+    };
+
+    put(out, &mut at, b"{").ok()?;
+    for key in [
+        &b"cnf"[..],
+        b"device_id",
+        b"email_hash",
+        b"iss",
+        b"sub",
+        b"status",
+        b"key_binding",
+    ] {
+        let value = jose::claim_str(held, key).unwrap_or(b"");
+        if !carry(out, &mut at, key, value) {
+            return None;
+        }
+    }
+    // `cnf` is an object in the record, not a string; its `jkt` is what a
+    // reader wants and what `claim_str` finds either way.
+    for key in [&b"exp"[..], b"iat"] {
+        if let Some(value) = jose::claim_u64(held, key) {
+            put(out, &mut at, b"\"").ok()?;
+            put(out, &mut at, key).ok()?;
+            put(out, &mut at, br#"":"#).ok()?;
+            put_u64(out, &mut at, value).ok()?;
+            put(out, &mut at, b",").ok()?;
+        }
+    }
+    if let Some(amr) = jose::claim_array_raw(held, b"amr") {
+        put(out, &mut at, br#""amr":"#).ok()?;
+        put(out, &mut at, amr).ok()?;
+        put(out, &mut at, b",").ok()?;
+    }
+    put(out, &mut at, br#""totp_secret":""#).ok()?;
+    put(out, &mut at, secret).ok()?;
+    // A string, not a JSON boolean: the shared reader takes string claims,
+    // and a field written in a shape it cannot read is a field that always
+    // reads as absent — which for a confirmation flag means an authenticator
+    // that never counts.
+    put(out, &mut at, br#"","totp_confirmed":""#).ok()?;
+    put(out, &mut at, if confirmed { b"true" } else { b"false" }).ok()?;
+    put(out, &mut at, b"\"").ok()?;
+    put(out, &mut at, br#","totp_counter":"#).ok()?;
+    put_u64(out, &mut at, counter).ok()?;
+    put(out, &mut at, b"}").ok()?;
+    Some(at)
+}
+
+/// Replace the device record, conditional on the revision it was read at.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn cas_device(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &mut Pending,
+    etag: &[u8],
+    value: &[u8],
+) -> bool {
+    let corr = next_corr(s);
+    let key_len = entry
+        .device_id
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(entry.device_id.len());
+    let mut key = [0u8; 4 + ids::DEVICE_ID_LENGTH];
+    key.copy_from_slice(&entry.device_id);
+    let request = state_wire::StateRequest {
+        correlation: corr,
+        client: STATE_CLIENT,
+        namespace: state_wire::NS_DEVICE,
+        key: &key[..key_len],
+        etag,
+        value,
+        // Device membership does not expire; revocation ends it.
+        expiry_unix: 0,
+    };
+    dispatch(s, sys, state_wire::MSG_STATE_CAS, &request, *entry)
+}
+
+/// The device record came back: attach the authenticator, or check a code.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn totp_read_done(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &Pending,
+    status: u8,
+    value: &[u8],
+    etag: &[u8],
+) {
+    if status != auth_wire::ST_OK {
+        // The certificate verified but the ledger holds no such device: a
+        // certificate outliving its enrolment. The same refusal minting
+        // gives it.
+        let refusal = if status == auth_wire::ST_NOT_FOUND {
+            Refusal::Unauthenticated
+        } else {
+            s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+            respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+            return;
+        };
+        refuse(s, sys, entry.conn, entry.stream, refusal);
+        return;
+    }
+
+    let held = jose::claim_str(value, b"totp_secret").unwrap_or(b"");
+    if entry.totp_confirming {
+        confirm_against(s, sys, entry, value, etag, held);
+    } else if held.is_empty() {
+        attach_authenticator(s, sys, entry, value, etag);
+    } else {
+        // Replacing one silently would leave the device holding an
+        // authenticator whose codes no longer verify, with nothing having
+        // said so. Removing an authenticator is its own decision.
+        s.enrol_totp_conflict = s.enrol_totp_conflict.saturating_add(1);
+        refuse(s, sys, entry.conn, entry.stream, Refusal::AlreadyRegistered);
+    }
+}
+
+/// Write the drawn secret into the device record, unconfirmed.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn attach_authenticator(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &Pending,
+    value: &[u8],
+    etag: &[u8],
+) {
+    let secret = &entry.totp_secret[..usize::from(entry.totp_secret_len)];
+    let mut record = [0u8; 1536];
+    let Some(len) = write_device_record(&mut record, value, secret, false, 0) else {
+        refuse(s, sys, entry.conn, entry.stream, Refusal::Malformed);
+        return;
+    };
+
+    let mut next = *entry;
+    next.stage = STAGE_TOTP_WRITE;
+    if !cas_device(s, sys, &mut next, etag, &record[..len]) {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+    }
+}
+
+/// Check a presented code and, if it holds, confirm the authenticator.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn confirm_against(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    entry: &Pending,
+    value: &[u8],
+    etag: &[u8],
+    held: &[u8],
+) {
+    if held.is_empty() {
+        refuse(s, sys, entry.conn, entry.stream, Refusal::NoAuthenticator);
+        return;
+    }
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
+        // A code is a statement about the current step, so a window cannot
+        // be judged without a clock this deployment trusts.
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        return;
+    };
+    let Some(matched) = verify_presented_code(entry, held, value, now) else {
+        s.enrol_totp_bad_code = s.enrol_totp_bad_code.saturating_add(1);
+        refuse(s, sys, entry.conn, entry.stream, Refusal::BadCode);
+        return;
+    };
+
+    let mut record = [0u8; 1536];
+    let Some(len) = write_device_record(&mut record, value, held, true, matched) else {
+        refuse(s, sys, entry.conn, entry.stream, Refusal::Malformed);
+        return;
+    };
+    let mut next = *entry;
+    next.stage = STAGE_TOTP_WRITE;
+    if !cas_device(s, sys, &mut next, etag, &record[..len]) {
+        s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
+        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+    }
+}
+
+/// Verify the presented code against the record's secret and counter.
+///
+/// Returns the step it matched, which becomes the record's new floor.
+fn verify_presented_code(entry: &Pending, held: &[u8], record: &[u8], now: u64) -> Option<u64> {
+    let code = totp::parse_code(&entry.totp_code[..usize::from(entry.totp_code_len)]).ok()?;
+    let mut secret = [0u8; totp::MAX_SECRET];
+    let secret_len = totp::base32_decode(held, &mut secret).ok()?;
+    // The floor a code must beat. Absent on the first verification, which is
+    // the confirmation itself.
+    let last = jose::claim_u64(record, b"totp_counter");
+    let matched = totp::verify_totp(
+        hmac_sha256_into,
+        &secret[..secret_len],
+        code,
+        now,
+        0,
+        TOTP_PERIOD,
+        TOTP_DIGITS,
+        TOTP_SKEW,
+        last,
+    )
+    .ok()??;
+    Some(matched.counter)
+}
+
+/// The authenticator write came back.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn totp_write_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, status: u8) {
+    if status != auth_wire::ST_OK {
+        // The record moved under the write. Two registrations racing, or a
+        // confirmation against a revision another confirmation already
+        // advanced — either way this one did not happen, and saying so is
+        // the only honest answer.
+        s.enrol_totp_conflict = s.enrol_totp_conflict.saturating_add(1);
+        refuse(s, sys, entry.conn, entry.stream, Refusal::AlreadyRegistered);
+        return;
+    }
+    if entry.totp_confirming {
+        s.enrol_totp_confirmed = s.enrol_totp_confirmed.saturating_add(1);
+        respond(
+            s,
+            sys,
+            entry.conn,
+            entry.stream,
+            200,
+            br#"{"confirmed":true}"#,
+        );
+        return;
+    }
+
+    // The one time the secret is readable. There is no route that reads it
+    // back, so a client that loses it registers again after removing this
+    // one rather than asking.
+    s.enrol_totp_registered = s.enrol_totp_registered.saturating_add(1);
+    let mut body = [0u8; 256];
+    let mut at = 0usize;
+    let secret = &entry.totp_secret[..usize::from(entry.totp_secret_len)];
+    let ok = put(&mut body, &mut at, br#"{"secret":""#).is_ok()
+        && put(&mut body, &mut at, secret).is_ok()
+        && put(
+            &mut body,
+            &mut at,
+            br#"","algorithm":"SHA256","digits":6,"period":30,"confirmed":false}"#,
+        )
+        .is_ok();
+    if ok {
+        respond(s, sys, entry.conn, entry.stream, 200, &body[..at]);
+    } else {
+        respond(s, sys, entry.conn, entry.stream, 500, UNAVAILABLE_BODY);
     }
 }
 

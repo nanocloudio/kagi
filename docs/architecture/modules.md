@@ -151,6 +151,31 @@ claims rather than inferred from its form: a `cnf` binding says a
 credential is non-bearer, which is one fact among the several a level is
 scored from.
 
+### Replay
+
+A DPoP proof admits once. Each module keeps a time-bounded, fail-closed
+window in its own memory: an entry lives until the proof it came from would
+be refused as stale anyway, and a saturated window refuses rather than
+evicting, because an eviction under load is an admission under load.
+
+That window is memory, so it answers for one process. The modules whose
+decisions rest on the shared ledger — `mint_admission` and `authcode` —
+additionally claim the proof's replay identifier under `NS_REPLAY`, as a
+create-only write: the first caller records it and every other gets a
+conflict, at one linearization point, whichever replica they reached and
+whether or not a process has restarted since. A claim that cannot be made
+refuses, because the ledger's absence must not become a way to replay.
+
+The key is a digest of the proof, not the client's own `jti`, which is
+whatever the client wrote. The entry expires with the proof: one outside its
+freshness window is refused before it is ever offered, so remembering it
+longer would be paying to store what nothing can present.
+
+Modules whose state is their own memory — `e2ee_state_endpoint`,
+`keypackage_endpoint` — keep only the local window, and correctly: a proof
+replayed at another replica reaches a different pool of state and can take
+nothing this one holds.
+
 ### Control plane
 
 | msg | payload |

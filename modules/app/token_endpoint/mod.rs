@@ -136,6 +136,13 @@ const MAX_REPLIES_PER_STEP: usize = 4;
 /// Default lifetime, in seconds, when a request names none.
 const DEFAULT_TTL_SECS: u32 = 300;
 
+/// Longest one-time code accepted from the form.
+///
+/// Bounded here as well as at the authenticator: a field this module copies
+/// into a fixed buffer is one it has to bound, whatever the thing that
+/// eventually reads it decides.
+const MAX_OTP: usize = 8;
+
 /// One request waiting for its token.
 #[derive(Clone, Copy)]
 struct Pending {
@@ -526,12 +533,18 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 
     let mut aud = [0u8; MAX_FIELD];
     let mut scope = [0u8; MAX_FIELD];
-    let (aud_len, scope_len, ttl) = {
+    // A one-time code, when the caller has a second factor to present. It is
+    // carried across untouched: this module does not know what an
+    // authenticator is, and admission — which reads the device record — is
+    // the only thing that could check one.
+    let mut otp = [0u8; MAX_OTP];
+    let (aud_len, scope_len, ttl, otp_len) = {
         let body = &s.buf[body_at..body_end];
         (
             form_value(body, b"aud", &mut aud),
             form_value(body, b"scope", &mut scope),
             form_u32(body, b"expires_in").unwrap_or(DEFAULT_TTL_SECS),
+            form_value(body, b"otp", &mut otp),
         )
     };
 
@@ -602,6 +615,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         uri: &uri[..uri_len],
         credential: &credential[..credential_len],
         proof: &proof[..proof_len],
+        otp: &otp[..otp_len],
     };
     let mut framed = [0u8; 4096];
     let Ok(n) = ask.encode(&mut framed) else {

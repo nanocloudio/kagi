@@ -635,6 +635,50 @@ impl<'a> Iterator for ClaimArray<'a> {
     }
 }
 
+/// A JSON array claim as its raw bytes, brackets included.
+///
+/// For carrying an array across a rewrite without reading it: a record
+/// rebuilt field by field has to put `amr` back exactly as it found it, and
+/// re-emitting it from parsed elements would be a second encoder that could
+/// disagree with the first.
+#[must_use]
+pub fn claim_array_raw<'a>(json: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut i = 0usize;
+    let at = loop {
+        if i + key.len() + 2 > json.len() {
+            return None;
+        }
+        if json[i] == b'"'
+            && json[i + 1..].starts_with(key)
+            && json.get(i + 1 + key.len()) == Some(&b'"')
+        {
+            break i + key.len() + 2;
+        }
+        i += 1;
+    };
+    let mut p = at;
+    while p < json.len() && (json[p] == b' ' || json[p] == b':') {
+        p += 1;
+    }
+    if json.get(p) != Some(&b'[') {
+        return None;
+    }
+    let start = p;
+    // Scan to the matching bracket, honouring strings so a `]` inside one
+    // does not end the array early.
+    let mut in_string = false;
+    while p < json.len() {
+        match json[p] {
+            b'\\' if in_string => p += 1,
+            b'"' => in_string = !in_string,
+            b']' if !in_string => return Some(&json[start..=p]),
+            _ => {}
+        }
+        p += 1;
+    }
+    None
+}
+
 /// The first string element of a JSON array claim, e.g. `x5c`'s leaf.
 ///
 /// Only the first: a carrier presents a leaf, never a chain, and reading

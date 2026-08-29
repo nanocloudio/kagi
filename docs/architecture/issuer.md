@@ -133,7 +133,10 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
 - `enrollment_endpoint` — `/start` binds an email, a device key and a PKCE
   challenge into a signed token; `/redeem` takes it back with the verifier,
   a possession proof and the delivered code, and returns a device
-  certificate.
+  certificate. `/authenticators/totp` attaches a second factor to an
+  enrolled device, verified against this module's own signing key: it signed
+  the certificate, so it already holds the public half and needs no
+  verification-key edge of its own.
 - `security_state` — the durable identity ledger over `storage.object`:
   create-if-absent, replace-if-unchanged, and read. Enrolment transactions,
   device membership and revocation live here. It refuses everything until the
@@ -149,8 +152,11 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
 - `token_endpoint` — the HTTP shape of a token request. It translates; it
   decides nothing.
 - `mint_admission` — may this presenter mint, and for whom. One question,
-  answered once, for whoever asks. In grant mode it drives the mint itself,
-  so a subject established here never passes back through the pipeline.
+  answered once, for whoever asks. It claims the proof's replay identifier in
+  the ledger before looking anything up, checks a presented one-time code
+  against the device's authenticator, and scores what was proved. In grant
+  mode it drives the mint itself, so a subject established here never passes
+  back through the pipeline.
 - `token_mint` — ES256 / EdDSA JWS minting from a keyset indexed by
   `(issuer, profile_id, kid)`.
 - `token_verify` — the verification counterpart: signature first, then the
