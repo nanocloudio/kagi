@@ -520,6 +520,39 @@ pub const fn min_fence_replicated(ns: u8) -> u8 {
     }
 }
 
+/// The weakest view a READ of `ns` may be decided on.
+///
+/// A read asks a different question from a write. A write asks what survives;
+/// a read asks whether what it is looking at is a view anything can be
+/// decided on. So this is not [`min_fence`] applied to the read path — a
+/// provider legitimately answers a read with `VIEW_CONSISTENT` and a write
+/// with `LOCAL_DURABLE`, and requiring the write's floor on the read would
+/// refuse every correct read.
+///
+/// For a namespace whose writes must be linearized, the floor is a
+/// consistent snapshot: a single-use record read from a view with no
+/// linearization point is how a consumed transaction reads as unconsumed and
+/// is spent twice. `VOLATILE` is what a provider reports when it has no such
+/// point to offer — an object surface backed by an HTTP fetch, say — and a
+/// ledger decision must never rest on one.
+#[must_use]
+pub const fn min_read_fence(ns: u8) -> u8 {
+    if requires_linearized(ns) {
+        fence::VIEW_CONSISTENT
+    } else {
+        fence::VOLATILE
+    }
+}
+
+/// Whether a read of `ns` served under `achieved` may be answered.
+///
+/// Compared on [`fence::strength`], so a durable read satisfies a
+/// view-consistent floor as well.
+#[must_use]
+pub const fn read_fence_satisfies(ns: u8, achieved: u8) -> bool {
+    fence::strength(achieved) >= fence::strength(min_read_fence(ns))
+}
+
 /// Whether a write to `ns` acknowledged under `achieved` may be reported as
 /// committed.
 ///

@@ -45,6 +45,10 @@
 
 #![no_std]
 #![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the fluxor module ABI entry points: the runtime owns these pointers and their validity is the ABI's contract. Same allow the other PIC modules carry."
+)]
+#![allow(
     unused_imports,
     dead_code,
     reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
@@ -62,6 +66,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
 #[path = "../../common/auth_wire.rs"]
@@ -212,6 +217,56 @@ impl PublishedKey {
     }
 }
 
+/// Longest URL the discovery document will carry.
+const MAX_URL: usize = 256;
+
+/// The four URLs the document is built from, in the order the params declare
+/// them. All four or nothing: a partial document is worse than none, because
+/// a client caches what it fetched and a missing endpoint reads as one the
+/// deployment does not offer.
+const DISCOVERY_URLS: usize = 4;
+const URL_ISSUER: usize = 0;
+const URL_AUTHORIZE: usize = 1;
+const URL_TOKEN: usize = 2;
+const URL_JWKS: usize = 3;
+
+define_params! {
+    ModuleState;
+
+    // The discovery document's URLs. Optional as a group: a deployment that
+    // does not wire the authorization-code surface declares none and the
+    // document is not served at all, rather than advertising endpoints
+    // nothing answers.
+    1, issuer, str, 0 => |s, d, len| { store_url(s, URL_ISSUER, d, len); };
+    2, authorization_endpoint, str, 0 => |s, d, len| { store_url(s, URL_AUTHORIZE, d, len); };
+    3, token_endpoint, str, 0 => |s, d, len| { store_url(s, URL_TOKEN, d, len); };
+    4, jwks_uri, str, 0 => |s, d, len| { store_url(s, URL_JWKS, d, len); };
+}
+
+/// Copy one declared URL into its slot.
+///
+/// A URL longer than the slot is dropped rather than truncated: half a URL
+/// is a URL to somewhere else, and dropping it makes the document unservable
+/// instead of wrong.
+///
+/// # Safety
+///
+/// `d` points to at least `len` readable bytes, as the params ABI guarantees.
+unsafe fn store_url(s: &mut ModuleState, slot: usize, d: *const u8, len: usize) {
+    if len == 0 || len > MAX_URL {
+        return;
+    }
+    let mut i = 0usize;
+    while i < len {
+        s.discovery[slot][i] = *d.add(i);
+        i += 1;
+    }
+    #[expect(clippy::cast_possible_truncation, reason = "len <= MAX_URL (256)")]
+    {
+        s.discovery_len[slot] = len as u16;
+    }
+}
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
@@ -246,6 +301,20 @@ struct ModuleState {
     /// makes an expired thing look live.
     updated_at: u64,
 
+    /// The discovery document's four URLs, as the deployment declared them.
+    ///
+    /// Held rather than derived: this module owns one listener and cannot
+    /// know what host or port the authorization and token endpoints answer
+    /// on — they are separate listeners, in the issuer graph and in the
+    /// authorization-code graph. A document that guessed them would be a
+    /// document that sends clients somewhere nothing is listening.
+    discovery: [[u8; MAX_URL]; DISCOVERY_URLS],
+    discovery_len: [u16; DISCOVERY_URLS],
+
+    discovery_served: u32,
+    /// Discovery asked for while the deployment declared no URLs for it.
+    discovery_incomplete: u32,
+
     jwks_served: u32,
     jwks_empty: u32,
     jwks_not_found: u32,
@@ -274,8 +343,8 @@ pub extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -309,6 +378,11 @@ pub extern "C" fn module_new(
         let _ = (sys.provider_call)(-1, 0x0C3C, s.salt.as_mut_ptr(), 8);
         s.inserted = 0;
         s.updated_at = dev_unix_millis(sys) / 1000;
+        s.discovery = [[0u8; MAX_URL]; DISCOVERY_URLS];
+        s.discovery_len = [0u16; DISCOVERY_URLS];
+        parse_tlv(s, params, params_len);
+        s.discovery_served = 0;
+        s.discovery_incomplete = 0;
         s.jwks_served = 0;
         s.jwks_empty = 0;
         s.jwks_not_found = 0;
@@ -858,10 +932,22 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         let path = &s.buf[REQ_HDR..path_end];
         path == b"/.well-known/revocations.json"
     };
+    let discovery = {
+        let path = &s.buf[REQ_HDR..path_end];
+        path == b"/.well-known/openid-configuration"
+    };
     let known_path = {
         let path = &s.buf[REQ_HDR..path_end];
         path == b"/jwks" || path == b"/.well-known/jwks.json"
     };
+    if discovery {
+        if method != METHOD_GET && method != METHOD_HEAD {
+            respond(s, sys, conn, stream, 405, b"application/json", b"{}");
+            return;
+        }
+        serve_discovery(s, sys, conn, stream);
+        return;
+    }
     if revocations {
         if method != METHOD_GET && method != METHOD_HEAD {
             respond(s, sys, conn, stream, 405, b"application/json", b"{}");
@@ -997,6 +1083,96 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Option<()> {
 /// # Safety
 ///
 /// As `drain_keys`.
+/// Serve `/.well-known/openid-configuration`.
+///
+/// Built from the registry, not from a literal: the algorithms advertised are
+/// the ones [`auth_wire::suite::is_implemented`] answers for, so a document
+/// cannot promise a signature this build does not produce, and adding a suite
+/// updates the document without anyone remembering to.
+///
+/// Served only when all four URLs are declared. A client caches discovery, so
+/// an incomplete document is a durable wrong answer — 404 says "no
+/// authorization-code surface here", which is the truth for a deployment that
+/// wired none.
+///
+/// # Safety
+///
+/// As `handle_request`.
+unsafe fn serve_discovery(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u16) {
+    if s.discovery_len.contains(&0) {
+        s.discovery_incomplete = s.discovery_incomplete.saturating_add(1);
+        respond(s, sys, conn, stream, 404, b"application/json", b"{}");
+        return;
+    }
+
+    let mut body = [0u8; 1024];
+    let mut at = 0usize;
+    let mut ok = true;
+    let write = |bytes: &[u8], at: &mut usize, body: &mut [u8], ok: &mut bool| {
+        if !*ok || *at + bytes.len() > body.len() {
+            *ok = false;
+            return;
+        }
+        body[*at..*at + bytes.len()].copy_from_slice(bytes);
+        *at += bytes.len();
+    };
+
+    write(br#"{"issuer":""#, &mut at, &mut body, &mut ok);
+    write(url(s, URL_ISSUER), &mut at, &mut body, &mut ok);
+    write(
+        br#"","authorization_endpoint":""#,
+        &mut at,
+        &mut body,
+        &mut ok,
+    );
+    write(url(s, URL_AUTHORIZE), &mut at, &mut body, &mut ok);
+    write(br#"","token_endpoint":""#, &mut at, &mut body, &mut ok);
+    write(url(s, URL_TOKEN), &mut at, &mut body, &mut ok);
+    write(br#"","jwks_uri":""#, &mut at, &mut body, &mut ok);
+    write(url(s, URL_JWKS), &mut at, &mut body, &mut ok);
+    write(
+        br#"","response_types_supported":["code"],"grant_types_supported":["authorization_code"],"subject_types_supported":["public"],"code_challenge_methods_supported":["S256"],"token_endpoint_auth_methods_supported":["none"],"id_token_signing_alg_values_supported":["#,
+        &mut at,
+        &mut body,
+        &mut ok,
+    );
+
+    let mut first = true;
+    let mut suite_id = 0u16;
+    while suite_id <= auth_wire::suite::MAX_ID {
+        if auth_wire::suite::is_implemented(suite_id) {
+            if !first {
+                write(b",", &mut at, &mut body, &mut ok);
+            }
+            write(b"\"", &mut at, &mut body, &mut ok);
+            write(
+                auth_wire::suite::jose_alg(suite_id),
+                &mut at,
+                &mut body,
+                &mut ok,
+            );
+            write(b"\"", &mut at, &mut body, &mut ok);
+            first = false;
+        }
+        suite_id += 1;
+    }
+    write(b"]}", &mut at, &mut body, &mut ok);
+
+    if !ok {
+        respond(s, sys, conn, stream, 500, b"application/json", b"{}");
+        return;
+    }
+    s.discovery_served = s.discovery_served.saturating_add(1);
+    let mut out = [0u8; 1024];
+    out[..at].copy_from_slice(&body[..at]);
+    respond(s, sys, conn, stream, 200, b"application/json", &out[..at]);
+}
+
+/// One declared URL, as bytes.
+fn url(s: &ModuleState, slot: usize) -> &[u8] {
+    &s.discovery[slot][..usize::from(s.discovery_len[slot])]
+}
+
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,

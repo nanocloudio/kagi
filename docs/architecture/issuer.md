@@ -136,7 +136,11 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
   certificate.
 - `security_state` — the durable identity ledger over `storage.object`:
   create-if-absent, replace-if-unchanged, and read. Enrolment transactions,
-  device membership and revocation live here.
+  device membership and revocation live here. It refuses everything until the
+  graph declares which authority it is — `single-node` or `replicated` —
+  because that is what decides whether a `LocalDurable` acknowledgement counts
+  as a commit, and both defaults are silently wrong for half of the
+  deployments that would take one.
 - `certificate_endpoint` — an X.509 client certificate for a device key,
   in the PKI graph.
 
@@ -155,7 +159,11 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
   single-use code bound to a client and a PKCE challenge, and the exchange
   redeems it for an access token and an ID token.
 - `resource_gate` — DPoP-bound admission for a protected surface.
-- `wellknown_endpoint` — the key set and the revocation filter.
+- `wellknown_endpoint` — the key set, the revocation filter, and the OIDC
+  discovery document. Discovery is served only where the deployment declares
+  its four URLs, because this module owns one listener and cannot know where
+  the others answer; a deployment that wires no authorization-code surface
+  advertises none.
 
 **Messaging**
 

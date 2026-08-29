@@ -662,19 +662,14 @@ unsafe fn state_get(s: &ModuleState, sys: &SyscallTable, corr: u32, ns: u8, key:
     chan::channel_write_msg(sys, s.out_state, t, p) > 0
 }
 
-/// Whether a byte string can be a JSON string value without escaping.
+/// Whether a value may go into the code record unescaped.
 ///
-/// A quote or a backslash would end the value early, and `jose::claim_str`
-/// scans for the FIRST `"key":"..."` anywhere in the record — so a value
-/// carrying `","scope":"admin` puts an attacker's scope AHEAD of the real
-/// one and wins the read. The clamp at /authorize would then bound a scope
-/// nothing signs. Control bytes go too: they cannot appear raw in JSON.
-///
-/// Refused rather than escaped. `claim_str` returns the raw bytes between
-/// the quotes, so an escaped value would read back with its backslashes
-/// still in it — a nonce that is not the nonce the client sent.
+/// The predicate lives in `jose`, beside the scanner that makes it matter:
+/// what a record may carry is a property of how it is read back, not of this
+/// module. Named locally because every use here reads better as a question
+/// about this record.
 fn json_safe(v: &[u8]) -> bool {
-    !v.iter().any(|&b| b == b'"' || b == b'\\' || b < 0x20)
+    jose::is_record_safe(v)
 }
 
 /// Build the compact code record authcode owns both ends of. JSON, so the

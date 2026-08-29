@@ -117,6 +117,40 @@ stays at `aal1` until a second factor joins it.
 `mfa` appears in `amr` when the evidence reaches `aal2` or above. It is
 derived from the other methods and cannot be asserted by a caller.
 
+### Where the claims come from
+
+Enrolment records what it proved — the channel that established control,
+and where the device's key lives — in the device record. Admission reads
+that back, adds the possession proof the request in front of it just made,
+and hands both to the mint as `amr`, `acr` and `auth_time`. The level is
+never stored: it is scored from the recorded facts at mint time by the same
+fragment a relying party scores with, so a record written before a rung was
+added still scores correctly under the ladder that has it.
+
+`auth_time` is the possession proof, not the enrolment. A device that
+enrolled last month and signed a proof a second ago authenticated a second
+ago, and a policy asking for a recent proof should see that.
+
+A deployment whose devices enrol by mailed code and present a DPoP proof
+reaches `aal1`: both proofs are possession, which is one category however
+many proofs are collected. Reaching `aal2` needs a genuinely different
+factor. The `totp` fragment implements one, pinned against the RFC 4226 and
+6238 vectors, and the `webauthn` fragment another, driven through ceremonies
+assembled in the shapes a browser and authenticator produce — but neither
+has a wired endpoint, so `aal2` is reachable by the ladder and not yet by
+this deployment.
+
+### A claim may not exceed its evidence
+
+`acr` is a summary and `amr` is the evidence for it, so a credential naming
+a level its own methods do not reach is refused — by `token_verify`, and by
+`resource_gate` even where the deployment sets no floor at all. The
+contradiction belongs to the credential, not to the policy reading it.
+
+That is what makes the summary safe to read. A relying party can compare
+`acr` against its floor without re-deriving the level, knowing the two ends
+cannot disagree about a credential that passed.
+
 ## Asking for more
 
 A relying party holds the policy; kagi never sees it. `AssurancePolicy`
@@ -183,5 +217,5 @@ because that chain is the evidence of what happened.
 - **SMS and push codes.** SIM swapping makes a phone number a weaker
   possession proof than the device key kagi already holds, so offering it
   as a second factor would lower assurance while appearing to raise it.
-- **A consumer OAuth authorisation-code server.** Unbuilt, and wanted by
-  neither machine-identity consumer.
+- **Passwords.** There is no password to phish, reuse, or store, which is
+  what makes the inbox a bootstrap rather than a credential.

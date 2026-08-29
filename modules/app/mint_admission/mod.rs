@@ -170,6 +170,16 @@ struct Pending {
     device_id: [u8; MAX_FIELD],
     device_id_len: u16,
     jkt: [u8; 43],
+    /// What the presenter proved, assembled here because this is the only
+    /// stage that sees both halves: the enrolment facts the ledger record
+    /// carries, and the possession proof in the request in front of it.
+    evidence: auth_wire::assurance::EvidenceWire,
+    /// When the possession proof was verified — the token's `auth_time`.
+    ///
+    /// Taken at verification rather than when the ledger answers: the round
+    /// trip is not part of the authentication, and a busy ledger must not
+    /// make a token look freshly authenticated later than it was.
+    proved_at: u64,
 }
 
 impl Pending {
@@ -186,6 +196,13 @@ impl Pending {
             device_id: [0; MAX_FIELD],
             device_id_len: 0,
             jkt: [0; 43],
+            evidence: auth_wire::assurance::EvidenceWire {
+                methods: 0,
+                key_binding: 0,
+                flags: 0,
+                auth_time: 0,
+            },
+            proved_at: 0,
         }
     }
 }
@@ -463,6 +480,14 @@ unsafe fn reply(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8, 
             device_id: b"",
             thumbprint_alg: auth_wire::suite::thumbprint::NONE,
             jkt: b"",
+            // A refusal establishes nothing, so it carries no evidence — the
+            // same rule as the identity fields beside it.
+            evidence: auth_wire::assurance::EvidenceWire {
+                methods: 0,
+                key_binding: 0,
+                flags: 0,
+                auth_time: 0,
+            },
         }
         .encode(&mut framed)
     };
@@ -486,6 +511,7 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending) {
         device_id: &entry.device_id[..usize::from(entry.device_id_len)],
         thumbprint_alg: auth_wire::suite::thumbprint::JWK_SHA256,
         jkt: &entry.jkt,
+        evidence: entry.evidence,
     };
     let mut framed = [0u8; 1024];
     if let Ok(n) = resp.encode(&mut framed) {
@@ -682,6 +708,7 @@ unsafe fn handle(
     let device_len = device_id.len().min(MAX_FIELD);
     entry.device_id[..device_len].copy_from_slice(&device_id[..device_len]);
     entry.jkt = admitted.thumbprint;
+    entry.proved_at = now;
     #[expect(clippy::cast_possible_truncation, reason = "each bounded by MAX_FIELD")]
     {
         entry.sub_len = sub_len as u16;
@@ -798,6 +825,14 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             continue;
         }
 
+        // Assemble what the presenter proved, now that both halves are in
+        // hand: the enrolment facts the ledger record carries, and the
+        // possession proof this request just made. Scoring is the shared
+        // fragment's, so what admission establishes and what a relying party
+        // later checks are the same ladder.
+        let mut entry = entry;
+        entry.evidence = establish_evidence(rep.value, entry.proved_at);
+
         if entry.grant {
             emit_mint(s, sys, index, &entry);
         } else {
@@ -805,6 +840,45 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         }
     }
     worked
+}
+
+/// What the presenter proved, from the enrolment record and this request.
+///
+/// Two sources, and neither alone is the answer. The record says how the
+/// device was ENROLLED — which channel proved control, where its key lives —
+/// and the request in front of us says the device holds that key NOW. A
+/// token's `amr` has to carry both or it describes an authentication that
+/// did not happen.
+///
+/// `auth_time` is this proof, not the enrolment: the device authenticated
+/// just now by signing, and reporting the enrolment instant would make every
+/// token look as old as the device.
+///
+/// Unrecognised methods in the record are dropped rather than carried, so a
+/// record written by a newer build cannot inflate a level this one computes.
+fn establish_evidence(record: &[u8], now: u64) -> auth_wire::assurance::EvidenceWire {
+    use auth_wire::assurance::{AuthMethod, Evidence, KeyBinding};
+
+    // The proof this request made. Always present: admission does not reach
+    // here without a verified possession proof.
+    let mut evidence = Evidence::at(now).with(AuthMethod::Pop);
+
+    if let Some(amr) = jose::claim_array(record, b"amr") {
+        for name in amr {
+            evidence = evidence.with_amr_name(name);
+        }
+    }
+    evidence = match jose::claim_str(record, b"key_binding") {
+        Some(b"hardware") => evidence.key_binding(KeyBinding::Hardware),
+        // Software unless the enrolment recorded otherwise. A device key this
+        // issuer never saw generated is a software key as far as it knows,
+        // and guessing upward is the one direction that must not happen.
+        _ => evidence.key_binding(KeyBinding::Software),
+    };
+    if matches!(jose::claim_str(record, b"user_verified"), Some(b"true")) {
+        evidence = evidence.user_verified(true);
+    }
+    evidence.encode()
 }
 
 /// The presenter is admitted; MINT under the deployment's policy.
@@ -840,6 +914,28 @@ unsafe fn emit_mint(s: &mut ModuleState, sys: &SyscallTable, index: usize, entry
     let mint_corr = s.next_corr;
     s.next_corr = s.next_corr.wrapping_add(1).max(1);
 
+    // What the presenter proved, as the three claims a relying party reads.
+    // Rendered by the shared fragment: the level in `acr` and the methods in
+    // `amr` are scored from one place, so a token cannot claim a level its
+    // own method list does not support.
+    let evidence = auth_wire::assurance::Evidence::decode(entry.evidence);
+    let mut amr = [0u8; auth_wire::assurance::Evidence::MAX_AMR_JSON];
+    let amr_len = evidence.write_amr(&mut amr).unwrap_or(0);
+    let extra = [
+        auth_wire::MintClaim {
+            key: b"amr",
+            value: auth_wire::MintClaimValue::Raw(&amr[..amr_len]),
+        },
+        auth_wire::MintClaim {
+            key: b"acr",
+            value: auth_wire::MintClaimValue::Str(evidence.acr().as_bytes()),
+        },
+        auth_wire::MintClaim {
+            key: b"auth_time",
+            value: auth_wire::MintClaimValue::U64(evidence.auth_time()),
+        },
+    ];
+
     let req = auth_wire::MintRequest {
         correlation: mint_corr,
         request_type: auth_wire::request_type::MINT,
@@ -853,7 +949,7 @@ unsafe fn emit_mint(s: &mut ModuleState, sys: &SyscallTable, index: usize, entry
         scope: &s.scope[..usize::from(s.scope_len)],
         thumbprint_alg: auth_wire::suite::thumbprint::JWK_SHA256,
         jkt: Some(&entry.jkt),
-        extra: auth_wire::ExtraClaims::Slice(&[]),
+        extra: auth_wire::ExtraClaims::Slice(&extra),
     };
     let mut framed = [0u8; 4096];
     let ok = req

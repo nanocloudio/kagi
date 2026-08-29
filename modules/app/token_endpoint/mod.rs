@@ -152,6 +152,11 @@ struct Pending {
     sub_len: u16,
     jkt: [u8; 43],
     jkt_len: u8,
+    /// What admission established the presenter proved, carried to the mint
+    /// so the token says how it was obtained. This module does not derive
+    /// it: admission is the stage that saw both the enrolment record and the
+    /// proof, and a second derivation here could disagree with it.
+    evidence: auth_wire::assurance::EvidenceWire,
     aud: [u8; MAX_FIELD],
     aud_len: u16,
     scope: [u8; MAX_FIELD],
@@ -176,6 +181,12 @@ impl Pending {
             sub_len: 0,
             jkt: [0u8; 43],
             jkt_len: 0,
+            evidence: auth_wire::assurance::EvidenceWire {
+                methods: 0,
+                key_binding: 0,
+                flags: 0,
+                auth_time: 0,
+            },
             aud: [0u8; MAX_FIELD],
             aud_len: 0,
             scope: [0u8; MAX_FIELD],
@@ -707,6 +718,7 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         entry.device_id[..device_len].copy_from_slice(&verdict.device_id[..device_len]);
         let jkt_len = verdict.jkt.len().min(entry.jkt.len());
         entry.jkt[..jkt_len].copy_from_slice(&verdict.jkt[..jkt_len]);
+        entry.evidence = verdict.evidence;
         #[expect(clippy::cast_possible_truncation, reason = "each bounded above")]
         {
             entry.sub_len = sub_len as u16;
@@ -736,6 +748,26 @@ unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending
     // the raw channel write: handing it to `channel_write_msg` would wrap an
     // envelope in a second one and the mint would read its correlation id out
     // of the framing.
+    // The assurance claims, rendered by the shared fragment so this path and
+    // the grant path emit the same three claims from the same scoring.
+    let evidence = auth_wire::assurance::Evidence::decode(entry.evidence);
+    let mut amr = [0u8; auth_wire::assurance::Evidence::MAX_AMR_JSON];
+    let amr_len = evidence.write_amr(&mut amr).unwrap_or(0);
+    let extra = [
+        auth_wire::MintClaim {
+            key: b"amr",
+            value: auth_wire::MintClaimValue::Raw(&amr[..amr_len]),
+        },
+        auth_wire::MintClaim {
+            key: b"acr",
+            value: auth_wire::MintClaimValue::Str(evidence.acr().as_bytes()),
+        },
+        auth_wire::MintClaim {
+            key: b"auth_time",
+            value: auth_wire::MintClaimValue::U64(evidence.auth_time()),
+        },
+    ];
+
     let mut framed = [0u8; 4096];
     let request = MintRequest {
         correlation: corr,
@@ -754,7 +786,7 @@ unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending
         // minted here without a `cnf` would be a bearer token.
         thumbprint_alg: auth_wire::suite::thumbprint::JWK_SHA256,
         jkt: Some(&entry.jkt),
-        extra: ExtraClaims::none(),
+        extra: ExtraClaims::Slice(&extra),
     };
     let Ok(n) = request.encode(&mut framed) else {
         refuse(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);

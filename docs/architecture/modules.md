@@ -118,7 +118,7 @@ of once per caller.
 | msg | dir | payload |
 |---|---|---|
 | `ADMIT_REQ` 0x35 | → admission | the credential and DPoP proof, with the request they were made for |
-| `ADMIT_RESP` 0x36 | admission → | subject, device and key binding, or a typed refusal |
+| `ADMIT_RESP` 0x36 | admission → | subject, device, key binding and the evidence established, or a typed refusal |
 | `GRANT_REQ` 0x37 | → admission | as `ADMIT_REQ`; admission mints as well |
 | `GRANT_RESP` 0x38 | admission → | `[corr][status][token f16]` |
 | `AUTHORIZE_REQ` 0x39 | → authcode | the client's ask plus the subject's presentation |
@@ -134,6 +134,22 @@ for a wider audience or a longer life because there is no field to ask in.
 Every reply in this family refuses at decode to carry both a refusal status
 and a payload: a caller that ignored `status` cannot end up holding something
 token-shaped.
+
+### Assurance
+
+Admission is the only stage that sees both what the enrolment record says
+was proved and what the request in front of it just proved, so it is where
+the two are combined. `ADMIT_RESP` carries the result as a fixed-width
+`assurance::EvidenceWire` — a method bitset, a key binding, two flags and
+the time of the proof — and both minters render it into the `amr`, `acr`
+and `auth_time` claims through the same fragment a relying party scores
+with. The bitset is the fragment's own, so a method added there needs no
+change to any wire that carries one.
+
+`VERIFY_RESP` reports the same shape, read out of the credential's own
+claims rather than inferred from its form: a `cnf` binding says a
+credential is non-bearer, which is one fact among the several a level is
+scored from.
 
 ### Control plane
 

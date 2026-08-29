@@ -35,6 +35,30 @@
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface"
 )]
 
+/// Evidence as it travels between modules and rests in a record.
+///
+/// A flat, fixed-width form: no allocator, no JSON, and the same four fields
+/// whatever methods a future build adds — the bitset absorbs those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EvidenceWire {
+    /// [`Evidence`]'s method bitset.
+    pub methods: u16,
+    /// [`KeyBinding`]: 0 none, 1 software, 2 hardware.
+    pub key_binding: u8,
+    /// See [`evidence_flag`].
+    pub flags: u8,
+    /// When the proof was made.
+    pub auth_time: u64,
+}
+
+/// Bits in [`EvidenceWire::flags`].
+pub mod evidence_flag {
+    /// The authenticator verified the user locally before it would sign.
+    pub const USER_VERIFIED: u8 = 1 << 0;
+    /// The proof was bound to the relying party it was presented to.
+    pub const PHISHING_RESISTANT: u8 = 1 << 1;
+}
+
 /// A single authentication method, as reported in `amr`.
 ///
 /// Values marked *(RFC 8176)* come from the IANA "Authentication Method
@@ -112,6 +136,25 @@ impl AuthMethod {
             Self::Recovery => "recovery",
             Self::Mfa => "mfa",
         }
+    }
+
+    /// Parse an `amr` entry from raw bytes.
+    ///
+    /// The form a module reads: a claim comes off the wire as bytes and
+    /// converting to `str` first would mean deciding what to do about
+    /// invalid UTF-8, which is a question with no better answer than "it
+    /// matches no method".
+    #[must_use]
+    pub fn parse_bytes(text: &[u8]) -> Option<Self> {
+        let mut i = 0usize;
+        while i < Self::ALL.len() {
+            let method = Self::ALL[i];
+            if method.as_str().as_bytes() == text {
+                return Some(method);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Parse an `amr` entry. Unknown values return `None` and are dropped
@@ -203,6 +246,21 @@ impl AssuranceLevel {
         }
     }
 
+    /// Parse an `acr` claim from raw bytes.
+    ///
+    /// The form a module reads: a claim arrives as bytes, and converting to
+    /// `str` first would mean deciding what to do about invalid UTF-8 — a
+    /// question with no better answer than "it names no level".
+    #[must_use]
+    pub fn parse_bytes(text: &[u8]) -> Option<Self> {
+        match text {
+            b"aal1" => Some(Self::Aal1),
+            b"aal2" => Some(Self::Aal2),
+            b"aal3" => Some(Self::Aal3),
+            _ => None,
+        }
+    }
+
     /// Parse an `acr` claim. Unknown values are rejected rather than being
     /// treated as a floor, so a relying party can never be talked into
     /// accepting an unrecognised level.
@@ -253,6 +311,32 @@ impl Evidence {
         self
     }
 
+    /// Record one `amr` name, with everything that name implies.
+    ///
+    /// A method name is not only a method: `hwk` says where the key lives,
+    /// `user` says the authenticator verified someone, and `webauthn` says
+    /// the proof was bound to the relying party. Those implications are the
+    /// difference between `aal1` and `aal3`, so they are drawn here rather
+    /// than at each place that reads a claim — three readers drawing them
+    /// separately is three chances to score one credential differently.
+    ///
+    /// A name this build does not recognise is dropped: an unknown method
+    /// cannot contribute to a level, in either direction.
+    #[must_use]
+    pub fn with_amr_name(self, name: &[u8]) -> Self {
+        let Some(method) = AuthMethod::parse_bytes(name) else {
+            return self;
+        };
+        let evidence = self.with(method);
+        match method {
+            AuthMethod::Hwk => evidence.key_binding(KeyBinding::Hardware),
+            AuthMethod::Swk => evidence.key_binding(KeyBinding::Software),
+            AuthMethod::User => evidence.user_verified(true),
+            AuthMethod::Webauthn => evidence.phishing_resistant(true),
+            _ => evidence,
+        }
+    }
+
     /// Record where the proving key lives.
     #[must_use]
     pub const fn key_binding(mut self, binding: KeyBinding) -> Self {
@@ -297,6 +381,140 @@ impl Evidence {
     pub const fn is_empty(&self) -> bool {
         self.methods == 0
     }
+
+    /// The evidence in the form it travels and is stored in.
+    ///
+    /// The bitset is the fragment's own, so a method added here needs no
+    /// change to any wire, record or module that carries one: the width was
+    /// already reserved and the meaning is defined in exactly one place.
+    #[must_use]
+    pub const fn encode(&self) -> EvidenceWire {
+        let mut flags = 0u8;
+        if self.user_verified {
+            flags |= evidence_flag::USER_VERIFIED;
+        }
+        if self.phishing_resistant {
+            flags |= evidence_flag::PHISHING_RESISTANT;
+        }
+        EvidenceWire {
+            methods: self.methods,
+            key_binding: match self.key_binding {
+                KeyBinding::None => 0,
+                KeyBinding::Software => 1,
+                KeyBinding::Hardware => 2,
+            },
+            flags,
+            auth_time: self.auth_time,
+        }
+    }
+
+    /// Rebuild evidence from its wire form.
+    ///
+    /// An unrecognised key binding decodes as `None` — the weakest — because
+    /// a value this build does not understand must not be scored as the
+    /// strongest thing it might have meant.
+    #[must_use]
+    pub const fn decode(wire: EvidenceWire) -> Self {
+        Self {
+            methods: wire.methods,
+            key_binding: match wire.key_binding {
+                1 => KeyBinding::Software,
+                2 => KeyBinding::Hardware,
+                _ => KeyBinding::None,
+            },
+            user_verified: wire.flags & evidence_flag::USER_VERIFIED != 0,
+            phishing_resistant: wire.flags & evidence_flag::PHISHING_RESISTANT != 0,
+            auth_time: wire.auth_time,
+        }
+    }
+
+    /// Write the `amr` claim's JSON array into `out`, returning its length.
+    ///
+    /// The producer's half of this fragment. Scoring evidence and rendering
+    /// the claim that reports it are the same knowledge, and splitting them
+    /// across a module boundary is how a token comes to claim a level its own
+    /// `amr` does not support.
+    ///
+    /// `mfa` is derived here rather than recorded: it is a statement ABOUT the
+    /// other methods, and a caller that could assert it could inflate a
+    /// token's summary of itself.
+    pub fn write_amr(&self, out: &mut [u8]) -> Option<usize> {
+        let mut at = 0usize;
+        let mut put = |bytes: &[u8], at: &mut usize| -> bool {
+            if *at + bytes.len() > out.len() {
+                return false;
+            }
+            out[*at..*at + bytes.len()].copy_from_slice(bytes);
+            *at += bytes.len();
+            true
+        };
+        if !put(b"[", &mut at) {
+            return None;
+        }
+        let mut first = true;
+        for method in self.methods() {
+            if !first && !put(b",", &mut at) {
+                return None;
+            }
+            if !put(b"\"", &mut at)
+                || !put(method.as_str().as_bytes(), &mut at)
+                || !put(b"\"", &mut at)
+            {
+                return None;
+            }
+            first = false;
+        }
+        if self.distinct_factors() >= 2 {
+            if !first && !put(b",", &mut at) {
+                return None;
+            }
+            if !put(b"\"", &mut at)
+                || !put(AuthMethod::Mfa.as_str().as_bytes(), &mut at)
+                || !put(b"\"", &mut at)
+            {
+                return None;
+            }
+        }
+        if !put(b"]", &mut at) {
+            return None;
+        }
+        Some(at)
+    }
+
+    /// The `acr` claim for this evidence.
+    #[must_use]
+    pub fn acr(&self) -> &'static str {
+        self.level().as_str()
+    }
+
+    /// Whether a credential claiming `acr` is supported by these methods.
+    ///
+    /// `acr` is a summary and `amr` is the evidence for it, so a credential
+    /// asserting a level its own methods do not reach is asserting something
+    /// it also refutes. Reading the summary alone would take the assertion;
+    /// reading the methods alone would ignore an issuer that knows something
+    /// the names do not carry. Requiring the summary to be no higher than the
+    /// evidence takes the issuer's word only as far as its own evidence goes.
+    #[must_use]
+    pub fn supports(&self, claimed: AssuranceLevel) -> bool {
+        claimed <= self.level()
+    }
+
+    /// The longest `amr` array this fragment can render.
+    ///
+    /// Every method name plus quotes, commas and brackets. A caller sizes its
+    /// buffer from this rather than guessing, and adding a method keeps it
+    /// correct because the bound is computed from the registry.
+    pub const MAX_AMR_JSON: usize = {
+        let mut total = 2; // the brackets
+        let mut i = 0usize;
+        while i < AuthMethod::ALL.len() {
+            // "name" plus a separator
+            total += AuthMethod::ALL[i].as_str().len() + 3;
+            i += 1;
+        }
+        total
+    };
 
     /// How many distinct factor categories the evidence covers.
     fn distinct_factors(&self) -> usize {
@@ -390,6 +608,12 @@ pub enum AssuranceFailure {
     ProofTooOld { age: u64, max_age: u64 },
     /// A specifically required method was not among the token's `amr`.
     MethodMissing(AuthMethod),
+    /// The token claims a level its own `amr` does not reach. Refused
+    /// whatever the floor: the contradiction is the credential's.
+    LevelUnsupported {
+        claimed: AssuranceLevel,
+        supported: AssuranceLevel,
+    },
 }
 
 impl AssurancePolicy {
@@ -433,6 +657,24 @@ impl AssurancePolicy {
         if let Some(required) = self.require_method {
             if !amr.iter().any(|m| *m == required.as_str()) {
                 return Err(AssuranceFailure::MethodMissing(required));
+            }
+        }
+
+        // A credential may not claim a level its own `amr` does not reach.
+        // Checked before the floor, and whatever the floor is: a
+        // self-contradicting credential is refused by a deployment that
+        // demands nothing, because the contradiction is the issuer's and not
+        // this policy's to weigh.
+        if let Some(claimed) = acr.and_then(AssuranceLevel::parse) {
+            let mut evidence = Evidence::at(auth_time.unwrap_or(0));
+            for name in amr {
+                evidence = evidence.with_amr_name(name.as_bytes());
+            }
+            if !evidence.supports(claimed) {
+                return Err(AssuranceFailure::LevelUnsupported {
+                    claimed,
+                    supported: evidence.level(),
+                });
             }
         }
 

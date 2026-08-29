@@ -24,6 +24,7 @@
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface"
 )]
 
+use crate::auth_wire::suite;
 use crate::b64;
 use crate::jose;
 
@@ -52,12 +53,15 @@ pub const CLOCK_SKEW_SECS: u64 = 60;
 /// The longest proof signing input this fragment composes.
 pub const MAX_PROOF_INPUT: usize = 512;
 
-/// Verify a JWS signature. `(alg_code, pubkey, signing_input, signature)`.
+/// Verify a JWS signature. `(suite, pubkey, signing_input, signature)`.
 ///
-/// `alg_code` is `auth_wire::suite`. The curve implementation is the
-/// caller's: a module wires the SDK's, an issuer wires the one its key
-/// custody speaks.
-pub type VerifyFn = fn(u8, &[u8], &[u8], &[u8]) -> bool;
+/// `suite` is a `suite::*` id, the same `u16` the rest of the surface
+/// carries — not a narrowed copy of it, because a suite space that is `u16`
+/// in the registry and `u8` at a verification boundary is one that silently
+/// stops round-tripping the day it needs the width. The curve implementation
+/// is the caller's: a module wires the SDK's, an issuer wires the one its
+/// key custody speaks.
+pub type VerifyFn = fn(u16, &[u8], &[u8], &[u8]) -> bool;
 
 /// The ciphersuites this contract covers.
 ///
@@ -200,7 +204,7 @@ pub fn write_proof_input(
 pub fn check_credential<'a>(
     verify: VerifyFn,
     credential: &[u8],
-    issuer_alg: u8,
+    issuer_suite: u16,
     issuer_key: &[u8],
     expected_issuer: &[u8],
     now: u64,
@@ -219,21 +223,35 @@ pub fn check_credential<'a>(
         _ => return Err(CredentialError::WrongContentType),
     }
     // The header must SAY what signed it, but what actually verifies is
-    // `issuer_alg` — the suite the caller holds the key under. A credential
+    // `issuer_suite` — the suite the caller holds the key under. A credential
     // therefore cannot talk a verifier into a weaker algorithm by naming
     // one, which is the whole of the JOSE `alg` confusion class.
     if jose::claim_str(header, b"alg").is_none() {
         return Err(CredentialError::UnknownAlgorithm);
     }
 
-    // 64 bytes: both suites kagi signs credentials under — Ed25519 and
-    // ES256 — produce exactly that, and a longer one belongs to a suite this
-    // build does not issue.
-    let mut signature = [0u8; 64];
-    if b64::decode(jws.signature_b64, &mut signature) != Some(64) {
+    // A suite this build cannot verify is refused as that, before any bytes
+    // are read under it.
+    if !suite::is_implemented(issuer_suite) {
+        return Err(CredentialError::UnknownAlgorithm);
+    }
+
+    // The buffer is sized from the registry and the signature is then
+    // checked against the length THIS suite produces. A fixed `64` would be
+    // right for the two suites implemented today and wrong for every one
+    // after them, and would accept a 64-byte signature offered under a suite
+    // that does not sign in 64 bytes.
+    let expected = suite::max_signature_len(issuer_suite);
+    let mut signature = [0u8; suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    if b64::decode(jws.signature_b64, &mut signature) != Some(expected) {
         return Err(CredentialError::Segment);
     }
-    if !verify(issuer_alg, issuer_key, jws.signing_input, &signature) {
+    if !verify(
+        issuer_suite,
+        issuer_key,
+        jws.signing_input,
+        &signature[..expected],
+    ) {
         return Err(CredentialError::BadSignature);
     }
 

@@ -71,8 +71,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
-#[path = "../../common/assurance.rs"]
-mod assurance;
+/// The assurance ladder, reached through `auth_wire` so this module and the
+/// wire it reads cannot mount two copies of one vocabulary.
+use auth_wire::assurance;
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -547,7 +548,7 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<
     // ── 5. the token meets the assurance floor ────────────────────────────
     let acr = jose::claim_str(token_json, b"acr");
     let auth_time = jose::claim_u64(token_json, b"auth_time");
-    check_assurance(s, acr, auth_time, now).map_err(|()| Refusal::Assurance)?;
+    check_assurance(s, token_json, acr, auth_time, now).map_err(|()| Refusal::Assurance)?;
 
     // Leave `sub` at the front of `s.out` for the caller.
     let subject = jose::claim_str(token_json, b"sub").unwrap_or(b"");
@@ -566,10 +567,21 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<
 /// treated as a floor, and a freshness demand a token cannot answer fails.
 fn check_assurance(
     s: &ModuleState,
+    token_json: &[u8],
     acr: Option<&[u8]>,
     auth_time: Option<u64>,
     now: u64,
 ) -> Result<(), ()> {
+    // A credential may not claim more than its own `amr` reaches. Checked
+    // whatever the floor, because the contradiction is the credential's and
+    // not this deployment's to weigh — and checked here as well as in
+    // `token_verify` so a surface fronted by only one of them is not the
+    // weaker one.
+    if let Some(claimed) = acr.and_then(level_from) {
+        if !evidence_from(token_json, auth_time).supports(claimed) {
+            return Err(());
+        }
+    }
     if s.min_level > AssuranceLevel::Aal1 {
         let level = acr.and_then(level_from).ok_or(())?;
         if level < s.min_level {
@@ -583,6 +595,21 @@ fn check_assurance(
         }
     }
     Ok(())
+}
+
+/// The evidence a token's own `amr` carries.
+///
+/// Each name carries whatever it implies about the key and the ceremony;
+/// `Evidence::with_amr_name` draws those, so this gate and the issuer that
+/// wrote the claim score one credential the same way.
+fn evidence_from(token_json: &[u8], auth_time: Option<u64>) -> assurance::Evidence {
+    let mut evidence = assurance::Evidence::at(auth_time.unwrap_or(0));
+    if let Some(amr) = jose::claim_array(token_json, b"amr") {
+        for name in amr {
+            evidence = evidence.with_amr_name(name);
+        }
+    }
+    evidence
 }
 
 /// The `Sha256Fn` shape the fragments take, over the SDK's hasher.

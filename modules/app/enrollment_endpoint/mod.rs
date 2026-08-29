@@ -1315,6 +1315,22 @@ unsafe fn redeem(
     put(&mut out, &mut at, b"\"")?;
     put(&mut out, &mut at, br#","email_hash":"#)?;
     put_json_string(&mut out, &mut at, email_hash)?;
+    // What the enrolment PROVED, recorded so admission can score it later.
+    // The level is not stored: it is derived from these facts by the shared
+    // fragment at mint time, so a record written today scores correctly under
+    // a ladder that gains a rung tomorrow.
+    //
+    // `email` is the channel that proved control — the mailed code came back,
+    // or an operator carried one for the QR ceremony. `key_binding` is
+    // software because the device generated its own key and this issuer has
+    // seen no attestation saying otherwise; recording anything stronger would
+    // be claiming evidence nobody produced.
+    put(
+        &mut out,
+        &mut at,
+        br#","amr":["email","pop"],"key_binding":"#,
+    )?;
+    put_json_string(&mut out, &mut at, b"software")?;
     put(&mut out, &mut at, br#","exp":"#)?;
     put_u64(&mut out, &mut at, now + CERTIFICATE_TTL_SECS)?;
     put(&mut out, &mut at, br#","iat":"#)?;
@@ -2205,6 +2221,14 @@ fn put(out: &mut [u8], at: &mut usize, bytes: &[u8]) -> Result<(), Refusal> {
 }
 
 fn put_json_string(out: &mut [u8], at: &mut usize, value: &[u8]) -> Result<(), Refusal> {
+    // A value that could end its own string could introduce a key, and the
+    // reader takes the FIRST match anywhere in the record — see
+    // `jose::is_record_safe`. Every value written here is a thumbprint, a
+    // hash or a deployment parameter today, and the guard is what keeps that
+    // a fact rather than a habit.
+    if !jose::is_record_safe(value) {
+        return Err(Refusal::Malformed);
+    }
     put(out, at, b"\"")?;
     put(out, at, value)?;
     put(out, at, b"\"")

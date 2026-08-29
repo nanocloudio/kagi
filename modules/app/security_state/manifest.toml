@@ -46,4 +46,5 @@ metrics = [
     "state_conflict",
     "state_unavailable",
     "state_malformed",
+    "state_read_too_weak",
 ]

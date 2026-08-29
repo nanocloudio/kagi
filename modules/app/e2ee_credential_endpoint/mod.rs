@@ -870,6 +870,14 @@ fn put(out: &mut [u8], at: &mut usize, bytes: &[u8]) -> Result<(), Refusal> {
 }
 
 fn put_json_string(out: &mut [u8], at: &mut usize, value: &[u8]) -> Result<(), Refusal> {
+    // A value that could end its own string could introduce a key, and the
+    // reader takes the FIRST match anywhere in the record — see
+    // `jose::is_record_safe`. Every value written here is a thumbprint, a
+    // hash or a deployment parameter today, and the guard is what keeps that
+    // a fact rather than a habit.
+    if !jose::is_record_safe(value) {
+        return Err(Refusal::Malformed);
+    }
     put(out, at, b"\"")?;
     put(out, at, value)?;
     put(out, at, b"\"")

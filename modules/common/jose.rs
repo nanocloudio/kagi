@@ -422,6 +422,34 @@ pub fn claim_u64(payload_json: &[u8], key: &[u8]) -> Option<u64> {
 /// `None` if the key is absent or its value is not a string. Like
 /// `claim_u64`, this is a scanner for kagi's flat claim objects, not a
 /// general JSON parser.
+/// Whether `value` may be written into a record that [`claim_str`] will read
+/// back, without escaping it.
+///
+/// [`claim_str`] scans for the FIRST `"key":"…"` anywhere in the bytes,
+/// including inside another value. So a record built by concatenation, whose
+/// values are not checked, lets one value introduce a key: a `nonce` carrying
+/// `","scope":"admin` places a scope ahead of the real one and wins the read.
+///
+/// The answer is to refuse rather than to escape. `claim_str` returns the raw
+/// bytes between the quotes, so an escaped value reads back with its
+/// backslashes still in it — a nonce that is not the nonce that was sent.
+/// Control bytes go too: they cannot appear raw in a JSON string.
+///
+/// This is the writer's half of that scanner's contract, and it lives here so
+/// the two cannot be reasoned about separately.
+#[must_use]
+pub const fn is_record_safe(value: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < value.len() {
+        let byte = value[i];
+        if byte == b'"' || byte == b'\\' || byte < 0x20 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 pub fn claim_str<'a>(payload_json: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     let needle_len = key.len() + 2; // "key"
     let mut i = 0;
@@ -532,6 +560,78 @@ impl JsonWriter<'_> {
             }
         }
         self.raw(&digits[i..])
+    }
+}
+
+/// Every string element of a JSON array claim, in order.
+///
+/// For claims that are a LIST of equals — `amr` is the one this exists for —
+/// where reading only the first would drop the methods that make a level.
+/// Contrast [`claim_array_first_str`], which reads one deliberately.
+///
+/// Elements are returned raw, exactly as [`claim_str`] returns a string: no
+/// unescaping, because the values this reads are registry tokens and a value
+/// needing an escape is a value that does not match any of them.
+#[must_use]
+pub fn claim_array<'a>(json: &'a [u8], key: &[u8]) -> Option<ClaimArray<'a>> {
+    let mut i = 0usize;
+    let at = loop {
+        if i + key.len() + 2 > json.len() {
+            return None;
+        }
+        if json[i] == b'"'
+            && json[i + 1..].starts_with(key)
+            && json.get(i + 1 + key.len()) == Some(&b'"')
+        {
+            break i + key.len() + 2;
+        }
+        i += 1;
+    };
+    let mut p = at;
+    while p < json.len() && (json[p] == b' ' || json[p] == b':') {
+        p += 1;
+    }
+    if json.get(p) != Some(&b'[') {
+        return None;
+    }
+    Some(ClaimArray { json, at: p + 1 })
+}
+
+/// The string elements of one JSON array claim.
+pub struct ClaimArray<'a> {
+    json: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for ClaimArray<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Skip separators to the next element's opening quote, stopping at
+        // the array's end so a following claim is never read as an element.
+        while self.at < self.json.len() {
+            match self.json[self.at] {
+                b' ' | b',' => self.at += 1,
+                b'"' => break,
+                _ => return None,
+            }
+        }
+        if self.json.get(self.at) != Some(&b'"') {
+            return None;
+        }
+        let start = self.at + 1;
+        let mut end = start;
+        while end < self.json.len() {
+            match self.json[end] {
+                b'\\' => end += 2,
+                b'"' => {
+                    self.at = end + 1;
+                    return Some(&self.json[start..end]);
+                }
+                _ => end += 1,
+            }
+        }
+        None
     }
 }
 

@@ -548,22 +548,40 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     }
 
-    // A `cnf.jkt` binding is what makes a credential non-bearer, so a
-    // credential that carries one was authenticated to proof-of-possession
-    // and one that does not was not. Reported rather than assumed: the
-    // caller's floor is checked against what the credential actually says.
-    let cnf = jose::claim_str(json, b"cnf").unwrap_or(b"");
+    // The key binding, still read: it is what makes the credential
+    // non-bearer, and the identity reports it as its own fact rather than as
+    // an assurance level.
     let jkt = jose::claim_str(json, b"jkt").unwrap_or(b"");
-    let bound = !jkt.is_empty() || !cnf.is_empty();
-    let (level, methods) = if bound {
-        (
-            auth_wire::assurance::PROOF_OF_POSSESSION,
-            auth_wire::auth_method::PROOF_OF_POSSESSION,
-        )
-    } else {
-        (auth_wire::assurance::SINGLE_FACTOR, 0u16)
+
+    // What the credential SAYS was proved, from its own `acr`/`amr` claims —
+    // not inferred from its shape. A `cnf` binding says a credential is
+    // non-bearer, which is one fact among the several a level is scored
+    // from; reading a level out of it would report an answer the credential
+    // never made, and would ignore the `amr` of one that did.
+    //
+    // A credential carrying neither claim scores as the floor, which is the
+    // safe direction: an unknown level is never treated as a high one.
+    let evidence = read_evidence(json);
+    let presented = evidence.level();
+    // A credential may not claim a level its own `amr` does not reach.
+    // Refused whatever the policy asked for: the contradiction is the
+    // credential's, and a caller demanding nothing should still not be
+    // handed one that argues with itself.
+    if let Some(claimed) =
+        jose::claim_str(json, b"acr").and_then(auth_wire::assurance::AssuranceLevel::parse_bytes)
+    {
+        if !evidence.supports(claimed) {
+            s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+            refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
+            return;
+        }
+    }
+    let Some(required) = level_from_discriminant(req.min_assurance) else {
+        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+        refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
+        return;
     };
-    if level < req.min_assurance {
+    if presented < required {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
         refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
         return;
@@ -594,8 +612,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         // reported as authenticated when it was issued, which is the most
         // a credential that says nothing else can support.
         auth_time: jose::claim_u64(json, b"auth_time").unwrap_or(iat),
-        assurance: level,
-        auth_methods: methods,
+        evidence: evidence.encode(),
         credential_id,
         // Empty: this module does not record replays. `device_auth` does,
         // for the credentials presented with a proof, and reporting an id
@@ -610,6 +627,61 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 
     s.verify_ok = s.verify_ok.saturating_add(1);
     emit(s, sys, &identity);
+}
+
+/// Read a credential's assurance claims into the shared evidence type.
+///
+/// `amr` is a JSON array of RFC 8176 method names. An unrecognised name is
+/// dropped rather than carried, so a method this build does not understand
+/// can never contribute to a level it computes — the rule
+/// `auth_wire::assurance::AuthMethod::parse` already states, applied here.
+///
+/// The `acr` claim is NOT read back as the level. A level is scored from the
+/// methods, and taking the issuer's word for it would let a credential name
+/// a level its own `amr` does not support.
+fn read_evidence(json: &[u8]) -> auth_wire::assurance::Evidence {
+    let auth_time = jose::claim_u64(json, b"auth_time").unwrap_or(0);
+    let mut evidence = auth_wire::assurance::Evidence::at(auth_time);
+    let Some(amr) = jose::claim_array(json, b"amr") else {
+        return evidence;
+    };
+    for name in amr {
+        if let Some(method) = auth_wire::assurance::AuthMethod::parse_bytes(name) {
+            evidence = evidence.with(method);
+        }
+    }
+    if amr_contains(json, auth_wire::assurance::AuthMethod::Hwk) {
+        evidence = evidence.key_binding(auth_wire::assurance::KeyBinding::Hardware);
+    } else if amr_contains(json, auth_wire::assurance::AuthMethod::Swk) {
+        evidence = evidence.key_binding(auth_wire::assurance::KeyBinding::Software);
+    }
+    if amr_contains(json, auth_wire::assurance::AuthMethod::User) {
+        evidence = evidence.user_verified(true);
+    }
+    if amr_contains(json, auth_wire::assurance::AuthMethod::Webauthn) {
+        evidence = evidence.phishing_resistant(true);
+    }
+    evidence
+}
+
+/// Whether the credential's `amr` names `method`.
+fn amr_contains(json: &[u8], method: auth_wire::assurance::AuthMethod) -> bool {
+    jose::claim_array(json, b"amr")
+        .is_some_and(|mut names| names.any(|name| name == method.as_str().as_bytes()))
+}
+
+/// The level a policy floor discriminant names.
+///
+/// `None` for a value this build does not know: a floor it cannot interpret
+/// is refused rather than treated as the lowest one, because the caller
+/// asking for it meant something.
+fn level_from_discriminant(value: u8) -> Option<auth_wire::assurance::AssuranceLevel> {
+    match value {
+        0 => Some(auth_wire::assurance::AssuranceLevel::Aal1),
+        1 => Some(auth_wire::assurance::AssuranceLevel::Aal2),
+        2 => Some(auth_wire::assurance::AssuranceLevel::Aal3),
+        _ => None,
+    }
 }
 
 /// Emit a `MSG_VERIFY_RESP`.

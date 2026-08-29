@@ -27,164 +27,190 @@
 pub mod suite_mod;
 pub use suite_mod as suite;
 
+#[path = "assurance.rs"]
+pub mod assurance_mod;
+pub use assurance_mod as assurance;
+
 // ── Message type constants ──────────────────────────────────────────────
+/// Declare the wire's message types, and the table that proves they are
+/// distinct.
+///
+/// Every opcode goes through here. The alternative — a `pub const` written
+/// wherever the module that reads it happened to live — is how two types come
+/// to share a number: a channel fanned to several modules relies on each
+/// taking only its own type, and that holds exactly as long as no two types
+/// collide. One declaration site makes the collision visible to whoever picks
+/// the next number, and `MESSAGE_TYPES` lets a test prove it rather than
+/// trusting the reading.
+macro_rules! message_types {
+    ($( $(#[$meta:meta])* $name:ident = $value:expr; )*) => {
+        $( $(#[$meta])* pub const $name: u8 = $value; )*
 
-// secret_store requests
-pub const MSG_SECRET_GET: u8 = 0x01;
-pub const MSG_SECRET_PUT: u8 = 0x02;
-pub const MSG_SECRET_LIST: u8 = 0x03;
-pub const MSG_SECRET_ROTATE: u8 = 0x04;
+        /// Every message type this wire defines, as `(name, value)`.
+        ///
+        /// Built from the same declarations as the constants, so a type
+        /// cannot be added without appearing here.
+        pub const MESSAGE_TYPES: &[(&str, u8)] = &[ $( (stringify!($name), $name) ),* ];
+    };
+}
 
-// secret_store replies
-pub const MSG_SECRET_VALUE: u8 = 0x11;
-pub const MSG_SECRET_ACK: u8 = 0x12;
-pub const MSG_SECRET_LIST_PAGE: u8 = 0x13;
+message_types! {
 
-// key material / epochs
-/// KEK epoch delivery to `secret_store`: `[epoch: u32 LE][kek: 32B]`.
-pub const MSG_KEY_EPOCH: u8 = 0x21;
+    // secret_store requests
+    MSG_SECRET_GET = 0x01;
+    MSG_SECRET_PUT = 0x02;
+    MSG_SECRET_LIST = 0x03;
+    MSG_SECRET_ROTATE = 0x04;
 
-// ── Keyset lifecycle ────────────────────────────────────────────────────
-//
-// Rotation needs two live keys at once. A latest-wins key delivery cannot
-// express that: the instant a new key arrives every credential signed
-// under the old one stops verifying, there is no way to load a key before
-// making it active, and no way to keep verifying a retired key while its
-// credentials age out.
-//
-// A keyset is indexed by `(issuer, profile_id, kid)` and holds more than
-// one live entry. The verbs below are the whole lifecycle, in the order a
-// rotation uses them: ADD (loaded, not yet signing), ACTIVATE (signs new
-// credentials), RETIRE (still verifies, no longer signs), REMOVE (gone).
+    // secret_store replies
+    MSG_SECRET_VALUE = 0x11;
+    MSG_SECRET_ACK = 0x12;
+    MSG_SECRET_LIST_PAGE = 0x13;
 
-/// Add a key to a keyset without making it active. See [`KeyRecord`].
-///
-/// Loading and activating are separate because they are separate decisions
-/// with a deliberate gap between them: every verifier must hold the key
-/// before anything signs with it, or the first credential minted under it
-/// is unverifiable everywhere that has not caught up.
-pub const MSG_KEY_ADD: u8 = 0x22;
-/// Make an added key the one new credentials are signed under.
-/// Payload: `[issuer f8][profile_id u16 LE][kid f8][generation u32 LE]`.
-pub const MSG_KEY_ACTIVATE: u8 = 0x23;
-/// Stop signing with a key; keep verifying it.
-/// Payload: `[issuer f8][profile_id u16 LE][kid f8][remove_after_unix u64 LE]`.
-///
-/// `remove_after_unix` is the deadline past which a verifier drops the key
-/// — it must outlast the longest credential the key ever signed, or a
-/// credential that is still inside its own validity window stops verifying.
-pub const MSG_KEY_RETIRE: u8 = 0x24;
-/// Drop a key entirely. Payload: `[issuer f8][profile_id u16 LE][kid f8]`.
-///
-/// Immediate and unconditional: this is the revocation path, for a key
-/// believed compromised, where credentials signed under it are supposed to
-/// stop verifying.
-pub const MSG_KEY_REMOVE: u8 = 0x25;
-/// The whole keyset, as one message: `[count u16 LE]` then `count`
-/// [`KeyRecord`] payloads.
-///
-/// How a verifier that just started reaches current state. Without it a
-/// restarting verifier holds nothing until the next rotation, which may be
-/// months away — it would reject every credential in the system and call
-/// it an unknown kid.
-pub const MSG_KEYSET_SNAPSHOT: u8 = 0x26;
+    // key material / epochs
+    /// KEK epoch delivery to `secret_store`: `[epoch: u32 LE][kek: 32B]`.
+    MSG_KEY_EPOCH = 0x21;
 
-// token_mint
-pub const MSG_MINT_REQ: u8 = 0x31;
-pub const MSG_MINT_RESP: u8 = 0x32;
+    // ── Keyset lifecycle ────────────────────────────────────────────────────
+    //
+    // Rotation needs two live keys at once. A latest-wins key delivery cannot
+    // express that: the instant a new key arrives every credential signed
+    // under the old one stops verifying, there is no way to load a key before
+    // making it active, and no way to keep verifying a retired key while its
+    // credentials age out.
+    //
+    // A keyset is indexed by `(issuer, profile_id, kid)` and holds more than
+    // one live entry. The verbs below are the whole lifecycle, in the order a
+    // rotation uses them: ADD (loaded, not yet signing), ACTIVATE (signs new
+    // credentials), RETIRE (still verifies, no longer signs), REMOVE (gone).
 
-// admission
-/// Ask admission whether a presenter may mint, and for whom.
-pub const MSG_ADMIT_REQ: u8 = 0x35;
-/// Admission's typed verdict.
-pub const MSG_ADMIT_RESP: u8 = 0x36;
-/// Ask admission to admit AND mint in one exchange: the /oauth/token slice.
-pub const MSG_GRANT_REQ: u8 = 0x37;
-/// The grant's answer: a token, or a typed refusal.
-pub const MSG_GRANT_RESP: u8 = 0x38;
-/// OIDC /authorize: authenticate a subject and issue an authorization code.
-pub const MSG_AUTHORIZE_REQ: u8 = 0x39;
-/// The authorize answer: a code + the state to echo, or a typed refusal.
-pub const MSG_AUTHORIZE_RESP: u8 = 0x3A;
-/// OIDC token code-exchange: redeem a code for an access + ID token.
-pub const MSG_CODE_EXCHANGE_REQ: u8 = 0x3B;
-/// The exchange answer: an access token + an ID token, or a typed refusal.
-pub const MSG_CODE_EXCHANGE_RESP: u8 = 0x3C;
+    /// Add a key to a keyset without making it active. See [`KeyRecord`].
+    ///
+    /// Loading and activating are separate because they are separate decisions
+    /// with a deliberate gap between them: every verifier must hold the key
+    /// before anything signs with it, or the first credential minted under it
+    /// is unverifiable everywhere that has not caught up.
+    MSG_KEY_ADD = 0x22;
+    /// Make an added key the one new credentials are signed under.
+    /// Payload: `[issuer f8][profile_id u16 LE][kid f8][generation u32 LE]`.
+    MSG_KEY_ACTIVATE = 0x23;
+    /// Stop signing with a key; keep verifying it.
+    /// Payload: `[issuer f8][profile_id u16 LE][kid f8][remove_after_unix u64 LE]`.
+    ///
+    /// `remove_after_unix` is the deadline past which a verifier drops the key
+    /// — it must outlast the longest credential the key ever signed, or a
+    /// credential that is still inside its own validity window stops verifying.
+    MSG_KEY_RETIRE = 0x24;
+    /// Drop a key entirely. Payload: `[issuer f8][profile_id u16 LE][kid f8]`.
+    ///
+    /// Immediate and unconditional: this is the revocation path, for a key
+    /// believed compromised, where credentials signed under it are supposed to
+    /// stop verifying.
+    MSG_KEY_REMOVE = 0x25;
+    /// The whole keyset, as one message: `[count u16 LE]` then `count`
+    /// [`KeyRecord`] payloads.
+    ///
+    /// How a verifier that just started reaches current state. Without it a
+    /// restarting verifier holds nothing until the next rotation, which may be
+    /// months away — it would reject every credential in the system and call
+    /// it an unknown kid.
+    MSG_KEYSET_SNAPSHOT = 0x26;
 
-// token_verify
-/// Verify request: a [`VerifyRequest`] — the credential AND the policy it
-/// must satisfy.
-///
-/// The policy travels with the request because the alternative is the
-/// caller checking it afterwards, which is the arrangement that put an
-/// audience check in five places and got it slightly different in each.
-/// An OPERATOR asks the issuer to authorise one enrolment.
-///
-/// `[corr u32][purpose u8][ttl_seconds u32][audience f16]`
-///
-/// This is what a QR ceremony rests on. Enrolment normally proves control of
-/// a mailbox — a code is mailed and must come back. A device being enrolled
-/// from a QR code proves no such thing, so something else has to carry the
-/// authorisation, and this is it: a single-use, short-lived secret the
-/// ISSUER minted and an operator carried to the device out of band.
-///
-/// **It travels on the control plane, and that is not a widening.** The
-/// control socket already pushes [`MSG_KEY_ADD`] into the mint, so anyone
-/// holding an operator credential can already install a signing key of their
-/// choosing and mint anything the deployment can mint. Permission to
-/// authorise one enrolment is strictly less than that, so siting it here
-/// adds no authority the credential did not already carry — where a separate
-/// listener would have added a second credential and a second trust anchor
-/// to gate something the first already implied.
-pub const MSG_ENROL_AUTH_REQ: u8 = 0x53;
+    // token_mint
+    MSG_MINT_REQ = 0x31;
+    MSG_MINT_RESP = 0x32;
 
-/// The issuer's answer: the transaction and its code, once.
-///
-/// `[corr u32][status u8][auth_id f8][secret f8][expires_at u64]`
-///
-/// `auth_id` is the transaction's NONCE and `secret` is its CODE — the same
-/// two values the mail path produces, delivered to an operator instead of to
-/// a mailbox. That is the whole of the QR ceremony: **one delivery channel
-/// swapped for another, over an unchanged transaction.** A separate
-/// authorisation object was drafted and dropped; it would have been a second
-/// single-use secret guarding a first, and `/redeem` would have had to know
-/// which kind it was looking at.
-///
-/// **The code is returned exactly once and never stored.** What the ledger
-/// holds is `HMAC-SHA256(k, nonce ‖ code)`, as for a mailed code: a read of
-/// the store must not yield a working credential. An operator who loses it
-/// mints another; there is deliberately no way to ask for it again.
-///
-/// A refusal carries an empty `auth_id` and `secret`, so a caller that
-/// ignored `status` has nothing that looks like an authorisation.
-pub const MSG_ENROL_AUTH_RESP: u8 = 0x54;
+    // admission
+    /// Ask admission whether a presenter may mint, and for whom.
+    MSG_ADMIT_REQ = 0x35;
+    /// Admission's typed verdict.
+    MSG_ADMIT_RESP = 0x36;
+    /// Ask admission to admit AND mint in one exchange: the /oauth/token slice.
+    MSG_GRANT_REQ = 0x37;
+    /// The grant's answer: a token, or a typed refusal.
+    MSG_GRANT_RESP = 0x38;
+    /// OIDC /authorize: authenticate a subject and issue an authorization code.
+    MSG_AUTHORIZE_REQ = 0x39;
+    /// The authorize answer: a code + the state to echo, or a typed refusal.
+    MSG_AUTHORIZE_RESP = 0x3A;
+    /// OIDC token code-exchange: redeem a code for an access + ID token.
+    MSG_CODE_EXCHANGE_REQ = 0x3B;
+    /// The exchange answer: an access token + an ID token, or a typed refusal.
+    MSG_CODE_EXCHANGE_RESP = 0x3C;
 
-/// A device id the issuer no longer stands behind.
-///
-/// `[id f8]`. It travels the control plane and reaches `wellknown_endpoint`,
-/// which records it in the ledger and then in the published filter.
-///
-/// Declared here rather than in the module that reads it, so the number is
-/// visible to everything else choosing one. A control channel is fanned to
-/// several modules and each takes only its own type, which holds exactly as
-/// long as no two types share a number.
-pub const MSG_REVOKE: u8 = 0x51;
+    // token_verify
+    /// Verify request: a [`VerifyRequest`] — the credential AND the policy it
+    /// must satisfy.
+    ///
+    /// The policy travels with the request because the alternative is the
+    /// caller checking it afterwards, which is the arrangement that put an
+    /// audience check in five places and got it slightly different in each.
+    /// An OPERATOR asks the issuer to authorise one enrolment.
+    ///
+    /// `[corr u32][purpose u8][ttl_seconds u32][audience f16]`
+    ///
+    /// This is what a QR ceremony rests on. Enrolment normally proves control of
+    /// a mailbox — a code is mailed and must come back. A device being enrolled
+    /// from a QR code proves no such thing, so something else has to carry the
+    /// authorisation, and this is it: a single-use, short-lived secret the
+    /// ISSUER minted and an operator carried to the device out of band.
+    ///
+    /// **It travels on the control plane, and that is not a widening.** The
+    /// control socket already pushes [`MSG_KEY_ADD`] into the mint, so anyone
+    /// holding an operator credential can already install a signing key of their
+    /// choosing and mint anything the deployment can mint. Permission to
+    /// authorise one enrolment is strictly less than that, so siting it here
+    /// adds no authority the credential did not already carry — where a separate
+    /// listener would have added a second credential and a second trust anchor
+    /// to gate something the first already implied.
+    MSG_ENROL_AUTH_REQ = 0x53;
 
-pub const MSG_VERIFY_REQ: u8 = 0x42;
-/// Verify response: a typed [`VerifiedIdentity`], not claims JSON.
-///
-/// It used to hand back the decoded JWS payload so the caller could
-/// authorize on `iss`/`aud`/`scope`. That meant every consumer re-parsed
-/// attacker-controlled JSON to make an authorization decision, and each one
-/// had its own parser, its own idea of a missing claim, and its own
-/// behaviour on a duplicate key. The module verified the token and then
-/// handed the hard part back.
-///
-/// The fields a decision is made on are now extracted once, by the module
-/// that already had to parse them to check the signature, and delivered as
-/// typed values. Application claims outside the reserved set stay opaque —
-/// they travel as bytes and are not authorization inputs.
-pub const MSG_VERIFY_RESP: u8 = 0x43;
+    /// The issuer's answer: the transaction and its code, once.
+    ///
+    /// `[corr u32][status u8][auth_id f8][secret f8][expires_at u64]`
+    ///
+    /// `auth_id` is the transaction's NONCE and `secret` is its CODE — the same
+    /// two values the mail path produces, delivered to an operator instead of to
+    /// a mailbox. That is the whole of the QR ceremony: **one delivery channel
+    /// swapped for another, over one transaction.** An authorisation object of
+    /// its own would be a second single-use secret guarding a first, and
+    /// `/redeem` would have to know which kind it was looking at.
+    ///
+    /// **The code is returned exactly once and never stored.** What the ledger
+    /// holds is `HMAC-SHA256(k, nonce ‖ code)`, as for a mailed code: a read of
+    /// the store must not yield a working credential. An operator who loses it
+    /// mints another; there is deliberately no way to ask for it again.
+    ///
+    /// A refusal carries an empty `auth_id` and `secret`, so a caller that
+    /// ignored `status` has nothing that looks like an authorisation.
+    MSG_ENROL_AUTH_RESP = 0x54;
+
+    /// A device id the issuer no longer stands behind.
+    ///
+    /// `[id f8]`. It travels the control plane and reaches `wellknown_endpoint`,
+    /// which records it in the ledger and then in the published filter.
+    ///
+    /// Declared here rather than in the module that reads it, so the number is
+    /// visible to everything else choosing one. A control channel is fanned to
+    /// several modules and each takes only its own type, which holds exactly as
+    /// long as no two types share a number.
+    MSG_REVOKE = 0x51;
+
+    MSG_VERIFY_REQ = 0x42;
+    /// Verify response: a typed [`VerifiedIdentity`], not claims JSON.
+    ///
+    /// Every field a decision rests on is extracted once, by the module that
+    /// already had to parse them to check the signature, and delivered typed.
+    /// Handing back the decoded payload instead would make every consumer
+    /// re-parse attacker-controlled JSON to reach an authorization decision,
+    /// each with its own parser, its own idea of a missing claim and its own
+    /// behaviour on a duplicate key — the module verifying the token and then
+    /// handing the hard part back.
+    ///
+    /// Application claims outside the reserved set stay opaque: they travel as
+    /// bytes and are not authorization inputs.
+    MSG_VERIFY_RESP = 0x43;
+}
 
 // ── Status codes (replies) ──────────────────────────────────────────────
 
@@ -493,6 +519,18 @@ pub struct AdmitResponse<'a> {
     pub device_id: &'a [u8],
     pub thumbprint_alg: u8,
     pub jkt: &'a [u8],
+    /// What the presenter actually proved, for the `amr`/`acr`/`auth_time`
+    /// claims.
+    ///
+    /// Carried here because admission is where it is established — the
+    /// enrolment facts come from the ledger record and the possession proof
+    /// from the request in front of it, and no later stage sees both. A
+    /// minter that assembled this itself would be a second place deciding
+    /// what a token may claim about how it was obtained.
+    ///
+    /// Fixed-width and opaque on the wire: the meaning of the bits belongs to
+    /// `assurance::Evidence`, so a method added there needs no change here.
+    pub evidence: assurance::EvidenceWire,
 }
 
 impl<'a> AdmitResponse<'a> {
@@ -510,6 +548,10 @@ impl<'a> AdmitResponse<'a> {
         w.field16(self.device_id)?;
         w.u8(self.thumbprint_alg)?;
         w.field8(self.jkt)?;
+        w.u16(self.evidence.methods)?;
+        w.u8(self.evidence.key_binding)?;
+        w.u8(self.evidence.flags)?;
+        w.u64(self.evidence.auth_time)?;
         let n = w.len();
         write_envelope(MSG_ADMIT_RESP, &payload[..n], out)
     }
@@ -522,6 +564,12 @@ impl<'a> AdmitResponse<'a> {
         let device_id = r.field16()?;
         let thumbprint_alg = r.u8()?;
         let jkt = r.field8()?;
+        let evidence = assurance::EvidenceWire {
+            methods: r.u16()?,
+            key_binding: r.u8()?,
+            flags: r.u8()?,
+            auth_time: r.u64()?,
+        };
         // A refusal that carries an identity is rejected rather than
         // trusted-and-ignored: the rule `MintResponse` and
         // `VerifiedIdentity` already enforce on their own wires.
@@ -542,6 +590,7 @@ impl<'a> AdmitResponse<'a> {
             device_id,
             thumbprint_alg,
             jkt,
+            evidence,
         })
     }
 }
@@ -1668,33 +1717,6 @@ impl<'a> KeyRef<'a> {
 
 // ── Verified identity (C2) ──────────────────────────────────────────────
 
-/// Assurance levels: how strongly the subject was authenticated.
-///
-/// Ordered, so a policy can say "at least this" rather than enumerate.
-pub mod assurance {
-    /// Nothing was proved. Never the result of a successful verification;
-    /// present so a policy floor of "any" is expressible.
-    pub const NONE: u8 = 0;
-    /// A single factor — possession of one key.
-    pub const SINGLE_FACTOR: u8 = 1;
-    /// Possession plus a proof bound to this request (DPoP).
-    pub const PROOF_OF_POSSESSION: u8 = 2;
-    /// Two independent factors.
-    pub const MULTI_FACTOR: u8 = 3;
-    /// A hardware-backed authenticator.
-    pub const HARDWARE_BACKED: u8 = 4;
-}
-
-/// Authentication methods, as a bitmask (`amr`, RFC 8176).
-pub mod auth_method {
-    pub const PASSWORD: u16 = 0x0001;
-    pub const OTP: u16 = 0x0002;
-    pub const HARDWARE_KEY: u16 = 0x0004;
-    pub const MAIL_PROOF: u16 = 0x0008;
-    pub const PROOF_OF_POSSESSION: u16 = 0x0010;
-    pub const DEVICE_CERTIFICATE: u16 = 0x0020;
-}
-
 /// How long an enrolment authorisation may live, at most.
 ///
 /// Five minutes: a QR is scanned in front of the person who displayed it, so
@@ -1840,7 +1862,13 @@ pub struct VerifyRequest<'a> {
     /// credential is not presented with a proof.
     pub method: &'a [u8],
     pub uri: &'a [u8],
-    /// Minimum assurance the subject must have been authenticated to.
+    /// Minimum assurance the subject must have been authenticated to, as an
+    /// `assurance::AssuranceLevel` discriminant: 0 `aal1`, 1 `aal2`,
+    /// 2 `aal3`. A floor of `aal1` accepts anything that verified.
+    ///
+    /// The same ladder a relying party's `AssurancePolicy` uses, because a
+    /// floor checked here and a floor checked there must mean the same
+    /// thing or a policy demanding two factors quietly accepts one.
     pub min_assurance: u8,
     /// Seconds since the Unix epoch, and what may be concluded from it.
     /// `time_source_class` and `time_flags` mirror fluxor's
@@ -1948,8 +1976,16 @@ pub struct VerifiedIdentity<'a> {
     /// credential was issued: a re-issue carries a fresh `iat` over an old
     /// authentication, and a policy that wants recency needs the latter.
     pub auth_time: u64,
-    pub assurance: u8,
-    pub auth_methods: u16,
+    /// What the credential says was proved, in the shared vocabulary.
+    ///
+    /// Read from the credential's own `acr`/`amr`/`auth_time` claims rather
+    /// than inferred from its shape: a `cnf` binding says the credential is
+    /// non-bearer, which is one fact among several, and a verifier that
+    /// scored it as a level would report an answer the credential never
+    /// made. One vocabulary — `assurance::Evidence` — so the minter, this
+    /// verifier and a relying party's policy cannot disagree about what a
+    /// level means.
+    pub evidence: assurance::EvidenceWire,
     /// A stable id for this credential (`jti`), for revocation and audit.
     pub credential_id: &'a [u8],
     /// The replay id the proof was recorded under, empty when unbound.
@@ -1979,8 +2015,12 @@ impl<'a> VerifiedIdentity<'a> {
             issued_at: 0,
             expires_at: 0,
             auth_time: 0,
-            assurance: assurance::NONE,
-            auth_methods: 0,
+            evidence: assurance::EvidenceWire {
+                methods: 0,
+                key_binding: 0,
+                flags: 0,
+                auth_time: 0,
+            },
             credential_id: &[],
             replay_id: &[],
             application: &[],
@@ -2004,8 +2044,10 @@ impl<'a> VerifiedIdentity<'a> {
         w.u64(self.issued_at)?;
         w.u64(self.expires_at)?;
         w.u64(self.auth_time)?;
-        w.u8(self.assurance)?;
-        w.u16(self.auth_methods)?;
+        w.u16(self.evidence.methods)?;
+        w.u8(self.evidence.key_binding)?;
+        w.u8(self.evidence.flags)?;
+        w.u64(self.evidence.auth_time)?;
         w.field8(self.credential_id)?;
         w.field8(self.replay_id)?;
         w.field16(self.application)?;
@@ -2030,8 +2072,12 @@ impl<'a> VerifiedIdentity<'a> {
             issued_at: r.u64()?,
             expires_at: r.u64()?,
             auth_time: r.u64()?,
-            assurance: r.u8()?,
-            auth_methods: r.u16()?,
+            evidence: assurance::EvidenceWire {
+                methods: r.u16()?,
+                key_binding: r.u8()?,
+                flags: r.u8()?,
+                auth_time: r.u64()?,
+            },
             credential_id: r.field8()?,
             replay_id: r.field8()?,
             application: r.field16()?,

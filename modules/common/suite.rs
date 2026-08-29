@@ -186,6 +186,39 @@ pub const fn max_signature_len(suite: u16) -> usize {
     }
 }
 
+/// The longest signature this build can be asked to verify.
+///
+/// Sized from the IMPLEMENTED suites rather than from the registry as a
+/// whole: naming ML-DSA-87 does not mean this build carries it, and a 4627
+/// byte buffer on every verification path would be stack nothing uses. A
+/// fragment sizes its decode buffer from this and then checks the decoded
+/// length against [`max_signature_len`] for the suite it was actually told,
+/// so a signature of the wrong length for its own suite is refused rather
+/// than verified against whatever fits.
+///
+/// The assertion below is what keeps the two in step: implementing a suite
+/// whose signature does not fit here fails the build, where a hard-coded
+/// buffer would have truncated one.
+pub const MAX_IMPLEMENTED_SIGNATURE_LEN: usize = 64;
+
+const _: () = {
+    let mut suite = 0u16;
+    while suite <= MAX_ID {
+        if is_implemented(suite) {
+            assert!(
+                max_signature_len(suite) <= MAX_IMPLEMENTED_SIGNATURE_LEN,
+                "an implemented suite signs longer than MAX_IMPLEMENTED_SIGNATURE_LEN; \
+                 raise it with the suite rather than truncating a signature"
+            );
+            assert!(
+                max_signature_len(suite) != 0,
+                "an implemented suite has no signature length in the registry"
+            );
+        }
+        suite += 1;
+    }
+};
+
 /// Thumbprint algorithms for a `cnf.jkt` key binding.
 pub mod thumbprint {
     /// No key binding.
