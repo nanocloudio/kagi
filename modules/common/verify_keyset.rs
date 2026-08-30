@@ -2,18 +2,19 @@
 //!
 //! Five modules verify kagi-issued credentials without being the token
 //! verifier — `resource_gate`, `wellknown_endpoint`, `keypackage_endpoint`,
-//! `e2ee_state_endpoint` and `token_endpoint`. Each held **one** public key,
-//! overwrote it on every delivery, and threw away the `kid` it came with.
+//! `e2ee_state_endpoint` and `token_endpoint`. All five hold the whole
+//! keyset here rather than a single key, and index it by `kid`.
 //!
-//! That made rotation destructive in five places at once. The instant a new
-//! key arrived, every credential signed under the old one stopped verifying
-//! — and because the `kid` was discarded, a credential naming a key the
-//! module had never held was checked against whatever key happened to be
-//! loaded instead of being refused. A `kid` nothing indexes by is
-//! decorative, and a decorative `kid` is worse than none: it reads like a
-//! binding.
+//! Both properties are load-bearing. A module holding one key and
+//! overwriting it on delivery makes rotation destructive: the instant a
+//! replacement arrives, every credential signed under the outgoing key
+//! stops verifying. And a module that discards the `kid` has nothing to
+//! index by, so a credential naming a key it has never held is checked
+//! against whichever key is loaded instead of being refused — a `kid`
+//! nothing indexes by is decorative, and a decorative `kid` is worse than
+//! none, because it reads like a binding.
 //!
-//! Five copies of the same twenty lines is also five places for the
+//! Five copies of the same twenty lines would also be five places for the
 //! ordering to drift, which is why this is a fragment rather than a
 //! pattern.
 
@@ -27,8 +28,9 @@
 // mounted its own copy would load the same file twice in the same crate.
 use super::auth_wire;
 
-/// Longest public key: an uncompressed SEC1 P-256 point.
-pub const MAX_PUBKEY_LEN: usize = 65;
+/// Longest public key a slot holds, from the registry: the widest key
+/// this build can verify under.
+pub const MAX_PUBKEY_LEN: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KEY_LEN;
 pub const MAX_KID_LEN: usize = 64;
 pub const MAX_ISSUER_LEN: usize = 64;
 /// Keys held at once. Matches the mint's keyset: a verifier holding fewer
@@ -50,7 +52,10 @@ pub struct Key {
     pub generation: u32,
     pub remove_after_unix: u64,
     pub pubkey: [u8; MAX_PUBKEY_LEN],
-    pub pubkey_len: u8,
+    /// A `u16`: an ML-DSA-87 key is 2592 bytes, and a `u8` would keep
+    /// only its low byte of length, which reads as a short key rather
+    /// than as an error.
+    pub pubkey_len: u16,
 }
 
 impl Key {
@@ -247,13 +252,7 @@ fn fill(slot: &mut Key, rec: &auth_wire::KeyRecord<'_>) -> bool {
     if !auth_wire::suite::is_implemented(rec.suite) {
         return false;
     }
-    // ES256 accepts a SEC1 point (33 compressed / 65 uncompressed);
-    // Ed25519 wants exactly the 32-byte public key.
-    let ok_len = match rec.suite {
-        auth_wire::suite::ES256 => rec.key_ref.len() == 33 || rec.key_ref.len() == 65,
-        auth_wire::suite::ED25519 => rec.key_ref.len() == 32,
-        _ => false,
-    };
+    let ok_len = auth_wire::suite::public_key_len_ok(rec.suite, rec.key_ref.len());
     if !ok_len
         || rec.key_ref.len() > MAX_PUBKEY_LEN
         || rec.issuer.is_empty()
@@ -275,7 +274,7 @@ fn fill(slot: &mut Key, rec: &auth_wire::KeyRecord<'_>) -> bool {
     {
         slot.issuer_len = rec.issuer.len() as u8;
         slot.kid_len = rec.kid.len() as u8;
-        slot.pubkey_len = rec.key_ref.len() as u8;
+        slot.pubkey_len = rec.key_ref.len() as u16;
     }
     slot.profile_id = rec.profile_id;
     slot.suite = rec.suite;

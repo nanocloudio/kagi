@@ -48,9 +48,18 @@ full wire protocol):
 
 | port | dir | carries |
 |---|---|---|
-| `mint_requests` | in | `MINT_REQ` = `[corr u32][alg u8][iss f8][sub f8][aud f8][scope f8][jkt 43B][ttl u32]` |
-| `key_material` | in | `MINT_KEY` = `[alg u8][kid f8][key 32B]` (ES256 P-256 scalar / Ed25519 seed) |
-| `tokens` | out | `MINT_RESP` = `[corr u32][status u8][token f16]` |
+| `mint_requests` | in | `MSG_MINT_REQ` — a `MintRequest`: correlation, suite, profile, `kid`, TTL, the claims, and an optional `jkt` |
+| `key_material` | in | `MSG_KEY_ADD` — a `KeyRecord`, whose `key_ref` is a **vault label** for a signing key |
+| `tokens` | out | `MSG_MINT_RESP` = `[corr u32][status u8][token f16]` |
+
+`modules/common/auth_wire.rs` is the encoder and the only definition of
+either layout; a consumer builds them through it rather than by hand.
+
+A signing record carries a label and never key material. The private half
+is generated inside the vault on first open, leaves it only as signatures,
+and cannot be supplied or observed on the control plane — so a consumer
+graph feeding `key_material` is asking that a key EXIST under a name, not
+handing one over.
 
 Egress-proxy shape: the pipeline stage that needs an outbound credential
 sends a `MINT_REQ` to `mint_requests`; the deployment's key source (a key
@@ -74,15 +83,18 @@ wiring:
     to:   egress.token_in
 ```
 
-## 4. Signing algorithms
+## 4. Signing suites
 
-Both are deterministic (no runtime entropy):
-- `MINT_ALG_ES256` (1) — P-256 ECDSA (RFC 6979).
-- `MINT_ALG_ED25519` (2) — Ed25519 (RFC 8032).
+The `suite` in a `MintRequest` names what the credential is signed with;
+`modules/common/suite.rs` is the registry, and
+`docs/architecture/issuer.md` lists what this build implements. Every one
+of them is deterministic and needs no runtime entropy: RFC 6979 ECDSA, RFC
+8032 EdDSA, and FIPS 204 ML-DSA in its deterministic variant.
 
-The `alg` in `MINT_REQ` must match the loaded key's algorithm, else the
-module replies `ST_NO_KEY` (the right key may still arrive on
-`key_material`). Tokens are byte-identical to what the issuer graph mints
+The suite must match the loaded key's, else the module replies `ST_NO_KEY`
+(the right key may still arrive on `key_material`). A suite this build
+cannot sign in is refused when the key is loaded rather than at the first
+request. Tokens are byte-identical to what the issuer graph mints
 for the same claims — verify them against the issuer's JWKS, with
 `token_verify`, or with `resource_gate` if the receiving surface wants the
 DPoP binding checked too.

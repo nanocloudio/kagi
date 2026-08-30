@@ -78,6 +78,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+// ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
+// ed25519.rs. Order matters for all four.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -87,8 +92,6 @@ mod b64;
 mod chan;
 #[path = "../../common/device_auth.rs"]
 mod device_auth;
-#[path = "../../common/totp.rs"]
-mod totp;
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/jose.rs"]
@@ -99,6 +102,8 @@ mod jwk;
 mod state_wire;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/totp.rs"]
+mod totp;
 #[path = "../../common/verify_keyset.rs"]
 mod verify_keyset;
 
@@ -135,7 +140,8 @@ fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
 const VERIFIERS: device_auth::Verifiers = device_auth::Verifiers {
     sha256: sha256_into,
     ecdsa_verify,
-    ed25519_verify,
+    ed25519_verify: ed25519_verify_slice,
+    ml_dsa_verify: ml_dsa_verify_suite,
 };
 
 /// The windows a device certificate is admitted under, and the credential
@@ -682,7 +688,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     // Which key signed the credential is the credential's own claim, in its
     // JOSE header. It is looked up, never guessed: an unknown kid is refused
     // rather than checked against whatever key is loaded.
-    let mut pubkey = [0u8; 65];
+    let mut pubkey = [0u8; verify_keyset::MAX_PUBKEY_LEN];
     let mut pubkey_len = 0usize;
     let mut key_suite = 0u16;
     let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
@@ -793,7 +799,10 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
         return;
     };
     entry.replay_key = replay_key;
-    #[expect(clippy::cast_possible_truncation, reason = "base64url of 32 bytes is 43")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "base64url of 32 bytes is 43"
+    )]
     {
         entry.replay_key_len = replay_key_len as u8;
     }

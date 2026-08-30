@@ -95,8 +95,20 @@ const METHOD_GET: u8 = 1;
 /// wave's `wire::method::METHOD_HEAD`.
 const METHOD_HEAD: u8 = 4;
 
-/// SEC1 uncompressed P-256 points are 65 bytes — the widest key stored.
-const MAX_PUBKEY_LEN: usize = 65;
+/// Longest published key, from the registry: the widest key this build
+/// can verify under, since a key it cannot verify is not published.
+const MAX_PUBKEY_LEN: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KEY_LEN;
+
+/// Whether `pubkey` is a well-formed published key for `suite`.
+///
+/// One place, so the streaming path and the snapshot path cannot come to
+/// disagree about what a publishable key looks like. A suite this build
+/// cannot verify is refused here too: publishing a key nothing can check
+/// is publishing a key that will be tried and fail.
+fn publishable_key(suite: u16, pubkey: &[u8]) -> bool {
+    auth_wire::suite::is_implemented(suite)
+        && auth_wire::suite::public_key_len_ok(suite, pubkey.len())
+}
 /// Longest `kid` carried.
 const MAX_KID: usize = 64;
 
@@ -198,7 +210,10 @@ struct PublishedKey {
     kid: [u8; MAX_KID],
     kid_len: u8,
     pubkey: [u8; MAX_PUBKEY_LEN],
-    pubkey_len: u8,
+    /// A `u16`: an ML-DSA-87 key is 2592 bytes, and a `u8` would keep
+    /// only its low byte of length, which reads as a short key rather
+    /// than as an error.
+    pubkey_len: u16,
     /// The credential suite, from `auth_wire::suite`.
     suite: u16,
     live: bool,
@@ -518,11 +533,7 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
         if rec.key_use != auth_wire::key_use::VERIFY {
             continue;
         }
-        let valid = match suite {
-            auth_wire::suite::ES256 => pubkey.len() == 33 || pubkey.len() == 65,
-            auth_wire::suite::ED25519 => pubkey.len() == 32,
-            _ => false,
-        };
+        let valid = publishable_key(suite, pubkey);
         if !valid || kid.is_empty() || kid.len() > MAX_KID || pubkey.len() > MAX_PUBKEY_LEN {
             continue;
         }
@@ -552,7 +563,7 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
         )]
         {
             key.kid_len = kid.len() as u8;
-            key.pubkey_len = pubkey.len() as u8;
+            key.pubkey_len = pubkey.len() as u16;
         }
         key.suite = suite;
         key.live = true;
@@ -565,11 +576,7 @@ fn fill_published(slot: &mut PublishedKey, rec: &auth_wire::KeyRecord<'_>) -> bo
     if rec.key_use != auth_wire::key_use::VERIFY {
         return false;
     }
-    let valid = match rec.suite {
-        auth_wire::suite::ES256 => rec.key_ref.len() == 33 || rec.key_ref.len() == 65,
-        auth_wire::suite::ED25519 => rec.key_ref.len() == 32,
-        _ => false,
-    };
+    let valid = publishable_key(rec.suite, rec.key_ref);
     if !valid || rec.kid.is_empty() || rec.kid.len() > MAX_KID || rec.key_ref.len() > MAX_PUBKEY_LEN
     {
         return false;
@@ -583,7 +590,7 @@ fn fill_published(slot: &mut PublishedKey, rec: &auth_wire::KeyRecord<'_>) -> bo
     )]
     {
         slot.kid_len = rec.kid.len() as u8;
-        slot.pubkey_len = rec.key_ref.len() as u8;
+        slot.pubkey_len = rec.key_ref.len() as u16;
     }
     slot.suite = rec.suite;
     slot.live = true;
@@ -1020,20 +1027,33 @@ fn write_jwks(s: &ModuleState, out: &mut [u8]) -> Option<usize> {
 fn write_key(key: &PublishedKey, out: &mut [u8]) -> Option<usize> {
     let mut record = jwk::JwkRecord::new();
     record.kid = jwk::Field::set(&key.kid[..usize::from(key.kid_len)]).ok()?;
+
+    // `kty` and `alg` come from the registry rather than being spelled out
+    // per arm. A published key naming a different algorithm from the one
+    // the keyset holds is a key every relying party would verify under the
+    // wrong primitive, and two spellings of the same fact is how that
+    // happens. Empty means the suite has no registered JOSE identity, so
+    // there is nothing to publish it as.
+    let kty = auth_wire::suite::jwk_kty(key.suite);
+    let alg = auth_wire::suite::jose_alg(key.suite);
+    if kty.is_empty() || alg.is_empty() {
+        return None;
+    }
+    record.kty = jwk::Field::set(kty).ok()?;
+    record.alg = jwk::Field::set(alg).ok()?;
+
+    // What is left is the key material, which each key type carries
+    // differently.
     let pubkey = &key.pubkey[..usize::from(key.pubkey_len)];
     match key.suite {
         auth_wire::suite::ED25519 => {
-            record.kty = jwk::Field::set(b"OKP").ok()?;
             record.crv = jwk::Field::set(b"Ed25519").ok()?;
-            record.alg = jwk::Field::set(b"EdDSA").ok()?;
             let mut x = [0u8; 64];
             let n = b64::encode(pubkey, &mut x)?;
             record.x = jwk::Field::set(&x[..n]).ok()?;
         }
         auth_wire::suite::ES256 => {
-            record.kty = jwk::Field::set(b"EC").ok()?;
             record.crv = jwk::Field::set(b"P-256").ok()?;
-            record.alg = jwk::Field::set(b"ES256").ok()?;
             // Only the uncompressed SEC1 point carries both coordinates. A
             // compressed one would need the curve arithmetic to recover Y,
             // which is not this module's work — it is refused instead, so a
@@ -1047,6 +1067,14 @@ fn write_key(key: &PublishedKey, out: &mut [u8]) -> Option<usize> {
             record.x = jwk::Field::set(&coord[..n]).ok()?;
             let n = b64::encode(&pubkey[33..65], &mut coord)?;
             record.y = jwk::Field::set(&coord[..n]).ok()?;
+        }
+        auth_wire::suite::ML_DSA_44 | auth_wire::suite::ML_DSA_65 | auth_wire::suite::ML_DSA_87 => {
+            // RFC 9964's `AKP` carries the whole public key in one member.
+            // There is no curve to split coordinates out of and nothing to
+            // recover: the encoded key is published as it stands.
+            let mut encoded = [0u8; jwk::MAX_PUB_FIELD];
+            let n = b64::encode(pubkey, &mut encoded)?;
+            record.pub_key = jwk::PubField::set(&encoded[..n]).ok()?;
         }
         _ => return None,
     }

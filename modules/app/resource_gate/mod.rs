@@ -70,6 +70,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+// ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
+// ed25519.rs. Order matters for all four.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+include!("../../common/sdk_bridge.rs");
 
 /// The assurance ladder, reached through `auth_wire` so this module and the
 /// wire it reads cannot mount two copies of one vocabulary.
@@ -138,7 +143,8 @@ const MAX_SUBJECT: usize = 128;
 const VERIFIERS: device_auth::Verifiers = device_auth::Verifiers {
     sha256: sha256_into,
     ecdsa_verify,
-    ed25519_verify,
+    ed25519_verify: ed25519_verify_slice,
+    ml_dsa_verify: ml_dsa_verify_suite,
 };
 
 /// The windows this gate admits under. A resource server's access token
@@ -387,9 +393,9 @@ unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
         let payload = &buf[..plen as usize];
         // The whole key lifecycle, not a single overwriting delivery. See
-        // `verify_keyset.rs`: the predecessor kept one key and discarded
-        // the kid, so a rotation invalidated every live credential and an
-        // unknown kid was checked against whatever key had arrived last.
+        // `verify_keyset.rs`: a keyset holding one key and discarding the
+        // kid makes every rotation invalidate every live credential, and
+        // leaves an unknown kid checked against whatever arrived last.
         s.keyset.apply(msg_type, payload);
     }
 }
@@ -470,11 +476,11 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<
     // A credential's validity window is a statement about a date, so it
     // needs a clock worth believing. Without one this refuses.
     //
-    // It used to be `dev_unix_millis(sys) / 1000`, which returns 0 on a
-    // platform with no RTC — and 0 is a NUMBER, so it flowed into the
-    // window comparison and the comparison answered. Every `exp` is greater
-    // than 0, so a missing clock read as "not yet expired" and admitted
-    // every expired credential.
+    // Reading the raw clock is not enough: `dev_unix_millis` returns 0 on
+    // a platform with no RTC, and 0 is a NUMBER, so it flows into the
+    // window comparison and the comparison answers. Every `exp` exceeds 0,
+    // so a missing clock would read as "not yet expired" and admit every
+    // expired credential. `time_policy` returns absence as absence.
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
         return Err(Refusal::Proof);

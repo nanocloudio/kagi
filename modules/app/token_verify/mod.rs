@@ -1,11 +1,12 @@
-//! Token Verify — ES256 / EdDSA JWS access-token verification.
+//! Token Verify — JWS access-token verification in every implemented
+//! credential suite.
 //!
 //! The on-target counterpart to `token_mint`: consumes MSG_VERIFY_REQ on
-//! `verify_requests` and replies MSG_VERIFY_RESP on `results`. The
-//! verifying key arrives on `verify_key` as MSG_KEY_ADD
-//! (`[alg u8][kid_len u8][kid][pubkey_len u8][pubkey]` — the SEC1 public
-//! point for ES256, the 32-byte RFC 8032 public key for Ed25519); until
-//! one lands every request replies ST_NO_KEY. Tokens are split with the
+//! `verify_requests` and replies MSG_VERIFY_RESP on `results`. Verifying
+//! keys arrive on `verify_key` as `MSG_KEY_ADD` records, whose `key_ref`
+//! is the public key itself — a SEC1 point for ES256, the RFC 8032 public
+//! key for Ed25519, the FIPS 204 encoding for ML-DSA; until one lands
+//! every request replies ST_NO_KEY. Tokens are split with the
 //! shared `jose` fragment and checked with the SDK's deterministic
 //! verifiers, so no runtime entropy is needed. A valid signature is then
 //! range-checked against its `iat`/`exp` claims (60s skew) before ST_OK.
@@ -39,6 +40,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+// ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
+// ed25519.rs. Order matters for all four.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -53,8 +59,9 @@ mod time_policy;
 
 use auth_wire::{PayloadReader, PayloadWriter};
 
-/// SEC1 uncompressed P-256 points are 65 bytes — the widest key we store.
-const MAX_PUBKEY_LEN: usize = 65;
+/// Longest verification key held, from the registry: the widest key this
+/// build can verify under.
+const MAX_PUBKEY_LEN: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KEY_LEN;
 /// Clock skew (seconds) tolerated on `iat` when range-checking claims.
 const CLOCK_SKEW_SECS: u64 = 60;
 /// Max decoded-claims payload returned on `ST_OK`. Bounds the `results`
@@ -86,7 +93,10 @@ struct VerifyKey {
     generation: u32,
     remove_after_unix: u64,
     pubkey: [u8; MAX_PUBKEY_LEN],
-    pubkey_len: u8,
+    /// A `u16`: an ML-DSA-87 key is 2592 bytes, and a `u8` would keep
+    /// only its low byte of length, which reads as a short key rather
+    /// than as an error.
+    pubkey_len: u16,
 }
 
 impl VerifyKey {
@@ -143,7 +153,7 @@ fn fill_key(slot: &mut VerifyKey, rec: &auth_wire::KeyRecord<'_>) -> bool {
     {
         slot.issuer_len = rec.issuer.len() as u8;
         slot.kid_len = rec.kid.len() as u8;
-        slot.pubkey_len = rec.key_ref.len() as u8;
+        slot.pubkey_len = rec.key_ref.len() as u16;
     }
     slot.profile_id = rec.profile_id;
     slot.suite = rec.suite;
@@ -166,10 +176,9 @@ struct ModuleState {
     /// More than one key, which is what makes rotation possible: a token
     /// signed under a retired key keeps verifying until that key's removal
     /// deadline, so credentials already in flight are not invalidated the
-    /// moment a new key is activated. The predecessor held exactly one
-    /// public key and overwrote it, and discarded the `kid` it was
-    /// delivered with — so nothing could be indexed and every token was
-    /// checked against whichever key happened to have arrived last.
+    /// moment a new key is activated. Holding a single key means discarding
+    /// the `kid` it arrived with, which leaves nothing to index by and every
+    /// token checked against whichever key arrived last.
     keys: [VerifyKey; MAX_KEYS],
 
     // Metrics (names mirror manifest [observability])
@@ -274,8 +283,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Drain `verify_key`, keeping the key lifecycle into the keyset
-/// (`[alg u8][kid_len u8][kid][pubkey_len u8][pubkey]`).
+/// Drain `verify_key`, keeping the key lifecycle into the keyset.
 ///
 /// # Safety
 ///
@@ -443,10 +451,6 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     };
 
-    // Raw 64-byte JWS signature (r||s for ES256, R||S for EdDSA).
-    let mut sig = [0u8; 64];
-    let sig_ok = b64::decode(jws.signature_b64, &mut sig) == Some(64);
-
     // Which key signed this is the token's own claim, in its header. It is
     // looked up, never guessed: an unknown kid fails closed rather than
     // falling through to whatever key is loaded.
@@ -478,18 +482,33 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     }
 
+    // Decoded only once the SUITE is known, and checked against the length
+    // that suite signs in: how many bytes a signature has is a fact about
+    // the algorithm, so it cannot be decided before the algorithm is.
+    let mut sig_buf = [0u8; auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    let expected_sig = auth_wire::suite::max_signature_len(suite);
+    let sig_ok = expected_sig != 0
+        && expected_sig <= sig_buf.len()
+        && b64::decode(jws.signature_b64, &mut sig_buf) == Some(expected_sig);
+    // Empty unless the decode succeeded, so a refusal below can never be
+    // reading bytes the signature did not supply.
+    let sig = &sig_buf[..if sig_ok { expected_sig } else { 0 }];
+
     let pubkey_bytes = s.keys[slot].pubkey;
     let pubkey = &pubkey_bytes[..usize::from(s.keys[slot].pubkey_len)];
     let verified = sig_ok
+        && auth_wire::suite::public_key_len_ok(suite, pubkey.len())
         && match suite {
             auth_wire::suite::ES256 => {
                 let hash = sha256(jws.signing_input);
-                ecdsa_verify(pubkey, &hash, &sig)
+                ecdsa_verify(pubkey, &hash, sig)
             }
-            auth_wire::suite::ED25519 => match pubkey.try_into() {
-                Ok(pk32) => ed25519_verify(pk32, jws.signing_input, &sig),
-                Err(_) => false,
-            },
+            auth_wire::suite::ED25519 => ed25519_verify_slice(pubkey, jws.signing_input, sig),
+            auth_wire::suite::ML_DSA_44
+            | auth_wire::suite::ML_DSA_65
+            | auth_wire::suite::ML_DSA_87 => {
+                ml_dsa_verify_suite(suite, pubkey, jws.signing_input, sig)
+            }
             _ => false,
         };
     if !verified {

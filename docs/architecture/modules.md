@@ -221,29 +221,38 @@ the declared host capability surface.
 
 ## token_mint
 
-Stateless ES256 / EdDSA JWS minting, WCET-bounded at four signs per step.
-Token assembly is the `jose.rs` fragment — the same fragment every other
-minting path mounts, which is what makes their output identical. Both
-signature schemes are deterministic (RFC 6979 ECDSA, RFC 8032 EdDSA), so no
-runtime entropy is needed.
+Stateless JWS minting, WCET-bounded at four signs per step. The bound is a
+count rather than a duration, and what a sign costs depends on the suite:
+an ML-DSA-87 signature is orders of magnitude more work than an ES256 one,
+so a deployment choosing a post-quantum issuer key is choosing a longer
+step.
 
-Signing goes through the fluxor `key_vault` capability surface. A `KeyRecord`
-names a label; the private half is generated inside the vault on first open
-and leaves it only as signatures. The public half is announced back out on
-`key_announce`, which is how verifiers come to hold it. With no vault
-registered the module signs in-module through the SDK's deterministic
-implementations; the software vault backend is the same deterministic core,
-so vault-backed and fallback tokens are byte-identical, while a device HSM
-produces its own valid ECDSA signatures.
+Token assembly is the `jose.rs` fragment — the same fragment every other
+minting path mounts, which is what makes their output identical. Every
+signature scheme here is deterministic (RFC 6979 ECDSA, RFC 8032 EdDSA,
+FIPS 204 ML-DSA in its deterministic variant), so no runtime entropy is
+needed.
+
+Signing goes through the fluxor `key_vault` capability surface, and that is
+the only signing path: a `KeyRecord` names a label, the private half is
+generated inside the vault on first open, and it leaves only as signatures.
+The public half is announced back out on `key_announce`, which is how
+verifiers come to hold it. The module refuses to construct without a
+backend, so there is no in-module key to fall back to and no second place
+for one to be. The software backend is deterministic, so its tokens are
+byte-identical to what an independent implementation produces for the same
+claims; a device HSM may use random-k and produce its own valid ECDSA
+signatures.
 
 ## token_verify
 
-The on-target counterpart: stateless JWS verification for ES256 and EdDSA,
-WCET-bounded at four verifies per step, `bcm2712` only. The verifying keys
-arrive as the same keyset lifecycle. A `VERIFY_REQ` splits the compact JWS
-with `jose.rs`, recomputes the signature with the SDK's `ecdsa_verify` /
-`ed25519_verify`, and only then range-checks `iat`/`exp` against a 60-second
-skew. The reply is a typed identity, so the caller authorises on fields it
+The on-target counterpart: stateless JWS verification in every implemented
+credential suite, WCET-bounded at four verifies per step, `bcm2712` only.
+The verifying keys arrive as the same keyset lifecycle. A `VERIFY_REQ`
+splits the compact JWS with `jose.rs`, checks the signature with the SDK
+primitive the key's own suite names — `ecdsa_verify`, `ed25519_verify` or
+`ml_dsa_verify` — and only then range-checks `iat`/`exp` against a
+60-second skew. The reply is a typed identity, so the caller authorises on fields it
 did not have to parse.
 
 ## Embedding elsewhere

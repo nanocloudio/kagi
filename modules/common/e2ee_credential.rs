@@ -236,14 +236,13 @@ pub fn check_credential<'a>(
         return Err(CredentialError::UnknownAlgorithm);
     }
 
-    // The buffer is sized from the registry and the signature is then
-    // checked against the length THIS suite produces. A fixed `64` would be
-    // right for the two suites implemented today and wrong for every one
-    // after them, and would accept a 64-byte signature offered under a suite
-    // that does not sign in 64 bytes.
+    // Wide enough for every implemented suite, because the signer is the
+    // ISSUER, whose key is whatever the keyset holds. The decoded length
+    // is checked against what THIS suite produces, so a signature that
+    // merely fits the buffer is not mistaken for one of the right shape.
     let expected = suite::max_signature_len(issuer_suite);
     let mut signature = [0u8; suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
-    if b64::decode(jws.signature_b64, &mut signature) != Some(expected) {
+    if expected == 0 || b64::decode(jws.signature_b64, &mut signature) != Some(expected) {
         return Err(CredentialError::Segment);
     }
     if !verify(

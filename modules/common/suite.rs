@@ -1,13 +1,14 @@
 //! Kagi's credential-suite registry.
 //!
 //! A suite id is the one number the kagi surface carries to say what
-//! cryptography a credential uses. It replaced `alg: u8`, which was two
-//! values wide and mixed a signature algorithm with everything a decision
-//! actually needs to know about one.
+//! cryptography a credential uses. A bare JOSE `alg` will not do: it names
+//! a signature algorithm and says nothing about the sizes, key type and
+//! policy a decision about that credential actually needs.
 //!
-//! Everything sized here was a literal somewhere: `64` for a signature,
-//! `65` for a point, `43` for a base64url SHA-256 thumbprint, `32` for a
-//! private scalar. Those are true for P-256 and wrong for everything else,
+//! Every size here is otherwise a literal at each call site: `64` for a
+//! signature, `65` for a point, `43` for a base64url SHA-256 thumbprint,
+//! `32` for a private scalar. Those are true for P-256 and wrong for
+//! everything else,
 //! and an ML-DSA-65 signature is 3309 bytes against ES256's 64. A module
 //! that sizes a buffer from `suite::max_signature_len` keeps working when a
 //! suite is added; one that writes `64` does not.
@@ -55,15 +56,54 @@ pub const MAX_ID: u16 = HYBRID_ES256_ML_DSA_44;
 
 /// Whether this build can sign and verify in `suite`.
 ///
-/// ES256 and Ed25519 — the two the fluxor SDK gives kagi primitives for.
-/// The rest are named so sizes, policies and error reporting are already
-/// suite-shaped; they are refused everywhere a credential is signed or
-/// checked, so a deployment learns at configuration rather than at its
-/// first signature.
+/// ES256, Ed25519 and the three ML-DSA parameter sets — the ones the
+/// fluxor SDK gives kagi primitives for. ES384 and the hybrid are named
+/// so sizes, policies and error reporting are already suite-shaped; they
+/// are refused everywhere a credential is signed or checked, so a
+/// deployment learns at configuration rather than at its first signature.
 #[must_use]
 pub const fn is_implemented(suite: u16) -> bool {
-    matches!(suite, ES256 | ED25519)
+    matches!(suite, ES256 | ED25519 | ML_DSA_44 | ML_DSA_65 | ML_DSA_87)
 }
+
+/// This suite's bit in a suite mask. [`NONE`] and any id past [`MAX_ID`]
+/// have no bit, so neither can ever be permitted.
+///
+/// A `u32` holds the registry with room to spare; the assertion is what
+/// turns growing past it into a build failure rather than a shift that
+/// wraps a new suite onto an existing one's bit.
+const _: () = assert!(
+    (MAX_ID as u32) < u32::BITS,
+    "the suite registry has outgrown a u32 mask"
+);
+
+#[must_use]
+pub const fn mask(suite: u16) -> u32 {
+    if suite == NONE || suite > MAX_ID {
+        0
+    } else {
+        1u32 << suite
+    }
+}
+
+/// Every suite this build can sign and verify, as a mask.
+///
+/// Derived from [`is_implemented`] rather than listed beside it, because
+/// two lists of the same thing drift and the direction they drift in is
+/// unpredictable: a suite verifiable but not permitted refuses live
+/// credentials, and one permitted but not verifiable admits them to a
+/// verifier that has no primitive.
+pub const IMPLEMENTED: u32 = {
+    let mut allowed = 0u32;
+    let mut suite = 1u16;
+    while suite <= MAX_ID {
+        if is_implemented(suite) {
+            allowed |= mask(suite);
+        }
+        suite += 1;
+    }
+    allowed
+};
 
 /// Whether `suite` requires two signatures that must both verify.
 ///
@@ -118,7 +158,15 @@ pub const fn jose_alg(suite: u16) -> &'static [u8] {
         ES256 => b"ES256",
         ED25519 => b"EdDSA",
         ES384 => b"ES384",
-        // FIPS 204 algorithms have no registered JOSE name yet.
+        // RFC 9964 registers the FIPS 204 parameter sets under their own
+        // names; the `alg` is the parameter set, not a family name, which
+        // is why there is no ML-DSA equivalent of `EdDSA`'s ambiguity.
+        ML_DSA_44 => b"ML-DSA-44",
+        ML_DSA_65 => b"ML-DSA-65",
+        ML_DSA_87 => b"ML-DSA-87",
+        // The hybrid has no name to carry: a composite ML-DSA/ECDSA `alg`
+        // is an Internet-Draft (`draft-ietf-jose-pq-composite-sigs`) and
+        // not a registration.
         _ => b"",
     }
 }
@@ -132,8 +180,32 @@ pub fn from_jose_alg(alg: &[u8]) -> u16 {
         ED25519
     } else if alg == b"ES384" {
         ES384
+    } else if alg == b"ML-DSA-44" {
+        ML_DSA_44
+    } else if alg == b"ML-DSA-65" {
+        ML_DSA_65
+    } else if alg == b"ML-DSA-87" {
+        ML_DSA_87
     } else {
         NONE
+    }
+}
+
+/// The JWK `kty` a public key in `suite` is published under, or an empty
+/// slice for a suite with no registered key type.
+///
+/// `kty` is what a relying party dispatches on, and the three key types
+/// carry their algorithm in three different places: `EC` names a curve in
+/// `crv`, `OKP` names one there too, and RFC 9964's `AKP` names a
+/// parameter set in `alg`. Which member is authoritative follows from
+/// this, so it is answered here once rather than at each emitter.
+#[must_use]
+pub const fn jwk_kty(suite: u16) -> &'static [u8] {
+    match suite {
+        ES256 | ES384 => b"EC",
+        ED25519 => b"OKP",
+        ML_DSA_44 | ML_DSA_65 | ML_DSA_87 => b"AKP",
+        _ => b"",
     }
 }
 
@@ -167,6 +239,50 @@ pub const fn max_public_key_len(suite: u16) -> usize {
     }
 }
 
+/// Whether `len` is a valid encoded public-key length for `suite`.
+///
+/// Not simply `== max_public_key_len`: ES256 keys travel as SEC1 points
+/// in either form, and a 33-byte compressed point is the same key as its
+/// 65-byte uncompressed spelling. Every other suite has exactly one
+/// encoded length, and a key of any other length is not that suite's key.
+///
+/// One definition, because a keyset that admits a key shape the verifier
+/// then refuses is a key that is present and unusable — which looks like
+/// a configured issuer right up until someone presents a credential.
+///
+/// A suite the registry does not know has no length, so the explicit
+/// zero check is what stops an empty key matching it.
+#[must_use]
+pub const fn public_key_len_ok(suite: u16, len: usize) -> bool {
+    match suite {
+        ES256 => len == 33 || len == 65,
+        _ => len != 0 && len == max_public_key_len(suite),
+    }
+}
+
+/// The longest public key this build can be asked to verify under, over
+/// every implemented suite.
+///
+/// The bound a keyset slot, a published-key record, an exported issuer
+/// key and a JWK member are all sized from. Derived here so they cannot
+/// come to disagree, and so implementing a suite widens every one of them
+/// at once: a SEC1 P-256 point is 65 bytes and an ML-DSA-87 key is 2592,
+/// and a slot sized for the first cannot hold the second.
+pub const MAX_IMPLEMENTED_PUBLIC_KEY_LEN: usize = {
+    let mut longest = 0usize;
+    let mut suite = 1u16;
+    while suite <= MAX_ID {
+        if is_implemented(suite) {
+            let len = max_public_key_len(suite);
+            if len > longest {
+                longest = len;
+            }
+        }
+        suite += 1;
+    }
+    longest
+};
+
 /// Longest signature, in bytes.
 ///
 /// JOSE-encoded, so ECDSA is raw `r‖s` rather than the DER form an X.509
@@ -186,33 +302,59 @@ pub const fn max_signature_len(suite: u16) -> usize {
     }
 }
 
-/// The longest signature this build can be asked to verify.
+/// The longest signature among the implemented suites named in `allowed`.
 ///
-/// Sized from the IMPLEMENTED suites rather than from the registry as a
-/// whole: naming ML-DSA-87 does not mean this build carries it, and a 4627
-/// byte buffer on every verification path would be stack nothing uses. A
-/// fragment sizes its decode buffer from this and then checks the decoded
-/// length against [`max_signature_len`] for the suite it was actually told,
-/// so a signature of the wrong length for its own suite is refused rather
-/// than verified against whatever fits.
+/// A verification path sizes its decode buffer from the suites IT can be
+/// offered, not from the widest the build names. With ML-DSA-87 among
+/// them the two differ by 4.5 KB per path, so a call site that can only
+/// ever see a device's classical proof reserves 64 bytes while one that
+/// verifies whatever the issuer keyset holds passes [`IMPLEMENTED`].
 ///
-/// The assertion below is what keeps the two in step: implementing a suite
-/// whose signature does not fit here fails the build, where a hard-coded
-/// buffer would have truncated one.
-pub const MAX_IMPLEMENTED_SIGNATURE_LEN: usize = 64;
+/// Suites in `allowed` that this build cannot verify contribute nothing:
+/// naming ML-DSA-87 in a policy does not make a buffer hold one if the
+/// primitive is absent.
+#[must_use]
+pub const fn max_signature_len_over(allowed: u32) -> usize {
+    let mut longest = 0usize;
+    let mut suite = 1u16;
+    while suite <= MAX_ID {
+        if is_implemented(suite) && allowed & mask(suite) != 0 {
+            let len = max_signature_len(suite);
+            if len > longest {
+                longest = len;
+            }
+        }
+        suite += 1;
+    }
+    longest
+}
+
+/// The longest signature this build can be asked to verify, over every
+/// implemented suite.
+///
+/// Derived rather than written down, so implementing a suite widens the
+/// buffer that decodes it instead of truncating one. A fragment checks
+/// the DECODED length against [`max_signature_len`] for the suite it was
+/// actually told, so a signature that merely fits is not mistaken for one
+/// of the right shape.
+pub const MAX_IMPLEMENTED_SIGNATURE_LEN: usize = max_signature_len_over(IMPLEMENTED);
 
 const _: () = {
     let mut suite = 0u16;
     while suite <= MAX_ID {
         if is_implemented(suite) {
             assert!(
-                max_signature_len(suite) <= MAX_IMPLEMENTED_SIGNATURE_LEN,
-                "an implemented suite signs longer than MAX_IMPLEMENTED_SIGNATURE_LEN; \
-                 raise it with the suite rather than truncating a signature"
-            );
-            assert!(
                 max_signature_len(suite) != 0,
                 "an implemented suite has no signature length in the registry"
+            );
+            assert!(
+                max_public_key_len(suite) != 0,
+                "an implemented suite has no public key length in the registry"
+            );
+            assert!(
+                !jose_alg(suite).is_empty(),
+                "an implemented suite has no JOSE name; a credential cannot \
+                 say what signed it"
             );
         }
         suite += 1;

@@ -52,16 +52,34 @@ pub use crate::jwk::Sha256Fn;
 /// Verify an ECDSA P-256 signature over a digest, given a SEC1 public point.
 /// Slices rather than fixed arrays, matching the SDK verifier's own shape.
 pub type EcdsaVerifyFn = fn(&[u8], &[u8], &[u8]) -> bool;
-/// Verify an Ed25519 signature over a message, given a 32-byte public key.
-pub type Ed25519VerifyFn = fn(&[u8; 32], &[u8], &[u8; 64]) -> bool;
+/// Verify an Ed25519 signature over a message, given a public key.
+///
+/// Slices rather than the fixed `&[u8; 32]` / `&[u8; 64]` the algorithm's
+/// own sizes would justify: the CALLER decodes a signature whose length
+/// depends on a suite it learns at runtime, so a fixed array in the type
+/// forces a narrowing step that only ever succeeds for the suites that
+/// happen to be 64 bytes. The length is checked against the registry
+/// before the call instead, which is a check that keeps working when the
+/// suite is one that is not.
+pub type Ed25519VerifyFn = fn(&[u8], &[u8], &[u8]) -> bool;
+/// Verify an ML-DSA signature over a message, given the suite id, the
+/// encoded public key and the signature.
+///
+/// The suite is a parameter because ML-DSA-44, -65 and -87 are three
+/// algorithms with three key sizes, and the implementation on the other
+/// side of this pointer owns the several kilobytes of scratch a lattice
+/// verification needs — which is why the workspace does not appear here.
+pub type MlDsaVerifyFn = fn(u16, &[u8], &[u8], &[u8]) -> bool;
 
 /// The primitives this fragment is given rather than links. On target these
-/// are the SDK's; on the host they are `p256` / `ed25519-dalek` / `sha2`.
+/// are the SDK's; on the host they are `p256` / `ed25519-dalek` / `sha2` /
+/// the SDK's ML-DSA.
 #[derive(Clone, Copy)]
 pub struct Verifiers {
     pub sha256: Sha256Fn,
     pub ecdsa_verify: EcdsaVerifyFn,
     pub ed25519_verify: Ed25519VerifyFn,
+    pub ml_dsa_verify: MlDsaVerifyFn,
 }
 
 /// Credential suites this fragment can verify under.
@@ -69,18 +87,27 @@ pub struct Verifiers {
 /// Re-exported from the registry rather than restated. Two constants worth
 /// of duplication is how a suite id comes to mean one thing here and another
 /// where it was defined, and the registry is also where the sizes live.
-pub use crate::auth_wire::suite::{ED25519 as SUITE_ED25519, ES256 as SUITE_ES256};
+pub use crate::auth_wire::suite::{
+    ED25519 as SUITE_ED25519, ES256 as SUITE_ES256, ML_DSA_44 as SUITE_ML_DSA_44,
+    ML_DSA_65 as SUITE_ML_DSA_65, ML_DSA_87 as SUITE_ML_DSA_87,
+};
 
 /// DPoP proof-key types, from the proof header's own JWK `kty`.
 pub const ALG_ES256: u8 = 1;
 pub const ALG_ED25519: u8 = 2;
 
+/// The suites a device-presented proof key can be in.
+///
+/// Narrower than the issuer's, and the difference is what the proof path
+/// sizes its signature buffer from: a device proof is 64 bytes where an
+/// issuer credential may be an ML-DSA-87 signature seventy times that.
+const PROOF_SUITES: u32 = suite::mask(SUITE_ES256) | suite::mask(SUITE_ED25519);
+
 /// The issuer key a credential is verified under.
 pub struct IssuerKey<'a> {
-    /// The credential suite, from `auth_wire::suite`. Not a JOSE `alg`
-    /// string and not the old two-value `ALG_*` pair: the suite is what
-    /// the key was delivered under, and it is the only thing that decides
-    /// how a signature over it is checked.
+    /// The credential suite, from `auth_wire::suite` — not a JOSE `alg`
+    /// string. The suite is what the key was delivered under, and it is
+    /// the only thing that decides how a signature over it is checked.
     pub suite: u16,
     pub public: &'a [u8],
 }
@@ -272,62 +299,73 @@ pub fn credential_kid(credential: &[u8], out: &mut [u8]) -> Option<usize> {
 /// The algorithm comes from the key we already trust, never from the JWS
 /// header — the header is written by whoever made the token.
 fn verify_under_issuer(v: &Verifiers, key: &IssuerKey<'_>, jws: &jose::Jws<'_>) -> bool {
-    // Sized from the registry, then checked against the length THIS suite
-    // signs in. A fixed length would be right for the two suites carried
-    // today and would accept a signature of that length offered under any
-    // suite added later.
-    let Some((sig, len)) = decode_signature(jws.signature_b64, key.suite) else {
+    // Wide enough for every implemented suite: an issuer key is whatever
+    // the keyset holds, so this is the one path that must be able to see
+    // an ML-DSA-87 signature. The decoded length is then checked against
+    // what THIS suite signs in, so a signature that merely fits the
+    // buffer is not mistaken for one of the right shape.
+    let mut buf = [0u8; suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    let Some(sig) = decode_signature(jws.signature_b64, key.suite, &mut buf) else {
         return false;
     };
-    let Some(sig) = as_fixed_64(&sig, len) else {
+    verify_signature(v, key.suite, key.public, jws.signing_input, sig)
+}
+
+/// Check `signature` over `message` under a public key in `suite`.
+///
+/// One place, so the issuer path and the proof path cannot come to
+/// disagree about which primitive a suite means. A suite with no arm is
+/// refused rather than defaulted: an unrecognised suite that fell through
+/// to a verifier would be checking bytes under the wrong algorithm.
+fn verify_signature(
+    v: &Verifiers,
+    suite_id: u16,
+    public: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    if !suite::public_key_len_ok(suite_id, public.len()) {
         return false;
-    };
-    match key.suite {
+    }
+    match suite_id {
         SUITE_ES256 => {
             let mut hash = [0u8; 32];
-            (v.sha256)(jws.signing_input, &mut hash);
-            (v.ecdsa_verify)(key.public, &hash, sig)
+            (v.sha256)(message, &mut hash);
+            (v.ecdsa_verify)(public, &hash, signature)
         }
-        SUITE_ED25519 => match key.public.try_into() {
-            Ok(pk32) => (v.ed25519_verify)(pk32, jws.signing_input, sig),
-            Err(_) => false,
-        },
+        SUITE_ED25519 => (v.ed25519_verify)(public, message, signature),
+        SUITE_ML_DSA_44 | SUITE_ML_DSA_65 | SUITE_ML_DSA_87 => {
+            (v.ml_dsa_verify)(suite_id, public, message, signature)
+        }
         _ => false,
     }
 }
 
-/// Decode a base64url signature and check it is the length `suite` signs in.
+/// Decode a base64url signature into `buf` and check it is the length
+/// `suite` signs in.
 ///
-/// The buffer is the build's widest implemented signature; the check is
-/// against the length THIS suite produces, so a signature that merely fits
-/// is not mistaken for one of the right shape.
+/// The buffer belongs to the CALLER, sized from the suites that call site
+/// can be offered — the only place that decision can be made, since the
+/// fragment does not know which suites a given caller's keys are in.
 ///
-/// Returns the buffer and that length. The algorithm verifiers take a fixed
-/// array because their algorithms have a fixed size — an Ed25519 signature
-/// IS 64 bytes — so the caller narrows to the exact length rather than this
-/// pretending every suite is the same width.
-fn decode_signature(
+/// The check is against the length THIS suite produces, so a signature
+/// that merely fits is not mistaken for one of the right shape.
+fn decode_signature<'a>(
     signature_b64: &[u8],
     suite_id: u16,
-) -> Option<([u8; suite::MAX_IMPLEMENTED_SIGNATURE_LEN], usize)> {
+    buf: &'a mut [u8],
+) -> Option<&'a [u8]> {
     if !suite::is_implemented(suite_id) {
         return None;
     }
     let expected = suite::max_signature_len(suite_id);
-    let mut sig = [0u8; suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
-    if b64::decode(signature_b64, &mut sig) != Some(expected) {
+    if expected == 0 || expected > buf.len() {
         return None;
     }
-    Some((sig, expected))
-}
-
-/// Narrow a decoded signature to the 64-byte array an Ed25519 or raw-ECDSA
-/// verifier takes.
-///
-/// `None` when the suite does not sign in 64 bytes, which is a suite this
-/// pair of verifiers cannot serve however well its signature decoded.
-fn as_fixed_64(sig: &[u8; suite::MAX_IMPLEMENTED_SIGNATURE_LEN], len: usize) -> Option<&[u8; 64]> {
-    sig.get(..len)?.try_into().ok()
+    if b64::decode(signature_b64, buf) != Some(expected) {
+        return None;
+    }
+    Some(&buf[..expected])
 }
 
 /// Verify a DPoP proof under the public key its own header carries.
@@ -342,15 +380,21 @@ fn verify_under_header_jwk(v: &Verifiers, header_json: &[u8], jws: &jose::Jws<'_
     // The key type picks the suite, and the suite gives the length — so the
     // proof's own `alg` never reaches this, and a signature of the wrong
     // length for the key it names is refused before any curve sees it.
+    //
+    // `AKP`, RFC 9964's post-quantum key type, is not accepted here. A
+    // DPoP key is the DEVICE's, and an AKP thumbprint is taken over
+    // `alg`/`kty`/`pub` where an `EC` or `OKP` one is taken over
+    // `crv`/`kty`/`x` — so admitting one would change the `cnf.jkt` that
+    // every binding already issued was computed against. The ISSUER's
+    // keys reach ML-DSA through `verify_under_issuer`, where no
+    // thumbprint is involved.
     let suite_id = match kty {
         b"OKP" => SUITE_ED25519,
         b"EC" => SUITE_ES256,
         _ => return false,
     };
-    let Some((sig, len)) = decode_signature(jws.signature_b64, suite_id) else {
-        return false;
-    };
-    let Some(sig) = as_fixed_64(&sig, len) else {
+    let mut buf = [0u8; suite::max_signature_len_over(PROOF_SUITES)];
+    let Some(sig) = decode_signature(jws.signature_b64, suite_id, &mut buf) else {
         return false;
     };
     match kty {

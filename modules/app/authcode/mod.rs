@@ -55,6 +55,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+// ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
+// ed25519.rs. Order matters for all four.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -99,7 +104,8 @@ fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
 const VERIFIERS: device_auth::Verifiers = device_auth::Verifiers {
     sha256: sha256_into,
     ecdsa_verify,
-    ed25519_verify,
+    ed25519_verify: ed25519_verify_slice,
+    ml_dsa_verify: ml_dsa_verify_suite,
 };
 
 /// A dc+jwt device certificate presented at /authorize, and nothing else.
@@ -495,7 +501,7 @@ unsafe fn handle_authorize(
     };
 
     // Look the credential's key up by the kid it names.
-    let mut pubkey = [0u8; 65];
+    let mut pubkey = [0u8; verify_keyset::MAX_PUBKEY_LEN];
     let mut pubkey_len = 0usize;
     let mut key_suite = 0u16;
     let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
@@ -598,7 +604,10 @@ unsafe fn handle_authorize(
         refuse_authz(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     };
-    #[expect(clippy::cast_possible_truncation, reason = "base64url of 32 bytes is 43")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "base64url of 32 bytes is 43"
+    )]
     {
         e.replay_key_len = key_len as u8;
     }

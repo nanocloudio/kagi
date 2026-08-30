@@ -9,20 +9,20 @@
 //!
 //! # Why a label and not a key
 //!
-//! The predecessor put a raw private scalar on the key-distribution wire.
-//! That made distribution and COMPROMISE the same operation: whoever could
-//! reach the control plane could hand an issuer a signing key of their
-//! choosing, and whoever could observe that channel held the issuer's key.
+//! A raw private scalar on the key-distribution wire makes distribution and
+//! COMPROMISE the same operation: whoever can reach the control plane hands
+//! an issuer a signing key of their choosing, and whoever can observe that
+//! channel holds the issuer's key.
 //!
 //! A label removes the material from the wire entirely. The control plane
 //! can ask that a key EXIST; it cannot supply one and cannot learn one. The
 //! private half is generated inside the vault on first open and leaves it
 //! only as signatures.
 //!
-//! This shape was not available until labelled keys survived a **process**
-//! restart. While they did not, a raw key on the wire was the only way an
-//! issuer could hold the same key across a restart — and an issuer whose key
-//! changes at every restart invalidates every credential it ever issued.
+//! What makes a label sufficient is that a labelled key survives a
+//! **process** restart. Without that, the same key across a restart could
+//! only be had by putting it on the wire — and an issuer whose key changes
+//! at every restart invalidates every credential it ever issued.
 //!
 //! # Why the public half is carried here
 //!
@@ -38,7 +38,7 @@
 
 /// Longest public key an implemented suite exports: an uncompressed P-256
 /// point. Ed25519's is 32, so one bound covers both.
-pub const MAX_ISSUER_PUBKEY: usize = 65;
+pub const MAX_ISSUER_PUBKEY: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KEY_LEN;
 
 use crate::abi::SyscallTable;
 use crate::auth_wire;
@@ -59,10 +59,36 @@ pub struct IssuerKey {
     label: [u8; auth_wire::MAX_KEY_LABEL],
     label_len: u8,
     pub_key: [u8; MAX_ISSUER_PUBKEY],
-    pub_len: u8,
+    /// A `u16`: an ML-DSA-87 public key is 2592 bytes, and a `u8` would
+    /// keep only its low byte of length, which reads as a short key
+    /// rather than as an error.
+    pub_len: u16,
     /// Opaque vault handle, or -1 when no key is open. Never decoded.
     handle: i32,
     suite: u16,
+}
+
+/// The key-vault suite a kagi CREDENTIAL suite is custodied under.
+///
+/// The one place the two registries meet, with both in view. They are
+/// different registries — kagi's names what a JWS is signed with,
+/// fluxor's what a vault slot holds — and where their ids coincide it is
+/// coincidence rather than contract, so nothing else may assume it.
+///
+/// A suite with no custody equivalent maps to `NONE`, which the vault
+/// refuses. Defaulting instead would open a key of one algorithm under
+/// the label meant for another, and the label is what survives a
+/// restart.
+const fn vault_suite(credential_suite: u16) -> u16 {
+    match credential_suite {
+        auth_wire::suite::ES256 => key_vault::suite::P256,
+        auth_wire::suite::ED25519 => key_vault::suite::ED25519,
+        auth_wire::suite::ES384 => key_vault::suite::P384,
+        auth_wire::suite::ML_DSA_44 => key_vault::suite::ML_DSA_44,
+        auth_wire::suite::ML_DSA_65 => key_vault::suite::ML_DSA_65,
+        auth_wire::suite::ML_DSA_87 => key_vault::suite::ML_DSA_87,
+        _ => key_vault::suite::NONE,
+    }
 }
 
 impl IssuerKey {
@@ -119,7 +145,11 @@ impl IssuerKey {
         // [pub_out_ptr u64][pub_out_cap u16][pub_len_out u16]
         let mut pub_out = [0u8; MAX_ISSUER_PUBKEY];
         let mut arg = [0u8; 8 + auth_wire::MAX_KEY_LABEL + 12];
-        arg[0..2].copy_from_slice(&suite.to_le_bytes());
+        let vault = vault_suite(suite);
+        if vault == key_vault::suite::NONE {
+            return false;
+        }
+        arg[0..2].copy_from_slice(&vault.to_le_bytes());
         arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
         arg[6] = 0;
         #[expect(
@@ -135,7 +165,7 @@ impl IssuerKey {
         arg[tail..tail + 8].copy_from_slice(&pub_ptr.to_le_bytes());
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "MAX_ISSUER_PUBKEY is 65, far inside u16"
+            reason = "MAX_ISSUER_PUBKEY is the registry's widest key, far inside u16"
         )]
         {
             arg[tail + 8..tail + 10].copy_from_slice(&(MAX_ISSUER_PUBKEY as u16).to_le_bytes());
@@ -165,7 +195,7 @@ impl IssuerKey {
             reason = "both lengths bounded immediately above"
         )]
         {
-            self.pub_len = pub_len as u8;
+            self.pub_len = pub_len as u16;
             self.label_len = label.len() as u8;
         }
         true
@@ -192,20 +222,34 @@ impl IssuerKey {
         sys: &SyscallTable,
         scratch: &mut [u8],
         input: &[u8],
-    ) -> Option<[u8; 64]> {
+        sig_out: &mut [u8],
+    ) -> Option<usize> {
         if self.handle < 0 {
+            return None;
+        }
+        // The length this suite signs in, from the registry. Checked
+        // against what the vault actually wrote below, so a backend that
+        // answered with a different length is refused rather than
+        // producing a signature nothing verifies.
+        let want = auth_wire::suite::max_signature_len(self.suite);
+        if want == 0 || sig_out.len() < want {
             return None;
         }
         let total = input.len().checked_add(SIGN_SCRATCH_OVERHEAD)?;
         if scratch.len() < total || input.len() > u32::MAX as usize {
             return None;
         }
-        let mode = if self.suite == auth_wire::suite::ED25519 {
-            key_vault::sign_mode::RAW
-        } else {
-            key_vault::sign_mode::DIGEST
+        // What the bytes ARE, which is a property of the algorithm and not
+        // of the caller: ECDSA signs a digest, while Ed25519 and the pure
+        // FIPS 204 variant both sign the whole message.
+        let mode = match self.suite {
+            auth_wire::suite::ED25519
+            | auth_wire::suite::ML_DSA_44
+            | auth_wire::suite::ML_DSA_65
+            | auth_wire::suite::ML_DSA_87 => key_vault::sign_mode::RAW,
+            _ => key_vault::sign_mode::DIGEST,
         };
-        let mut sig = [0u8; 64];
+        let sig = &mut sig_out[..want];
         // SIGN v1: [sign_mode u8][_pad u8][input_len u32][input]
         //          [sig_out_ptr u64][sig_out_cap u16][sig_len_out u16]
         scratch[0] = mode;
@@ -221,20 +265,27 @@ impl IssuerKey {
         let tail = 6 + input.len();
         let sig_ptr = sig.as_mut_ptr() as u64;
         scratch[tail..tail + 8].copy_from_slice(&sig_ptr.to_le_bytes());
-        scratch[tail + 8..tail + 10].copy_from_slice(&64u16.to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the registry's widest signature is 4627, far inside u16"
+        )]
+        {
+            scratch[tail + 8..tail + 10].copy_from_slice(&(want as u16).to_le_bytes());
+        }
         scratch[tail + 10..tail + 12].copy_from_slice(&0u16.to_le_bytes());
         let rc = (sys.provider_call)(self.handle, key_vault::SIGN, scratch.as_mut_ptr(), total);
         if rc < 0 {
             return None;
         }
         let sig_len = usize::from(u16::from_le_bytes([scratch[tail + 10], scratch[tail + 11]]));
-        // A short signature is refused rather than zero-padded: padding one
-        // produces a well-formed value that verifies against nothing, which
-        // is the failure that gets diagnosed last.
-        if sig_len != 64 {
+        // A signature of the wrong length is refused rather than
+        // zero-padded: padding one produces a well-formed value that
+        // verifies against nothing, which is the failure that gets
+        // diagnosed last.
+        if sig_len != want {
             return None;
         }
-        Some(sig)
+        Some(want)
     }
 
     /// Release the vault handle. The key itself persists under its label —

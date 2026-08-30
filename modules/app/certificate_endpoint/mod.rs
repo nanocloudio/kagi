@@ -729,12 +729,11 @@ enum CaPublicKey {
 
 /// Emit the CA's public half as a VERIFY [`auth_wire::MSG_KEY_ADD`].
 ///
-/// **This edge exists because the operator can no longer supply it.** While
-/// a signing record carried a raw private key, whoever distributed it could
-/// derive the public half and hand it to the verifiers. A key generated
-/// inside the vault has no such moment, so publishing it becomes the
-/// signer's job. The announcement carries nothing secret, which is exactly
-/// why it can travel on an ordinary lane.
+/// **This edge exists because the operator cannot supply it.** Deriving the
+/// public half requires the private one, and a key generated inside the
+/// vault never presents that to anybody — so publishing it is the signer's
+/// job. The announcement carries nothing secret, which is exactly why it
+/// can travel on an ordinary lane.
 ///
 /// # Safety
 ///
@@ -790,18 +789,26 @@ fn sign_tbs(s: &mut ModuleState, tbs: &[u8], digest: bool) -> Option<[u8; 64]> {
     // long as the module; `sign_scratch` does not alias `tbs`.
     let sys = unsafe { &*s.syscalls };
     let key = s.key;
-    if digest {
+    // 64 bytes is the CERTIFICATE profile's bound, not the vault's: a kagi
+    // certificate carries an ECDSA `r‖s` or an Ed25519 `R‖S`, and the DER
+    // encoders are written to those shapes. Sizing the buffer to that is
+    // what makes a wider suite a refusal — `sign` will not write past what
+    // it is given — rather than a truncation. A post-quantum certificate
+    // is a change in the encoders, not a wider buffer here.
+    let mut sig = [0u8; 64];
+    let len = if digest {
         let hash = sha256(tbs);
-        unsafe { key.sign(sys, &mut s.sign_scratch, &hash) }
+        unsafe { key.sign(sys, &mut s.sign_scratch, &hash, &mut sig) }
     } else {
-        unsafe { key.sign(sys, &mut s.sign_scratch, tbs) }
-    }
+        unsafe { key.sign(sys, &mut s.sign_scratch, tbs, &mut sig) }
+    }?;
+    (len == sig.len()).then_some(sig)
 }
 
 /// The CA's public half, as the vault exported it at open.
 ///
 /// Read from the vault rather than derived from a scalar, because there is
-/// no longer a scalar here to derive it from — which is the point.
+/// no scalar here to derive it from — which is the point.
 fn ca_public_key(s: &ModuleState) -> Option<CaPublicKey> {
     let pk = s.key.public_key();
     if s.key_suite == auth_wire::suite::ES256 {

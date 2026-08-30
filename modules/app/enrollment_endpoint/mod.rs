@@ -60,6 +60,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+// ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
+// ed25519.rs. Order matters for all four.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -67,6 +72,10 @@ mod auth_wire;
 mod b64;
 #[path = "../../common/chan.rs"]
 mod chan;
+#[path = "../../common/device_auth.rs"]
+mod device_auth;
+#[path = "../../common/dpop.rs"]
+mod dpop;
 #[path = "../../common/ids.rs"]
 mod ids;
 #[path = "../../common/issuer_key.rs"]
@@ -81,10 +90,6 @@ mod key_vault;
 mod pkce;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
-#[path = "../../common/device_auth.rs"]
-mod device_auth;
-#[path = "../../common/dpop.rs"]
-mod dpop;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
 #[path = "../../common/totp.rs"]
@@ -176,7 +181,7 @@ struct ModuleState {
     ///
     /// Derived from the signing key at open (see `derive_code_key`) rather
     /// than held as a separate secret, so there is exactly one thing to
-    /// provision — and unlike its predecessor it is STABLE across restarts.
+    /// provision, and it is STABLE across restarts.
     code_key: [u8; 32],
     /// Proof replay for the authenticator routes, so one DPoP proof admits
     /// one operation.
@@ -408,10 +413,10 @@ const MAX_CODE_ATTEMPTS: u32 = 5;
 ///
 /// Emit this signer's public half as a VERIFY [`auth_wire::MSG_KEY_ADD`].
 ///
-/// **This edge exists because the operator can no longer supply it.** The
-/// signing record names a vault LABEL, so the private half is generated
-/// inside the vault and whoever distributed the record never sees the
-/// public half either. This module is the only component that does.
+/// **This edge exists because the operator cannot supply it.** The signing
+/// record names a vault LABEL, so the private half is generated inside the
+/// vault and whoever distributed the record never sees the public half
+/// either. This module is the only component that does.
 ///
 /// # Safety
 ///
@@ -454,23 +459,26 @@ unsafe fn announce_public_key(
 
 /// Derive the code-HMAC key from the vault-held signing key, once, at open.
 ///
-/// **This closes the restart hole its predecessor documented.** That version
-/// derived the key from a signing seed held in module RAM and re-delivered
-/// on restart, so a restart before redemption invalidated every outstanding
-/// code — fail-closed, but a real outage for anyone mid-enrolment. Closing
-/// it needed "a KEY_VAULT that can reopen a named key", which now exists.
+/// **The derived key must survive a restart**, or a restart before
+/// redemption invalidates every outstanding code — fail-closed, but a real
+/// outage for anyone mid-enrolment. What makes that possible is a vault
+/// that can reopen a key by name: the key material never has to be held in
+/// module RAM or re-delivered.
 ///
 /// The construction is `SHA-256(Sign_k(domain))`. Two properties make it
 /// work, and both are load-bearing:
 ///
-/// - **Ed25519 signing is deterministic** (RFC 8032 derives the nonce from
-///   the key and message, not from randomness), so the same key over the
-///   same domain string yields the same signature on every boot — which is
-///   what makes the derived key stable across restarts. This module accepts
-///   Ed25519 keys ONLY, and that restriction is now load-bearing rather than
-///   merely tidy: an ECDSA key would produce a different signature every
-///   time and silently invalidate every outstanding code, which is exactly
-///   the failure this replaced.
+/// - **Ed25519 signing is deterministic BY SPECIFICATION** — RFC 8032
+///   derives the nonce from the key and message, and admits no other
+///   construction — so the same key over the same domain string yields the
+///   same signature on every boot, on every backend. That is what makes
+///   the derived key stable across restarts, and it is why this module
+///   accepts Ed25519 keys ONLY. Determinism that a backend merely happens
+///   to provide is not enough: ECDSA's is RFC 6979's convention and a
+///   hardware token may use a random nonce instead, and FIPS 204 admits a
+///   hedged ML-DSA alongside the deterministic one. Either would yield a
+///   different signature per boot and silently invalidate every
+///   outstanding code.
 /// - **The signature is unavailable without the key**, which the vault never
 ///   exports — so the derived key is no weaker than the signing key itself.
 ///
@@ -481,10 +489,12 @@ fn derive_code_key(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let key = s.key;
     // SAFETY: `sys` is the module's own table; `sign_scratch` does not alias
     // the domain constant.
-    let Some(sig) = (unsafe { key.sign(sys, &mut s.sign_scratch, CODE_KEY_DOMAIN) }) else {
+    let mut sig = [0u8; auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    let Some(sig_len) = (unsafe { key.sign(sys, &mut s.sign_scratch, CODE_KEY_DOMAIN, &mut sig) })
+    else {
         return false;
     };
-    s.code_key = sha256(&sig);
+    s.code_key = sha256(&sig[..sig_len]);
     true
 }
 
@@ -962,10 +972,11 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
 
-        // Ed25519 only. An enrolment endpoint signs one shape of artefact and
-        // there is no reason for it to carry two suites; a graph that hands
-        // it a P-256 key has made a mistake worth failing on rather than
-        // quietly not signing.
+        // Ed25519 only, and not merely for tidiness: `derive_code_key`
+        // needs a signature that is the same on every boot, which RFC 8032
+        // guarantees and no other suite here does. A graph that hands this
+        // module a key of another suite has made a mistake worth failing
+        // on rather than quietly not signing.
         let (kid, label) = (rec.kid, rec.key_ref);
         if rec.suite != auth_wire::suite::ED25519
             || label.is_empty()
@@ -1068,7 +1079,9 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     }
     if registering || confirming {
-        totp_route(s, sys, conn, stream, confirming, path_len, body_at, body_end);
+        totp_route(
+            s, sys, conn, stream, confirming, path_len, body_at, body_end,
+        );
         return;
     }
     let Some(is_start) = path_start else {
@@ -1171,7 +1184,8 @@ unsafe fn authenticate_device(
     let verifiers = device_auth::Verifiers {
         sha256: sha256_into,
         ecdsa_verify,
-        ed25519_verify,
+        ed25519_verify: ed25519_verify_slice,
+        ml_dsa_verify: ml_dsa_verify_suite,
     };
     let policy = device_auth::Policy {
         proof_max_age_secs: PROOF_WINDOW_SECS,
@@ -2130,7 +2144,10 @@ unsafe fn begin_totp_register(
     entry.stream = stream;
     entry.totp_confirming = false;
     entry.totp_secret = secret;
-    #[expect(clippy::cast_possible_truncation, reason = "bounded by TOTP_SECRET_B32")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by TOTP_SECRET_B32"
+    )]
     {
         entry.totp_secret_len = secret_len as u8;
     }
@@ -2941,10 +2958,14 @@ fn sign_jws(s: &mut ModuleState, cty: &[u8], claims: &[u8]) -> Result<usize, Ref
     // `sign_scratch` does not alias `token`.
     let sys = unsafe { &*s.syscalls };
     let key = s.key;
-    let signature =
-        unsafe { key.sign(sys, &mut s.sign_scratch, &token[..n]) }.ok_or(Refusal::Malformed)?;
+    // Sized from the registry rather than from ES256's 64 bytes: what the
+    // issuer key's suite signs in is what this has to hold.
+    let mut signature = [0u8; auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    let signature_len = unsafe { key.sign(sys, &mut s.sign_scratch, &token[..n], &mut signature) }
+        .ok_or(Refusal::Malformed)?;
     put(&mut token, &mut n, b".")?;
-    let sig_len = b64::encode(&signature, &mut token[n..]).ok_or(Refusal::Malformed)?;
+    let sig_len =
+        b64::encode(&signature[..signature_len], &mut token[n..]).ok_or(Refusal::Malformed)?;
     n += sig_len;
 
     if n > s.out.len() {

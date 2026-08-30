@@ -48,6 +48,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+// ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
+// ed25519.rs. Order matters for all four.
+include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -432,7 +437,7 @@ unsafe fn authenticate(
     // Which key signed the credential is the credential's own claim, in
     // its JOSE header. It is looked up, never guessed: an unknown kid is
     // refused rather than checked against whatever key is loaded.
-    let mut pubkey = [0u8; 65];
+    let mut pubkey = [0u8; verify_keyset::MAX_PUBKEY_LEN];
     let mut pubkey_len = 0usize;
     let mut key_suite = 0u16;
     let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
@@ -864,7 +869,8 @@ unsafe fn respond(
 const VERIFIERS: device_auth::Verifiers = device_auth::Verifiers {
     sha256: sha256_into,
     ecdsa_verify,
-    ed25519_verify,
+    ed25519_verify: ed25519_verify_slice,
+    ml_dsa_verify: ml_dsa_verify_suite,
 };
 
 /// Device certificates only. A key package is published by the device that

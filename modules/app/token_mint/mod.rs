@@ -65,15 +65,6 @@ mod key_vault;
 
 use auth_wire::{MintClaimValue, MintRequest, PayloadWriter};
 
-/// key_vault `key_type` for a credential suite.
-fn kv_key_type(suite: u16) -> u8 {
-    if suite == auth_wire::suite::ED25519 {
-        2 // Ed25519 seed
-    } else {
-        1 // P-256 scalar
-    }
-}
-
 /// This deployment's posture, for the key-custody floor.
 ///
 /// `Development` today, and that is the honest setting: kagi's own e2e
@@ -94,10 +85,10 @@ const MAX_ISSUER_LEN: usize = 64;
 ///
 /// More than one, which is the point: a rotation ADDs before it ACTIVATEs
 /// and RETIREs the old key rather than removing it, so three entries for a
-/// single profile is the ordinary mid-rotation state. The predecessor held
-/// exactly one key and overwrote it, which made rotation an atomic swap
-/// with no overlap — every credential signed under the old key stopped
-/// verifying the instant the new one arrived.
+/// single profile is the ordinary mid-rotation state. A keyset holding one
+/// key would make rotation an atomic swap with no overlap, and every
+/// credential signed under the outgoing key would stop verifying the
+/// instant its replacement arrived.
 const MAX_KEYS: usize = 8;
 
 /// One key in the mint's keyset.
@@ -178,8 +169,9 @@ struct ModuleState {
     /// `TIER_NONE`. What `C5` is actually checked against: `PROBE` says a
     /// backend exists, this says what it protects against.
     vault_tier: u8,
-    /// Scratch for the key_vault SIGN arg: `[len u16][pad u16][msg][sig 64]`.
-    kv_arg: [u8; 4 + TOKEN_BUF_LEN + 64],
+    /// Scratch for the key_vault SIGN arg: header, message, and room for
+    /// the widest signature an implemented suite produces.
+    kv_arg: [u8; 4 + TOKEN_BUF_LEN + auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN],
 
     // Metrics (names mirror manifest [observability])
     mint_ok: u32,
@@ -244,17 +236,16 @@ pub extern "C" fn module_new(
         // answered.
         //
         // `PROBE` says a backend exists. It says nothing about what that
-        // backend isolates against, and this module used to stop there:
-        // any backend, including the in-process software one, satisfied it.
-        // `C5` is a statement about isolation, so it has to be checked
-        // against the ordinal that carries isolation.
+        // backend isolates against — the in-process software one answers it
+        // as readily as an HSM. `C5` is a statement about isolation, so it
+        // is checked against `TIER`, the ordinal that carries isolation,
+        // and not against presence.
         let probe = (sys.provider_call)(-1, key_vault::PROBE, core::ptr::null_mut(), 0);
-        // No backend, no mint. This used to be a soft signal selecting
-        // between a vault and an in-module scalar; with the scalar gone
-        // there is nothing on the other side of the branch, and a module
-        // that constructs without a vault would be one that starts cleanly
-        // and refuses every request — the shape that reads as a runtime
-        // fault rather than a misconfiguration.
+        // No backend, no mint. The vault is the only signing path, so
+        // there is nothing on the other side of this branch: a module that
+        // constructed without one would start cleanly and refuse every
+        // request, which reads as a runtime fault rather than as the
+        // misconfiguration it is.
         if probe != 1 {
             dev_log(
                 sys,
@@ -585,12 +576,10 @@ unsafe fn open_slot_key(s: &mut ModuleState, sys: &SyscallTable, i: usize) -> bo
 
 /// Emit the slot's public half as a VERIFY [`auth_wire::MSG_KEY_ADD`].
 ///
-/// **This edge exists because the operator can no longer supply it.** While
-/// a signing record carried a raw private key, whoever distributed it could
-/// derive the public half and hand it to the verifiers itself. A key
-/// generated inside the vault has no such moment: the mint is the only
-/// component that ever sees the public half, so publishing it is the mint's
-/// job. One output port and an edge, rather than a second distribution
+/// **This edge exists because the operator cannot supply it.** Deriving the
+/// public half requires the private one, and a key generated inside the
+/// vault never presents that to anybody: the mint is the only component
+/// that ever sees the public half, so publishing it is the mint's job. One output port and an edge, rather than a second distribution
 /// channel to secure — the announcement carries nothing secret, which is
 /// exactly why it can travel on an ordinary lane.
 ///
@@ -685,8 +674,8 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let Some(slot) = select_key(s, &req, now) else {
         s.no_key_errors = s.no_key_errors.saturating_add(1);
         // "This kid is not in the keyset" and "this profile has no key at
-        // all" are different operator problems, and the old ST_NO_KEY said
-        // neither.
+        // all" are different operator problems, and one status covering
+        // both would name neither.
         let why = if req.kid.is_empty() {
             auth_wire::mint_err::NO_KEY
         } else {
@@ -760,32 +749,42 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     };
 
-    // Raw 64-byte signatures are exactly the JWS segment form (no DER).
-    // ES256 signs the SHA-256 of the signing input per JOSE; EdDSA signs the
-    // input itself (RFC 8037). SIGN runs in the backend: the private key is
-    // generated there and never enters this module at all.
+    // Raw signatures are exactly the JWS segment form (no DER), and their
+    // length comes from the suite. SIGN runs in the backend: the private
+    // key is generated there and never enters this module at all.
     s.sign_ops = s.sign_ops.saturating_add(1);
-    let is_eddsa = req.suite == auth_wire::suite::ED25519;
     // `IssuerKey` is `Copy`, so the key is taken out of `s.keys` before
     // `s.kv_arg` is borrowed mutably: two disjoint fields of one state.
     let key = s.keys[slot].key;
-    // There is ONE signing path, and it is the vault. The predecessor kept
-    // an in-module scalar as a fallback for graphs with no backend; with the
-    // private key generated inside the vault there is no scalar to fall back
-    // to, and a second path would have been a second place for the key to
-    // be. `module_new` refuses to construct without a backend, so a handle
+    // There is ONE signing path, and it is the vault: the private key is
+    // generated inside it, so there is no in-module key to fall back to,
+    // and a second path would be a second place for a key to be.
+    // `module_new` refuses to construct without a backend, so a handle
     // below zero here means the key failed to open, not that the platform
     // cannot sign.
-    // The fragment picks RAW or DIGEST from the key's own suite; what this
-    // module chooses is WHAT gets signed, which is the JOSE rule: EdDSA
-    // signs the signing input itself (RFC 8037), ES256 signs its SHA-256.
-    let signed: Option<[u8; 64]> = if is_eddsa {
-        key.sign(sys, &mut s.kv_arg, &token[..input_len])
-    } else {
-        let hash = sha256(&token[..input_len]);
-        key.sign(sys, &mut s.kv_arg, &hash)
+    //
+    // The fragment picks RAW or DIGEST from the key's own suite.
+    // WHAT gets signed is the JOSE rule for the suite, and it is spelled
+    // out per suite rather than inferred: ES256 signs the SHA-256 of the
+    // signing input, while EdDSA (RFC 8037) and ML-DSA (RFC 9964) sign the
+    // input itself. A suite with no arm here signs nothing — inferring
+    // "not EdDSA, therefore hash it" would hand ES384 a SHA-256 digest and
+    // produce a valid signature over the wrong bytes.
+    let mut sig_buf = [0u8; auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    let signed = match req.suite {
+        auth_wire::suite::ES256 => {
+            let hash = sha256(&token[..input_len]);
+            key.sign(sys, &mut s.kv_arg, &hash, &mut sig_buf)
+        }
+        auth_wire::suite::ED25519
+        | auth_wire::suite::ML_DSA_44
+        | auth_wire::suite::ML_DSA_65
+        | auth_wire::suite::ML_DSA_87 => {
+            key.sign(sys, &mut s.kv_arg, &token[..input_len], &mut sig_buf)
+        }
+        _ => None,
     };
-    let Some(sig) = signed else {
+    let Some(sig_len) = signed else {
         s.mint_err = s.mint_err.saturating_add(1);
         // Signing failed with a key that IS loaded — the vault refused, or
         // the slot never opened. Reported as itself: calling it malformed
@@ -794,7 +793,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     };
 
-    let Ok(total) = jose::append_signature(&mut token, input_len, &sig) else {
+    let Ok(total) = jose::append_signature(&mut token, input_len, &sig_buf[..sig_len]) else {
         s.mint_err = s.mint_err.saturating_add(1);
         refuse(s, sys, corr, auth_wire::mint_err::MALFORMED);
         return;

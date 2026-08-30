@@ -19,8 +19,9 @@ module surface and its wire protocol see [modules.md](modules.md).
   verification, PKCE, DER emission and the encrypted-record format live in
   `modules/common/*.rs` with crypto injected as function pointers, so a
   module and an independent implementation produce byte-identical output.
-- **Deterministic signing.** ES256 (RFC 6979) and EdDSA (RFC 8032) need no
-  runtime entropy, which is what makes minting viable inside a PIC module.
+- **Deterministic signing.** ES256 (RFC 6979), EdDSA (RFC 8032) and ML-DSA
+  (FIPS 204, deterministic variant) need no runtime entropy, which is what
+  makes minting viable inside a PIC module.
 - **Keys by label.** A signing record names a vault label. The private half
   is generated inside the vault, leaves it only as signatures, and cannot
   be supplied or observed on the control plane.
@@ -157,8 +158,8 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
   against the device's authenticator, and scores what was proved. In grant
   mode it drives the mint itself, so a subject established here never passes
   back through the pipeline.
-- `token_mint` — ES256 / EdDSA JWS minting from a keyset indexed by
-  `(issuer, profile_id, kid)`.
+- `token_mint` — JWS minting from a keyset indexed by
+  `(issuer, profile_id, kid)`, in any implemented credential suite.
 - `token_verify` — the verification counterpart: signature first, then the
   `iat`/`exp` window, replying with a typed identity.
 - `authcode` — the OIDC authorization-code flow: `/authorize` issues a
@@ -186,6 +187,44 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
 - `secret_store` — sealed secret records behind a channel request API.
   Targets `bcm2712` and `wasm`; the browser build runs memory-only.
 - `control_admission` — who may open the control socket.
+
+## Credential suites
+
+A suite is the one number kagi carries to say what cryptography a
+credential uses. `modules/common/suite.rs` is the registry, and every
+size a module reserves — a signature buffer, a public key slot, a
+thumbprint length — is a lookup in it rather than a constant.
+
+| Suite | JOSE `alg` | JWK `kty` | Signature | Public key |
+| --- | --- | --- | --- | --- |
+| `ES256` | `ES256` | `EC` | 64 | 65, or 33 compressed |
+| `ED25519` | `EdDSA` | `OKP` | 64 | 32 |
+| `ML_DSA_44` | `ML-DSA-44` | `AKP` | 2420 | 1312 |
+| `ML_DSA_65` | `ML-DSA-65` | `AKP` | 3309 | 1952 |
+| `ML_DSA_87` | `ML-DSA-87` | `AKP` | 4627 | 2592 |
+
+`ES384` and `HYBRID_ES256_ML_DSA_44` are named and not implemented. The
+hybrid has no JOSE name to carry — a composite ML-DSA/ECDSA `alg` is an
+Internet-Draft rather than a registration — so nothing can be minted under
+it, which is the fail-closed direction.
+
+Naming a suite is not implementing it: `suite::is_implemented` is the only
+thing that says this build can sign or verify one, and every issuance and
+verification path refuses anything else. A deployment learns at
+configuration rather than at its first signature.
+
+Post-quantum keys are custodied by seed. A vault slot holds the 32-byte
+FIPS 204 seed, which reproduces the encoded key exactly, so a slot sized
+for a P-256 scalar holds an ML-DSA-87 key. `key_ref` on the keyset wire
+carries a 16-bit length, which is what lets a 2592-byte public key travel
+it unchanged.
+
+Device authenticators are classical. A DPoP proof key is the device's, and
+an `AKP` thumbprint is taken over `alg`/`kty`/`pub` where an `EC` or `OKP`
+one is taken over `crv`/`kty`/`x` — so admitting one would change the
+`cnf.jkt` that every binding already issued was computed against. The
+issuer's own keys reach ML-DSA on a path where no thumbprint is
+involved.
 
 ## Testing
 

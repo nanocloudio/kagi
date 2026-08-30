@@ -755,10 +755,14 @@ fn sign_jws(s: &mut ModuleState, cty: &[u8], claims: &[u8]) -> Result<usize, Ref
     // reads RAW from the key's own suite.
     let key = s.key;
     // SAFETY: as `sys` above; `sign_scratch` does not alias `token`.
-    let signature =
-        unsafe { key.sign(sys, &mut s.sign_scratch, &token[..n]) }.ok_or(Refusal::Malformed)?;
+    // Sized from the registry rather than from ES256's 64 bytes: what the
+    // issuer key's suite signs in is what this has to hold.
+    let mut signature = [0u8; auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN];
+    let signature_len = unsafe { key.sign(sys, &mut s.sign_scratch, &token[..n], &mut signature) }
+        .ok_or(Refusal::Malformed)?;
     put(&mut token, &mut n, b".")?;
-    let sig_len = b64::encode(&signature, &mut token[n..]).ok_or(Refusal::Malformed)?;
+    let sig_len =
+        b64::encode(&signature[..signature_len], &mut token[n..]).ok_or(Refusal::Malformed)?;
     n += sig_len;
 
     if n > s.out.len() {
