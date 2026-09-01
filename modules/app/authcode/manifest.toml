@@ -39,7 +39,12 @@ name = "verify_key"
 index = 1
 direction = "input"
 content_type = "OctetStream"
-buffer_size = 512
+# Registry-sized ring: this lane carries MSG_KEY_ADD records whose
+# key_ref can be the widest implemented public key (ML-DSA-87, 2592
+# bytes). 512 fitted the classical suites and silently could not carry a
+# post-quantum announcement; the wiring validator refuses a max_record
+# above the ring, which is how this class was swept rather than patched.
+buffer_size = 8192
 
 # The state adapter, holding the client registry (NS_OAUTH_CLIENT), the
 # single-use code records (NS_OAUTH_CODE) and the device ledger (NS_DEVICE).

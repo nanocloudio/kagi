@@ -1,11 +1,18 @@
 //! Security state — Kagi's durable identity ledger, as a module.
 //!
-//! Three operations over `storage.object`: create only if absent, replace
-//! only if unchanged, and read. Enrollment transactions, device membership,
-//! key-package claims and endpoint high-water marks are all written in terms
-//! of those, because lattice offers no atomic multi-key transaction and a
-//! transition that cannot be one key's compare-and-swap cannot be made atomic
-//! on the intended backend at all.
+//! Three operations: create only if absent, replace only if unchanged, and
+//! read. Enrollment transactions, device membership, key-package claims and
+//! endpoint high-water marks are all written in terms of those, because
+//! lattice offers no atomic multi-key transaction and a transition that
+//! cannot be one key's compare-and-swap cannot be made atomic on a
+//! replicated backend at all.
+//!
+//! Two backends answer them, chosen by the graph's `backend` parameter and
+//! never inferred. `object` runs the three against a local
+//! `storage.object` provider; `lattice` runs them against a
+//! `lattice_data_client` over the module's kv lane, which is the only
+//! backend whose commits leave this node. The operations are the same
+//! either way — that is the point of there being exactly three.
 //!
 //! ## Why this exists rather than `secret_store`
 //!
@@ -19,9 +26,11 @@
 //!
 //! ## Fail closed, never memory-only
 //!
-//! At start-up this probes for a conditional-write provider. If none answers,
-//! every subsequent request is refused with `ST_UNAVAILABLE` for the life of
-//! the module — it never falls back to RAM. `ST_UNAVAILABLE` and
+//! At start-up this checks that the declared backend can actually answer:
+//! `object` probes for a conditional-write provider, `lattice` requires its
+//! kv lane to be wired. If the check fails, every subsequent request is
+//! refused with `ST_UNAVAILABLE` for the life of the module — it never
+//! falls back to RAM, and it never quietly answers from the other backend. `ST_UNAVAILABLE` and
 //! `ST_NOT_FOUND` are deliberately different answers: "there is no ledger"
 //! and "the ledger says no such device" must never look alike to a caller
 //! deciding whether to issue a credential.
@@ -64,8 +73,12 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 mod auth_wire;
 #[path = "../../common/chan.rs"]
 mod chan;
+#[path = "../../common/lattice_kv.rs"]
+mod lattice_kv;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
+#[path = "../../common/time_policy.rs"]
+mod time_policy;
 
 use state_wire::StateRequest;
 
@@ -138,6 +151,47 @@ define_params! {
     1, authority, str, 0 => |s, d, len| {
         s.authority = match_authority(d, len);
     };
+
+    // Which backend holds the ledger. `object` is the provider-call path
+    // (synchronous, this node's disk) — right for a single-node authority.
+    // `lattice` speaks MSG_KV_REQUEST to a `lattice_data_client` over the
+    // kv ports — asynchronous, correlated, answering with a durability
+    // class checked against the namespace floor, and the only backend a
+    // `replicated` authority can honestly run on.
+    2, backend, u8, 0, enum { object=0, lattice=1 }
+        => |s, d, len| { s.backend = p_u8(d, len, 0, BACKEND_OBJECT); };
+}
+
+const BACKEND_OBJECT: u8 = 0;
+const BACKEND_LATTICE: u8 = 1;
+
+/// Requests parked on a lattice answer. Small and refusing when full —
+/// parked requests are admissions-in-waiting, and an unbounded queue is
+/// the eviction-under-load shape.
+const MAX_KV_PENDING: usize = 8;
+
+/// One request parked on the lattice's answer.
+#[derive(Clone, Copy)]
+struct KvPending {
+    live: bool,
+    kv_corr: u64,
+    corr: u32,
+    client: u8,
+    namespace: u8,
+    is_read: bool,
+}
+
+impl KvPending {
+    const fn zero() -> Self {
+        Self {
+            live: false,
+            kv_corr: 0,
+            corr: 0,
+            client: 0,
+            namespace: 0,
+            is_read: false,
+        }
+    }
 }
 const MSG_BUF_LEN: usize = 4096;
 const ARG_BUF_LEN: usize = 512;
@@ -157,6 +211,14 @@ struct ModuleState {
     /// Which authority this ledger is, as the graph declared it. Undeclared
     /// refuses everything — see the constants.
     authority: u8,
+    /// Which backend (`BACKEND_*`), from the `backend` param.
+    backend: u8,
+    /// out[1]/in[1]: the lattice kv lane, used only in `lattice` mode.
+    out_kv: i32,
+    in_kv: i32,
+    kv_pending: [KvPending; MAX_KV_PENDING],
+    next_kv_corr: u64,
+    kv_buf: [u8; MSG_BUF_LEN],
 
     msg_buf: [u8; MSG_BUF_LEN],
     out_buf: [u8; MSG_BUF_LEN],
@@ -255,6 +317,11 @@ pub extern "C" fn module_new(
         s.unavailable = false;
         s.probed = false;
         s.authority = AUTHORITY_UNDECLARED;
+        s.backend = BACKEND_OBJECT;
+        s.out_kv = dev_channel_port(sys, 1, 1);
+        s.in_kv = dev_channel_port(sys, 0, 1);
+        s.kv_pending = [KvPending::zero(); MAX_KV_PENDING];
+        s.next_kv_corr = 1;
         parse_tlv(s, params, params_len);
         s.state_get = 0;
         s.state_put_absent = 0;
@@ -281,6 +348,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if !s.probed {
             probe(s, sys);
         }
+
+        drain_kv(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
             if !chan::can_read(sys, s.in_requests) {
@@ -330,6 +399,34 @@ unsafe fn probe(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
 
+    if s.backend == BACKEND_LATTICE {
+        // The lattice backend needs its lane, not the object provider. A
+        // replicated authority on the OBJECT backend would be a ledger
+        // whose commits never leave this node — refused as the same class
+        // of undeclarable claim.
+        if s.out_kv < 0 || s.in_kv < 0 {
+            s.unavailable = true;
+            dev_log(
+                sys,
+                1,
+                b"[state] lattice backend declared but kv lane unwired; refusing all requests"
+                    .as_ptr(),
+                76,
+            );
+        }
+        return;
+    }
+    if s.authority == AUTHORITY_REPLICATED {
+        s.unavailable = true;
+        dev_log(
+            sys,
+            1,
+            b"[state] replicated authority requires the lattice backend; refusing all requests"
+                .as_ptr(),
+            79,
+        );
+        return;
+    }
     let rc = head_object(s, sys, PROBE_KEY);
     // `ENXIO` — absent — is the expected healthy answer. Anything that is not
     // a real answer about a key means there is no conditional store here.
@@ -386,6 +483,16 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, msg_type: u8, 
         reply(s, sys, corr, client, auth_wire::ST_MALFORMED, &[], is_read);
         return;
     };
+
+    if s.backend == BACKEND_LATTICE {
+        let expiry = req.expiry_unix;
+        let etag_len = copy_field(&mut s.etag_buf, req.etag);
+        let value_len = copy_field(&mut s.value_buf, req.value);
+        kv_request(
+            s, sys, msg_type, ns, key_len, value_len, etag_len, expiry, corr, client, is_read,
+        );
+        return;
+    }
 
     match msg_type {
         state_wire::MSG_STATE_GET => {
@@ -890,6 +997,328 @@ fn encode_head_arg(
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+/// Hex-encode a lattice `mod_revision` as the etag callers CAS against.
+fn revision_etag(revision: u64, out: &mut [u8; 16]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, byte) in revision.to_be_bytes().iter().enumerate() {
+        out[i * 2] = HEX[usize::from(byte >> 4)];
+        out[i * 2 + 1] = HEX[usize::from(byte & 0x0F)];
+    }
+}
+
+/// Parse a caller's etag back into the revision witness it encodes.
+fn etag_revision(etag: &[u8]) -> Option<u64> {
+    if etag.len() != 16 {
+        return None;
+    }
+    let mut rev = 0u64;
+    for &b in etag {
+        let nibble = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => return None,
+        };
+        rev = (rev << 4) | u64::from(nibble);
+    }
+    Some(rev)
+}
+
+/// Encode one lattice request, park the caller, send it.
+///
+/// Fail closed at every seam: no pending slot, an encode that will not
+/// fit, or a lane that will not take the frame all answer
+/// `ST_UNAVAILABLE` now rather than admitting later on nothing.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site, mirrors the object path's split"
+)]
+unsafe fn kv_request(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    msg_type: u8,
+    ns: u8,
+    key_len: usize,
+    value_len: usize,
+    etag_len: usize,
+    expiry_unix: u64,
+    corr: u32,
+    client: u8,
+    is_read: bool,
+) {
+    let Some(slot) = s.kv_pending.iter().position(|p| !p.live) else {
+        s.state_unavailable = s.state_unavailable.saturating_add(1);
+        reply(
+            s,
+            sys,
+            corr,
+            client,
+            auth_wire::ST_UNAVAILABLE,
+            &[],
+            is_read,
+        );
+        return;
+    };
+
+    // The op body, in kv_buf's tail; the enveloped request lands in its
+    // head afterwards. Values travel as a Record so expiry lives INSIDE
+    // the authenticated bytes — lattice has no standalone TTL on this op
+    // set, and the decode-on-read treats an expired record as absent.
+    let mut body = [0u8; MSG_BUF_LEN / 2];
+    let key = &s.key_buf[..key_len];
+    let encoded_body = match msg_type {
+        state_wire::MSG_STATE_GET => {
+            s.state_get = s.state_get.saturating_add(1);
+            lattice_kv::encode_get(key, &mut body)
+        }
+        state_wire::MSG_STATE_PUT_ABS | state_wire::MSG_STATE_CAS => {
+            let witness = if msg_type == state_wire::MSG_STATE_PUT_ABS {
+                s.state_put_absent = s.state_put_absent.saturating_add(1);
+                Some(0)
+            } else {
+                s.state_cas = s.state_cas.saturating_add(1);
+                etag_revision(&s.etag_buf[..etag_len])
+            };
+            let Some(witness) = witness else {
+                s.state_malformed = s.state_malformed.saturating_add(1);
+                reply(s, sys, corr, client, auth_wire::ST_MALFORMED, &[], is_read);
+                return;
+            };
+            let record = lattice_kv::Record {
+                expires_at_unix: expiry_unix,
+                value: &s.value_buf[..value_len],
+            };
+            let mut record_buf = [0u8; MSG_BUF_LEN / 2];
+            let Some(record_len) = record.encode(&mut record_buf) else {
+                s.state_malformed = s.state_malformed.saturating_add(1);
+                reply(s, sys, corr, client, auth_wire::ST_MALFORMED, &[], is_read);
+                return;
+            };
+            lattice_kv::encode_cas(key, witness, &record_buf[..record_len], &mut body)
+        }
+        state_wire::MSG_STATE_DELETE => {
+            s.state_delete = s.state_delete.saturating_add(1);
+            lattice_kv::encode_delete(key, &mut body)
+        }
+        _ => {
+            s.state_malformed = s.state_malformed.saturating_add(1);
+            reply(s, sys, corr, client, auth_wire::ST_MALFORMED, &[], is_read);
+            return;
+        }
+    };
+    let Some(body_len) = encoded_body else {
+        s.state_malformed = s.state_malformed.saturating_add(1);
+        reply(s, sys, corr, client, auth_wire::ST_MALFORMED, &[], is_read);
+        return;
+    };
+
+    let op = match msg_type {
+        state_wire::MSG_STATE_GET => lattice_kv::op::GET,
+        state_wire::MSG_STATE_DELETE => lattice_kv::op::DELETE,
+        _ => lattice_kv::op::CAS,
+    };
+    let kv_corr = s.next_kv_corr;
+    s.next_kv_corr = s.next_kv_corr.wrapping_add(1).max(1);
+    let Some(frame_len) =
+        lattice_kv::encode_request(kv_corr, 0, op, &body[..body_len], &mut s.kv_buf)
+    else {
+        s.state_unavailable = s.state_unavailable.saturating_add(1);
+        reply(
+            s,
+            sys,
+            corr,
+            client,
+            auth_wire::ST_UNAVAILABLE,
+            &[],
+            is_read,
+        );
+        return;
+    };
+    if chan::channel_write_msg(
+        sys,
+        s.out_kv,
+        lattice_kv::MSG_KV_REQUEST,
+        &s.kv_buf[..frame_len],
+    ) <= 0
+    {
+        s.state_unavailable = s.state_unavailable.saturating_add(1);
+        reply(
+            s,
+            sys,
+            corr,
+            client,
+            auth_wire::ST_UNAVAILABLE,
+            &[],
+            is_read,
+        );
+        return;
+    }
+    s.kv_pending[slot] = KvPending {
+        live: true,
+        kv_corr,
+        corr,
+        client,
+        namespace: ns,
+        is_read,
+    };
+}
+
+/// Answer parked requests from the lattice's replies.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn drain_kv(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.backend != BACKEND_LATTICE || s.in_kv < 0 {
+        return;
+    }
+    while chan::can_read(sys, s.in_kv) {
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_kv, &mut s.kv_buf);
+        if msg_type == 0 {
+            break;
+        }
+        if msg_type != lattice_kv::MSG_KV_RESPONSE {
+            continue;
+        }
+        // kv_buf is both the response and the reply scratch below, so the
+        // decode borrows a copy of the fields it needs before reply() reuses
+        // the buffer.
+        let Some(resp) = lattice_kv::decode_response(&s.kv_buf[..plen as usize], 0) else {
+            continue;
+        };
+        let Some(slot) = s
+            .kv_pending
+            .iter()
+            .position(|p| p.live && p.kv_corr == resp.corr_id)
+        else {
+            continue;
+        };
+        let entry = s.kv_pending[slot];
+        s.kv_pending[slot] = KvPending::zero();
+
+        let status = lattice_kv::to_status(resp.result);
+        if entry.is_read {
+            if status != auth_wire::ST_OK {
+                if status == auth_wire::ST_CONFLICT {
+                    s.state_conflict = s.state_conflict.saturating_add(1);
+                }
+                reply(s, sys, entry.corr, entry.client, status, &[], true);
+                continue;
+            }
+            // Expiry lives inside the record; an expired record IS absent.
+            // The clock this needs is the replay-expiry decision's: absent
+            // a trustworthy clock, a record that carries an expiry cannot
+            // be served — refusing beats serving a spent grant forever.
+            let obs = dev_trusted_unix(sys);
+            let now = time_policy::now_for(time_policy::Decision::ReplayRecordExpiry, &obs);
+            let mut value_copy = [0u8; state_wire::MAX_VALUE];
+            let mut value_len = 0usize;
+            let mut expired_or_bad = false;
+            let mut needs_clock = false;
+            if resp.body.is_empty() {
+                expired_or_bad = true;
+            } else if let Some(now) = now {
+                match lattice_kv::Record::decode(resp.body, now) {
+                    Some(rec) if rec.value.len() <= value_copy.len() => {
+                        value_len = rec.value.len();
+                        value_copy[..value_len].copy_from_slice(rec.value);
+                    }
+                    _ => expired_or_bad = true,
+                }
+            } else if resp.body.len() >= lattice_kv::Record::HEAD && resp.body[..8] == [0u8; 8] {
+                // No expiry on the record: no clock needed.
+                let v = &resp.body[lattice_kv::Record::HEAD..];
+                if v.len() <= value_copy.len() {
+                    value_len = v.len();
+                    value_copy[..value_len].copy_from_slice(v);
+                } else {
+                    expired_or_bad = true;
+                }
+            } else {
+                needs_clock = true;
+            }
+            if needs_clock {
+                s.state_unavailable = s.state_unavailable.saturating_add(1);
+                reply(
+                    s,
+                    sys,
+                    entry.corr,
+                    entry.client,
+                    auth_wire::ST_UNAVAILABLE,
+                    &[],
+                    true,
+                );
+                continue;
+            }
+            if expired_or_bad {
+                reply(
+                    s,
+                    sys,
+                    entry.corr,
+                    entry.client,
+                    auth_wire::ST_NOT_FOUND,
+                    &[],
+                    true,
+                );
+                continue;
+            }
+            // A LINEARIZABLE read is served at the linearization point by
+            // construction — the read-floor question the object path asks
+            // of its fence does not arise on this lane.
+            let mut etag = [0u8; 16];
+            revision_etag(resp.revision, &mut etag);
+            let encoded = state_wire::encode_value(
+                &mut s.out_buf,
+                entry.corr,
+                entry.client,
+                auth_wire::ST_OK,
+                &etag,
+                &value_copy[..value_len],
+            );
+            if let Ok(len) = encoded {
+                write_out(s, sys, len);
+            }
+            continue;
+        }
+
+        // A write: the durability the lane achieved is checked against the
+        // namespace's floor, exactly as the object path checks its fence.
+        if status == auth_wire::ST_OK
+            && !state_wire::fence_satisfies(
+                entry.namespace,
+                resp.fence,
+                s.authority == AUTHORITY_REPLICATED,
+            )
+        {
+            s.state_unavailable = s.state_unavailable.saturating_add(1);
+            reply(
+                s,
+                sys,
+                entry.corr,
+                entry.client,
+                auth_wire::ST_UNAVAILABLE,
+                &[],
+                false,
+            );
+            continue;
+        }
+        if status == auth_wire::ST_CONFLICT {
+            s.state_conflict = s.state_conflict.saturating_add(1);
+        }
+        let mut etag = [0u8; 16];
+        revision_etag(resp.revision, &mut etag);
+        let etag_slice: &[u8] = if status == auth_wire::ST_OK {
+            &etag
+        } else {
+            &[]
+        };
+        reply(s, sys, entry.corr, entry.client, status, etag_slice, false);
+    }
+}
+
 unsafe fn reply(
     s: &mut ModuleState,
     sys: &SyscallTable,

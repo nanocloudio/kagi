@@ -404,6 +404,25 @@ const CODE_DIGITS: usize = 8;
 
 /// How many wrong codes a transaction tolerates before it is burned.
 const MAX_CODE_ATTEMPTS: u32 = 5;
+/// The key-announcement buffer, sized from the REGISTRY like every store
+/// that receives the announcement (`verify_keyset`, `wellknown`): the
+/// widest implemented public key plus the record's field overhead.
+///
+/// A literal here fails silently rather than loudly. A buffer too small
+/// for the key in use makes `rec.write` fail, the announcement never
+/// leave, and every verifier stay ignorant of a key the issuer is
+/// actively signing under — while the issuer itself reports nothing
+/// wrong. The assertion below is what makes that unrepresentable: naming
+/// a suite in the registry refuses to build until every buffer between
+/// the vault and the verifiers fits it.
+const ANNOUNCE_BUF: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KEY_LEN + 192;
+/// Mirrors the `key_announce` port's `max_record` in manifest.toml — the
+/// channel-side half of the same fit guarantee.
+const ANNOUNCE_MAX_RECORD: usize = 4096;
+const _: () = assert!(
+    ANNOUNCE_BUF <= ANNOUNCE_MAX_RECORD,
+    "a key announcement must fit the key_announce port's max_record"
+);
 
 /// Derive the key the code hash is taken under.
 ///
@@ -443,7 +462,7 @@ unsafe fn announce_public_key(
         remove_after_unix: 0,
         key_ref: s.key.public_key(),
     };
-    let mut payload = [0u8; 512];
+    let mut payload = [0u8; ANNOUNCE_BUF];
     let mut w = auth_wire::PayloadWriter::new(&mut payload);
     if rec.write(&mut w).is_err() {
         return;

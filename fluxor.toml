@@ -18,6 +18,10 @@ fluxor = "0.0.1"
 # not resolve — so every runtime e2e soft-skipped, and a gate that skips is
 # a gate that reports green over an untested graph.
 wave = "0.0.1"
+# lattice provides `lattice_data_client`, the compute-side half of the
+# ledger's replicated backend, reached when a graph declares
+# `security_state` with `backend: lattice`.
+lattice = "0.0.1"
 
 [ci]
 # Module targets to build in CI phase 3. `bcm2712` `.fmod` artefacts run
@@ -45,14 +49,14 @@ max_inline_lines = 80
 # Shadow-checkout hard-fail guard: tests/ and configs/ live in
 # .git-shadow/, so a primary-only checkout cannot run the test suite or
 # render the deployment graph templates. The guard fails CI instead.
-scripts = ["tools/ci-shadow-guard.sh", "tools/ci-e2e-required.sh"]
+scripts = ["tools/ci-shadow-guard.sh", "tools/ci-e2e-required.sh", "tools/ci-docs-coherence.sh"]
 
 [ci.templates]
 dir = "configs"
 # Defaults for the template-render gate (CI phase 1.5). Just enough to
 # make every template render without leftover `__KEY__` placeholders —
 # not production values.
-vars = { NODE_ID = "0", HTTP_PORT = "18080", WS_PORT = "19700", TOKEN_PORT = "18081", GATE_PORT = "18083", ENROL_PORT = "18084", TENANT_SEED = "render-only-not-a-secret", WELLKNOWN_PORT = "18085", CA_PEM = "render-only", E2EE_PORT = "18086", PKI_PORT = "18090", ISSUER_CN = "render-only", TRUST_DOMAIN = "render.invalid", ISSUER = "https://issuer.invalid", MAIL_FROM = "enrol@issuer.invalid", MAIL_HELO = "issuer.invalid", SMTP_ENDPOINT = "7f000001E11D", CONTROL_CERT = "render-only.pem", CONTROL_KEY = "render-only.key", CONTROL_TRUST = "render-only-ca.pem", CONTROL_SVID = "" }
+vars = { NODE_ID = "0", HTTP_PORT = "18080", WS_PORT = "19700", TOKEN_PORT = "18081", GATE_PORT = "18083", ENROL_PORT = "18084", TENANT_SEED = "render-only-not-a-secret", WELLKNOWN_PORT = "18085", CA_PEM = "render-only", E2EE_PORT = "18086", PKI_PORT = "18090", ISSUER_CN = "render-only", TRUST_DOMAIN = "render.invalid", ISSUER = "https://issuer.invalid", MAIL_FROM = "enrol@issuer.invalid", MAIL_HELO = "issuer.invalid", SMTP_ENDPOINT = "7f000001E11D", CONTROL_CERT = "render-only.pem", CONTROL_KEY = "render-only.key", CONTROL_TRUST = "render-only-ca.pem", CONTROL_SVID = "", CUSTODY_POSTURE = "development", LATTICE_PORT = "7501", LATTICE_PORT2 = "7502", LATTICE_PORT3 = "7503", LATTICE_EPOCH = "1" }
 
 [required]
 # Optional wire-ABI assertion (defence in depth). The authoritative

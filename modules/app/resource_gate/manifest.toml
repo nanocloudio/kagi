@@ -24,7 +24,32 @@ buffer_size = 8192
 name = "verify_key"
 direction = "input"
 content_type = "OctetStream"
-buffer_size = 512
+# Registry-sized ring: this lane carries MSG_KEY_ADD records whose
+# key_ref can be the widest implemented public key (ML-DSA-87, 2592
+# bytes), so a ring sized for the classical suites would carry the
+# classical announcements and drop the post-quantum ones. The wiring
+# validator refuses a max_record above the ring, which is what makes the
+# size a declared fact rather than a hope.
+buffer_size = 8192
+
+# The OPTIONAL durable replay lane to `security_state`. Wired, every
+# admitted proof is also claimed in the shared ledger before the 200 goes
+# out, so a proof spent at one gate instance is spent at all of them —
+# the "shared TTL state on servers" shape. Unwired, the process-local
+# window stands alone, and the graph file is where that scope was chosen.
+[[ports]]
+name = "state_requests"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[[ports]]
+name = "state_replies"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
 
 [observability]
 metrics = [
@@ -34,4 +59,6 @@ metrics = [
   "gate_bad_proof",
   "gate_not_bound",
   "gate_assurance",
+  "gate_replayed_ledger",
+  "gate_state_unavailable",
 ]

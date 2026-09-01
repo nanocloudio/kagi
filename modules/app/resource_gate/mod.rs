@@ -93,6 +93,8 @@ mod dpop;
 mod jose;
 #[path = "../../common/jwk.rs"]
 mod jwk;
+#[path = "../../common/state_wire.rs"]
+mod state_wire;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
 #[path = "../../common/verify_keyset.rs"]
@@ -132,6 +134,14 @@ const MAX_SEGMENT: usize = 1024;
 /// `PROOF_MAX_AGE_SECS` is refused by `check_proof` regardless, so an
 /// attacker cannot outrun the ring by waiting.
 const REPLAY_DEPTH: usize = 128;
+/// Ledger client id on the shared `security_state` reply fan-out. Unique
+/// across the modules that speak to one ledger (enrolment 1, e2ee-cred 2,
+/// wellknown 4, admission 6, authcode 7).
+const STATE_CLIENT: u8 = 8;
+/// Admissions parked on a durable replay claim at once. Small on purpose:
+/// the gate serves at most `MAX_REQS_PER_STEP` new requests a step, and a
+/// full table refuses (503) rather than queueing unboundedly.
+const MAX_PENDING_CLAIMS: usize = 8;
 /// WCET bound: requests admitted or refused per step. Each costs two
 /// signature verifications, which is the expensive part.
 const MAX_REQS_PER_STEP: usize = 2;
@@ -156,11 +166,48 @@ const POLICY: device_auth::Policy = device_auth::Policy {
 };
 
 #[repr(C)]
+/// One admission parked on the ledger's replay answer.
+#[derive(Clone, Copy)]
+struct PendingClaim {
+    live: bool,
+    conn: u16,
+    stream: u16,
+    subject: [u8; MAX_SUBJECT],
+    subject_len: u16,
+    state_corr: u32,
+}
+
+impl PendingClaim {
+    const fn zero() -> Self {
+        Self {
+            live: false,
+            conn: 0,
+            stream: 0,
+            subject: [0; MAX_SUBJECT],
+            subject_len: 0,
+            state_corr: 0,
+        }
+    }
+}
+
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_requests: i32,   // in[0]:  HttpRequest
     out_responses: i32, // out[0]: HttpResponse
     in_key: i32,        // in[1]:  MSG_KEY_ADD
+    /// out[1]/in[2]: the OPTIONAL durable replay lane to `security_state`.
+    ///
+    /// Wired, every admitted proof is also claimed in the shared ledger, so
+    /// a proof spent at one gate instance is spent at all of them — the
+    /// shared-TTL-state shape a replicated deployment needs.
+    /// Unwired (-1), the process-local window stands alone and the
+    /// deployment has DECLARED that scope by leaving the lane out: right
+    /// for a gate fronting one process's state, wrong for one fronting a
+    /// replicated backend, and visible either way in the graph file.
+    out_state: i32,
+    in_state: i32,
+    pending: [PendingClaim; MAX_PENDING_CLAIMS],
+    next_corr: u32,
 
     /// The issuer keyset. More than one key, indexed by the `kid` the
     /// presented token names — see `verify_keyset.rs`.
@@ -192,6 +239,8 @@ struct ModuleState {
     gate_bad_proof: u32,
     gate_not_bound: u32,
     gate_assurance: u32,
+    gate_replayed_ledger: u32,
+    gate_state_unavailable: u32,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -301,6 +350,10 @@ pub extern "C" fn module_new(
         s.in_requests = in_chan;
         s.out_responses = out_chan;
         s.in_key = dev_channel_port(sys, 0, 1);
+        s.out_state = dev_channel_port(sys, 1, 1);
+        s.in_state = dev_channel_port(sys, 0, 2);
+        s.pending = [PendingClaim::zero(); MAX_PENDING_CLAIMS];
+        s.next_corr = 1;
 
         s.keyset = verify_keyset::Keyset::new();
         s.replay = dpop::ReplayWindow::new();
@@ -310,6 +363,8 @@ pub extern "C" fn module_new(
         s.gate_bad_proof = 0;
         s.gate_not_bound = 0;
         s.gate_assurance = 0;
+        s.gate_replayed_ledger = 0;
+        s.gate_state_unavailable = 0;
 
         s.min_level = AssuranceLevel::Aal1;
         s.max_auth_age = 0;
@@ -343,7 +398,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Key updates first, so a same-step request uses the latest key.
         drain_key_material(s, sys);
 
-        let mut worked = false;
+        let mut worked = drain_claims(s, sys);
         for _ in 0..MAX_REQS_PER_STEP {
             if !chan::can_read(sys, s.in_requests) {
                 break;
@@ -412,14 +467,25 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
     let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
 
-    match admit(s, sys, plen) {
+    let mut proof_id = [0u8; 32];
+    match admit(s, sys, plen, &mut proof_id) {
         Ok(subject_len) => {
-            s.gate_admitted = s.gate_admitted.saturating_add(1);
             // `subject` lives in `s.out`'s tail, disjoint from the response
             // this writes into its head.
             let mut subject = [0u8; MAX_SUBJECT];
             subject[..subject_len].copy_from_slice(&s.out[..subject_len]);
-            respond(s, sys, conn, stream, 200, &subject[..subject_len]);
+            if s.out_state >= 0 {
+                // The durable lane is wired: the local window has answered,
+                // and the ledger answers for every process before anything
+                // is admitted. Fail closed — a claim that cannot be made is
+                // a proof whose freshness nothing established, and letting
+                // the ledger's absence admit would make losing the ledger a
+                // way to replay.
+                claim_and_pend(s, sys, conn, stream, &subject[..subject_len], &proof_id);
+            } else {
+                s.gate_admitted = s.gate_admitted.saturating_add(1);
+                respond(s, sys, conn, stream, 200, &subject[..subject_len]);
+            }
         }
         Err(refusal) => {
             match refusal {
@@ -442,7 +508,12 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 /// # Safety
 ///
 /// As `drain_key_material`.
-unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<usize, Refusal> {
+unsafe fn admit(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    plen: usize,
+    proof_id: &mut [u8; 32],
+) -> Result<usize, Refusal> {
     if s.keyset.is_empty() {
         return Err(Refusal::NoKey);
     }
@@ -513,10 +584,14 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) -> Result<
     // `false`; the counters below keep them apart for an operator,
     // since "somebody replayed a proof" and "the window is saturated"
     // are different problems.
-    let mut replay = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
-        dpop::Replay::Recorded => true,
-        dpop::Replay::Seen => false,
-        dpop::Replay::Full => false,
+    let mut replay = |jti: &[u8; 32]| {
+        // Kept for the durable claim, when the ledger lane is wired.
+        *proof_id = *jti;
+        match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+            dpop::Replay::Recorded => true,
+            dpop::Replay::Seen => false,
+            dpop::Replay::Full => false,
+        }
     };
     let authenticated = device_auth::authenticate(
         &VERIFIERS,
@@ -709,6 +784,139 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
 /// # Safety
 ///
 /// As `drain_key_material`.
+/// Send the durable replay claim and park the admission on its answer.
+///
+/// # Safety
+///
+/// As `drain_key_material`.
+unsafe fn claim_and_pend(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn: u16,
+    stream: u16,
+    subject: &[u8],
+    proof_id: &[u8; 32],
+) {
+    let Some(index) = s.pending.iter().position(|p| !p.live) else {
+        // Full is a refusal, not a queue: unbounded parked admissions is
+        // the eviction-under-load shape with extra steps.
+        s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        return;
+    };
+    // The proof's digest in the keyspace's alphabet — the digest, not the
+    // client's own `jti`, for admission's reason: a key built from the
+    // caller's bytes is a key the caller chooses.
+    let mut replay_key = [0u8; 43];
+    let Some(replay_key_len) = b64::encode(proof_id, &mut replay_key) else {
+        s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        return;
+    };
+    let obs = dev_trusted_unix(sys);
+    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
+        s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        return;
+    };
+
+    let state_corr = s.next_corr;
+    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    let request = state_wire::claim_replay(
+        state_corr,
+        STATE_CLIENT,
+        &replay_key[..replay_key_len],
+        now + PROOF_WINDOW_SECS,
+    );
+    let mut frame = [0u8; 512];
+    let sent = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)
+        .ok()
+        .and_then(|n| auth_wire::read_envelope(&frame[..n]).ok())
+        .is_some_and(|(wire_type, payload)| {
+            chan::channel_write_msg(sys, s.out_state, wire_type, payload) > 0
+        });
+    if !sent {
+        s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
+        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        return;
+    }
+
+    let mut entry = PendingClaim::zero();
+    entry.live = true;
+    entry.conn = conn;
+    entry.stream = stream;
+    let len = subject.len().min(MAX_SUBJECT);
+    entry.subject[..len].copy_from_slice(&subject[..len]);
+    #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_SUBJECT")]
+    {
+        entry.subject_len = len as u16;
+    }
+    entry.state_corr = state_corr;
+    s.pending[index] = entry;
+}
+
+/// Answer parked admissions from the ledger's replies.
+///
+/// # Safety
+///
+/// As `drain_key_material`.
+unsafe fn drain_claims(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    if s.in_state < 0 {
+        return false;
+    }
+    let mut worked = false;
+    while chan::can_read(sys, s.in_state) {
+        let mut buf = [0u8; 1024];
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_state, &mut buf);
+        if msg_type == 0 {
+            break;
+        }
+        let Ok(rep) = state_wire::StateReply::decode(msg_type, &buf[..plen as usize]) else {
+            continue;
+        };
+        // The ledger's reply port fans out to every consumer.
+        if rep.client != STATE_CLIENT {
+            continue;
+        }
+        let Some(index) = s
+            .pending
+            .iter()
+            .position(|p| p.live && p.state_corr == rep.correlation)
+        else {
+            continue;
+        };
+        let entry = s.pending[index];
+        s.pending[index] = PendingClaim::zero();
+        worked = true;
+        match state_wire::replay_claim_result(rep.status) {
+            state_wire::ReplayClaim::Fresh => {
+                s.gate_admitted = s.gate_admitted.saturating_add(1);
+                let subject = entry.subject;
+                respond(
+                    s,
+                    sys,
+                    entry.conn,
+                    entry.stream,
+                    200,
+                    &subject[..usize::from(entry.subject_len)],
+                );
+            }
+            state_wire::ReplayClaim::Replayed => {
+                // Spent at SOME gate sharing this ledger — this one or
+                // another replica. The local window said fresh; the shared
+                // state outranks it.
+                s.gate_replayed_ledger = s.gate_replayed_ledger.saturating_add(1);
+                respond(s, sys, entry.conn, entry.stream, 401, b"proof_replayed");
+            }
+            state_wire::ReplayClaim::Unavailable => {
+                s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
+                respond(s, sys, entry.conn, entry.stream, 503, b"state_unavailable");
+            }
+        }
+    }
+    worked
+}
+
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,

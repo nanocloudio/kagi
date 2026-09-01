@@ -1,0 +1,23 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Source"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The step-cost instrument. One credential operation per step, timed with
+# the monotonic microsecond clock, reported as a recurring beat — never a
+# one-shot line, which does not survive the UDP telemetry attach. The
+# numbers this module emits are what the tree's WCET constants are checked
+# against; `docs/performance/step-costs.md` is the table it fills.
+
+[[ports]]
+name = "tick_out"
+direction = "output"
+content_type = "OctetStream"
+# One byte per beat window, so the module has an output the scheduler can
+# see; the measurements travel on telemetry, not on this port.
+max_record = 16
+
+[observability]
+metrics = ["ops_done", "sign_failures", "verify_failures", "beats"]

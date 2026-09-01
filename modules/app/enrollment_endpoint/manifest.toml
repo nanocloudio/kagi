@@ -119,4 +119,7 @@ name = "key_announce"
 index = 4
 direction = "output"
 content_type = "OctetStream"
-max_record = 512
+# Registry-sized: the widest implemented public key (ML-DSA-87, 2592
+# bytes) plus record overhead. Mirrored by ANNOUNCE_MAX_RECORD in mod.rs,
+# whose compile-time assertion is what keeps the two from drifting.
+max_record = 4096

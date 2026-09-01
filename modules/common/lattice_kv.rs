@@ -44,21 +44,25 @@
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface"
 )]
 
-#[path = "auth_wire.rs"]
-mod auth_wire_mod;
-use auth_wire_mod as auth_wire;
-#[path = "state_wire.rs"]
-mod state_wire_mod;
-use state_wire_mod as state_wire;
+// Crate-sibling references, the same convention `state_wire.rs` itself
+// uses for `auth_wire`: every consumer (module or harness) mounts the
+// fragments as crate-level modules, and a self-`#[path]` mount here would
+// load the same file twice in any consumer that also mounts them.
+use crate::auth_wire;
+use crate::state_wire;
 
 /// Compute → `lattice_data_client`.
 pub const MSG_KV_REQUEST: u8 = 0xC0;
 /// `lattice_data_client` → compute.
 pub const MSG_KV_RESPONSE: u8 = 0xC1;
 
-/// Operations this backend uses. Deliberately four: a security ledger that
-/// reached for more of lattice's surface would be a ledger whose
-/// transitions were no longer single-key.
+/// Operations this backend uses. Three opcodes carrying four operations —
+/// `CAS` with witness `0` is create-if-absent — and deliberately no more:
+/// a security ledger reaching for more of lattice's surface would be one
+/// whose transitions are not a single key's compare-and-swap.
+///
+/// Values verified against lattice `modules/common/types.rs` (`KV_OP_GET`
+/// `0x01`, `KV_OP_DELETE` `0x03`, `KV_OP_CAS` `0x06`) on 2026-09-01.
 pub mod op {
     pub const GET: u8 = 0x01;
     pub const DELETE: u8 = 0x03;
@@ -66,7 +70,8 @@ pub mod op {
     pub const CAS: u8 = 0x06;
 }
 
-/// Result codes, mirroring lattice's `KV_RESULT_*`.
+/// Result codes, mirroring lattice's `KV_RESULT_*`. Verified against
+/// lattice `modules/common/types.rs:455-461` on 2026-09-01.
 pub mod result {
     pub const OK: u8 = 0x00;
     pub const NOT_FOUND: u8 = 0x01;
@@ -75,7 +80,8 @@ pub mod result {
     pub const UNAUTH: u8 = 0x06;
 }
 
-/// Consistency levels, mirroring lattice's `Consistency`.
+/// Consistency levels, mirroring lattice's `Consistency`
+/// (`db_context.rs:27-36`, verified 2026-09-01).
 pub mod consistency {
     /// The only level a security decision may read at.
     ///
@@ -86,8 +92,14 @@ pub mod consistency {
     pub const LINEARIZABLE: u8 = 0x01;
 }
 
-/// Durability classes, mirroring lattice's `Durability`. Ordered by
-/// strength.
+/// Durability classes, mirroring lattice's `Durability`
+/// (`db_context.rs:42-51`, verified 2026-09-01). Ordered by strength.
+///
+/// These are LATTICE's three classes and they are not the same vocabulary
+/// as `state_wire`'s fence tags — only `REPLICATED_DURABLE` names the same
+/// thing on both sides. `to_fence` below is the whole of the translation,
+/// and every statement about durability should say which vocabulary it is
+/// speaking.
 pub mod durability {
     /// Single-node acknowledgement. Survives nothing.
     pub const VOLATILE: u8 = 0x01;
@@ -115,7 +127,15 @@ pub mod durability {
     }
 }
 
+// Envelope layout, verified against lattice `modules/common/wire.rs` on
+// 2026-09-01: the request head at `:46-48`, `KvResponseHead::LEN` at
+// `:756`, and `KV_RESPONSE_FENCE_TAIL_LEN` at `:101`. The fence tail is
+// `[applied_index:u64][applied_term:u64][source_id:u32][durability:u8]
+// [catalog_generation:u64][commit_frontier:u64]`, which is what puts
+// `durability` at offset 20.
+
 /// Fixed part of a `MSG_KV_REQUEST` payload, before the op body.
+/// `[corr:8][proto:1][tenant:4][conn:1][consistency:1][op:1][body_len:2]`.
 pub const REQUEST_HEAD: usize = 8 + 1 + 4 + 1 + 1 + 1 + 2;
 /// Fixed part of a `MSG_KV_RESPONSE` payload, before the body.
 pub const RESPONSE_HEAD: usize = 8 + 1 + 1 + 8 + 2;
@@ -124,9 +144,23 @@ pub const RESPONSE_FENCE_TAIL: usize = 8 + 8 + 4 + 1 + 8 + 8;
 /// Offset of `durability` within the fence tail.
 pub const FENCE_DURABILITY_AT: usize = 8 + 8 + 4;
 
-/// Protocol of origin. `lattice_data_client` routes the response back on
-/// the port matching this, so it must be the internal one.
-pub const PROTO_INTERNAL_DATA: u8 = 0x05;
+/// Protocol of origin, mirroring lattice's `types::PROTO_INTERNAL_DATA`.
+///
+/// It was `0x05` here until 2026-09-01, which is lattice's
+/// `PROTO_INTERNAL_WATCH`. Nothing caught it because nothing runs this
+/// file: it is mounted by the host suites and by no application module,
+/// no config and no runtime graph.
+///
+/// Be precise about what the byte does, because the wrong version of that
+/// story is what let the wrong value look right. `lattice_data_anchor`
+/// stamps this field, and `kv_request_router` selects the reply port from
+/// it. `lattice_data_client` — the module kagi actually speaks to —
+/// parses the envelope's corr/tenant/conn/consistency/op/body_len and
+/// never reads byte 8 at all, so on kagi's path a wrong value is inert
+/// rather than a misroute. That makes this a correctness fix, not an
+/// outage fix: a constant that claims to mirror lattice's must, or the
+/// next reader takes it as evidence about lattice.
+pub const PROTO_INTERNAL_DATA: u8 = 0x09;
 
 /// A stored security record: kagi's value bytes with the expiry lattice
 /// cannot enforce.

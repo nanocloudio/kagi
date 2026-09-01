@@ -12,6 +12,10 @@
 
 #![no_std]
 #![allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the fluxor module ABI entry points: the runtime owns these pointers and their validity is the ABI's contract. Same allow the other PIC modules carry."
+)]
+#![allow(
     unused_imports,
     dead_code,
     reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
@@ -65,19 +69,35 @@ mod key_vault;
 
 use auth_wire::{MintClaimValue, MintRequest, PayloadWriter};
 
-/// This deployment's posture, for the key-custody floor.
-///
-/// `Development` today, and that is the honest setting: kagi's own e2e
-/// graphs run on a host with no HSM, and a production floor here would
-/// refuse every one of them. A production deployment flips this — in the
-/// same commit as wiring the vault that satisfies it, which is the point
-/// at which someone is thinking about custody rather than about getting a
-/// test to pass.
-///
-/// A constant rather than a parameter, because the permissive direction is
-/// silent: a production graph that left it at `Development` would issue
-/// under a software key and look exactly like one that had not.
-const KEY_CUSTODY_POSTURE: key_custody::Posture = key_custody::Posture::Development;
+// This deployment's posture, for the key-custody floor — a DECLARED graph
+// parameter whose absence refuses at construction (`define_params!` below,
+// applied in `module_new`).
+//
+// It was a hardcoded `Development` constant until 2026-09-01, with the
+// stated rationale that a parameter's permissive direction is silent: a
+// production graph that left it unset would issue under a software key and
+// look exactly like one that had chosen to. That rationale survives the
+// change, because the default here is neither posture — it is UNDECLARED,
+// and undeclared refuses. A graph says `posture: development` or
+// `posture: production`, or `token_mint` does not construct. The silent
+// path was never "development by default"; it is "no module at all".
+
+/// `posture` param values. `0` deliberately maps to no posture.
+const POSTURE_UNDECLARED: u8 = 0;
+const POSTURE_DEVELOPMENT: u8 = 1;
+const POSTURE_PRODUCTION: u8 = 2;
+
+define_params! {
+    ModuleState;
+
+    // The custody posture this deployment claims. Declared, never
+    // defaulted: `development` admits any answering vault (the floor is
+    // SOFTWARE), `production` requires the vault tier to meet
+    // `key_custody::required_tier` for the Issuer role (PROCESS_HW), and
+    // an undeclared posture refuses at construction.
+    1, posture, u8, 0, enum { undeclared=0, development=1, production=2 }
+        => |s, d, len| { s.posture = p_u8(d, len, 0, POSTURE_UNDECLARED); };
+}
 
 const MAX_KID_LEN: usize = 64;
 const MAX_ISSUER_LEN: usize = 64;
@@ -145,10 +165,15 @@ impl KeySlot {
     }
 }
 /// Compact JWS output cap; also bounds the `tokens` port max_record. Sized
-/// to hold a token carrying a realistic set of custom claims (W1/P1), not
-/// just the fixed reserved-claim set.
+/// to hold a token carrying a realistic set of custom claims, not just the
+/// fixed reserved-claim set.
 const TOKEN_BUF_LEN: usize = 4096;
-/// WCET bound: mint requests handled per step (one ECDSA sign each).
+/// WCET bound: mint requests handled per step, one vault SIGN each.
+///
+/// A count, not a duration, and what a sign costs depends on the suite —
+/// see `docs/performance/step-costs.md`. A graph whose issuer key is in a
+/// suite this budget does not fit declares a `step_deadline_us` for the
+/// module rather than leaving the guard to discover it.
 const MAX_REQS_PER_STEP: usize = 4;
 
 #[repr(C)]
@@ -169,6 +194,9 @@ struct ModuleState {
     /// `TIER_NONE`. What `C5` is actually checked against: `PROBE` says a
     /// backend exists, this says what it protects against.
     vault_tier: u8,
+    /// The declared custody posture (`POSTURE_*`), from the `posture`
+    /// param. `POSTURE_UNDECLARED` never survives `module_new`.
+    posture: u8,
     /// Scratch for the key_vault SIGN arg: header, message, and room for
     /// the widest signature an implemented suite produces.
     kv_arg: [u8; 4 + TOKEN_BUF_LEN + auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN],
@@ -198,8 +226,8 @@ pub extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -227,6 +255,7 @@ pub extern "C" fn module_new(
         s.out_key_announce = dev_channel_port(sys, 1, 1);
 
         s.keys = [KeySlot::empty(); MAX_KEYS];
+        parse_tlv(s, params, params_len);
         s.mint_ok = 0;
         s.mint_err = 0;
         s.no_key_errors = 0;
@@ -269,6 +298,24 @@ pub extern "C" fn module_new(
             }
         };
 
+        // The posture must be DECLARED. An undeclared posture is not
+        // development; it is a graph that has not said what it is, and the
+        // permissive reading of silence is exactly the failure the old
+        // hardcoded constant existed to prevent.
+        let posture = match s.posture {
+            POSTURE_DEVELOPMENT => key_custody::Posture::Development,
+            POSTURE_PRODUCTION => key_custody::Posture::Production,
+            _ => {
+                dev_log(
+                    sys,
+                    1,
+                    b"[mint] refusing to construct: posture undeclared (posture: development|production)".as_ptr(),
+                    87,
+                );
+                return -1;
+            }
+        };
+
         // The custody floor for the keys this module holds.
         //
         // Refused at CONSTRUCTION, not at the first mint. A module that
@@ -278,11 +325,7 @@ pub extern "C" fn module_new(
         // other direction: a deployment issuing under a software key
         // believes its issuer key is protected, and nothing downstream can
         // tell — the credentials verify either way.
-        if !key_custody::permits(
-            key_custody::KeyRole::Issuer,
-            KEY_CUSTODY_POSTURE,
-            s.vault_tier,
-        ) {
+        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, s.vault_tier) {
             let why = key_custody::refusal_text(s.vault_tier);
             dev_log(sys, 1, b"[mint] refusing to construct:".as_ptr(), 29);
             dev_log(sys, 1, why.as_ptr(), why.len());
@@ -574,6 +617,26 @@ unsafe fn open_slot_key(s: &mut ModuleState, sys: &SyscallTable, i: usize) -> bo
     true
 }
 
+/// The key-announcement buffer, sized from the REGISTRY like every store
+/// that receives the announcement (`verify_keyset`, `wellknown`): the
+/// widest implemented public key plus the record's field overhead.
+///
+/// A literal here fails silently rather than loudly. A buffer too small
+/// for the key in use makes `rec.write` fail, the announcement never
+/// leave, and every verifier stay ignorant of a key the issuer is
+/// actively signing under — while the issuer itself reports nothing
+/// wrong. The assertion below is what makes that unrepresentable: naming
+/// a suite in the registry refuses to build until every buffer between
+/// the vault and the verifiers fits it.
+const ANNOUNCE_BUF: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KEY_LEN + 192;
+/// Mirrors the `key_announce` port's `max_record` in manifest.toml — the
+/// channel-side half of the same fit guarantee.
+const ANNOUNCE_MAX_RECORD: usize = 4096;
+const _: () = assert!(
+    ANNOUNCE_BUF <= ANNOUNCE_MAX_RECORD,
+    "a key announcement must fit the key_announce port's max_record"
+);
+
 /// Emit the slot's public half as a VERIFY [`auth_wire::MSG_KEY_ADD`].
 ///
 /// **This edge exists because the operator cannot supply it.** Deriving the
@@ -605,7 +668,7 @@ unsafe fn announce_public_key(s: &mut ModuleState, sys: &SyscallTable, i: usize)
         remove_after_unix: s.keys[i].remove_after_unix,
         key_ref: s.keys[i].key.public_key(),
     };
-    let mut payload = [0u8; 512];
+    let mut payload = [0u8; ANNOUNCE_BUF];
     let mut w = auth_wire::PayloadWriter::new(&mut payload);
     if rec.write(&mut w).is_err() {
         return;

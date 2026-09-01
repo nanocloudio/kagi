@@ -136,10 +136,15 @@ secret store on Pi and in the browser, data-key wrapping, and the
 assurance, TOTP, passkey, device-set and recovery machinery described
 above.
 
-Design targets, not wired: OIDC discovery and `id_token` assembly, and
-the OAuth2 authorisation-code surface. The `Email` enrollment gate has no
-delivery backend in this repository, so `Direct` and `BootstrapToken` are
-the gates a deployment can use today.
+Built but deliberately unwired in the reference issuer graph: the OAuth2
+authorization-code surface (`authcode`, proved by `configs/e2e-authcode.yaml`)
+and OIDC discovery (`wellknown_endpoint` serves the document when a
+deployment declares its URLs; `configs/e2e-wellknown.yaml` proves it).
+`configs/issuer.yaml` wires neither, and says so in place — a deployment
+that adds `authcode` declares the four discovery URLs beside it. The
+`Email` enrollment gate is wired: `/start` submits through wave's SMTP
+connector (`smtp` in the issuer graph), and the enrolment code arrives by
+mail.
 
 `auth_wire` is DRAFT until its whole surface is promoted.
 

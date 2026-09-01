@@ -16,9 +16,9 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 16384
 # Envelope (3) + MINT_RESP header (corr 4 + status 1) + token f16 (2 +
-# compact JWS). The fixed reserved-claim set is ~800B, but W1/P1 lets a
-# request carry custom claims, so the token buffer is sized to 4096 and
-# max_record matches to admit a realistically claim-laden token.
+# compact JWS). The fixed reserved-claim set is ~800B, but a request may
+# carry custom claims on top of it, so the token buffer is sized to 4096
+# and max_record matches to admit a realistically claim-laden token.
 max_record = 4096
 
 [[ports]]
@@ -38,7 +38,10 @@ content_type = "OctetStream"
 name = "key_announce"
 direction = "output"
 content_type = "OctetStream"
-max_record = 512
+# Registry-sized: the widest implemented public key (ML-DSA-87, 2592
+# bytes) plus record overhead. Mirrored by ANNOUNCE_MAX_RECORD in mod.rs,
+# whose compile-time assertion is what keeps the two from drifting.
+max_record = 4096
 
 [observability]
 metrics = ["mint_ok", "mint_err", "no_key_errors", "sign_ops"]

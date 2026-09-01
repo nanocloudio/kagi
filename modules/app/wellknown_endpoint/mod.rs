@@ -205,10 +205,25 @@ const MAX_REVOCATIONS_PER_STEP: usize = 16;
 const MAX_ID: usize = 128;
 
 /// One published key.
+///
+/// `profile_id` is stored because the SLOT MATCH is by `(profile, kid)`
+/// and not by kid alone. A kid is unique within a profile and nothing
+/// makes it unique across them — the mint and the enrolment endpoint
+/// announce under separate profiles, and a deployment whose key records
+/// reuse a kid between them is well-formed. Matching on kid alone would
+/// let the second announcement REPLACE the first in the published set,
+/// and the failure is silent from inside: every access token stops
+/// verifying for a relying party trusting the JWKS, while `resource_gate`
+/// keeps admitting from its direct edge.
+///
+/// Publishing both is correct as well as safe. A JWKS entry does not
+/// expose the profile, two entries sharing a kid is RFC 7517-legal, and a
+/// relying party disambiguates by trying its kid's candidates.
 #[derive(Clone, Copy)]
 struct PublishedKey {
     kid: [u8; MAX_KID],
     kid_len: u8,
+    profile_id: u16,
     pubkey: [u8; MAX_PUBKEY_LEN],
     /// A `u16`: an ML-DSA-87 key is 2592 bytes, and a `u8` would keep
     /// only its low byte of length, which reads as a short key rather
@@ -224,6 +239,7 @@ impl PublishedKey {
         Self {
             kid: [0; MAX_KID],
             kid_len: 0,
+            profile_id: 0,
             pubkey: [0; MAX_PUBKEY_LEN],
             pubkey_len: 0,
             suite: 0,
@@ -495,11 +511,14 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
             },
             auth_wire::MSG_KEY_REMOVE => {
                 if let Ok(kr) = auth_wire::KeyRef::decode(payload) {
-                    if let Some(i) = s
-                        .keys
-                        .iter()
-                        .position(|k| k.live && &k.kid[..usize::from(k.kid_len)] == kr.kid)
-                    {
+                    // Same match as the add path: (profile, kid), so a
+                    // remove can never take down another profile's key
+                    // that merely shares the kid.
+                    if let Some(i) = s.keys.iter().position(|k| {
+                        k.live
+                            && k.profile_id == kr.profile_id
+                            && &k.kid[..usize::from(k.kid_len)] == kr.kid
+                    }) {
                         s.keys[i] = PublishedKey::empty();
                     }
                 }
@@ -538,11 +557,9 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
 
-        let slot = match s
-            .keys
-            .iter()
-            .position(|k| k.live && &k.kid[..usize::from(k.kid_len)] == kid)
-        {
+        let slot = match s.keys.iter().position(|k| {
+            k.live && k.profile_id == rec.profile_id && &k.kid[..usize::from(k.kid_len)] == kid
+        }) {
             Some(existing) => existing,
             None => {
                 let free = s.keys.iter().position(|k| !k.live);
@@ -555,6 +572,7 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
         };
 
         let mut key = PublishedKey::empty();
+        key.profile_id = rec.profile_id;
         key.kid[..kid.len()].copy_from_slice(kid);
         key.pubkey[..pubkey.len()].copy_from_slice(pubkey);
         #[expect(
@@ -593,6 +611,7 @@ fn fill_published(slot: &mut PublishedKey, rec: &auth_wire::KeyRecord<'_>) -> bo
         slot.pubkey_len = rec.key_ref.len() as u16;
     }
     slot.suite = rec.suite;
+    slot.profile_id = rec.profile_id;
     slot.live = true;
     true
 }
