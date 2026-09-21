@@ -56,7 +56,7 @@ dir = "configs"
 # Defaults for the template-render gate (CI phase 1.5). Just enough to
 # make every template render without leftover `__KEY__` placeholders —
 # not production values.
-vars = { NODE_ID = "0", HTTP_PORT = "18080", WS_PORT = "19700", TOKEN_PORT = "18081", GATE_PORT = "18083", ENROL_PORT = "18084", TENANT_SEED = "render-only-not-a-secret", WELLKNOWN_PORT = "18085", CA_PEM = "render-only", E2EE_PORT = "18086", PKI_PORT = "18090", ISSUER_CN = "render-only", TRUST_DOMAIN = "render.invalid", ISSUER = "https://issuer.invalid", MAIL_FROM = "enrol@issuer.invalid", MAIL_HELO = "issuer.invalid", SMTP_ENDPOINT = "7f000001E11D", CONTROL_CERT = "render-only.pem", CONTROL_KEY = "render-only.key", CONTROL_TRUST = "render-only-ca.pem", CONTROL_SVID = "", CUSTODY_POSTURE = "development", LATTICE_PORT = "7501", LATTICE_PORT2 = "7502", LATTICE_PORT3 = "7503", LATTICE_EPOCH = "1" }
+vars = { NODE_ID = "0", HTTP_PORT = "18080", WS_PORT = "19700", TOKEN_PORT = "18081", GATE_PORT = "18083", ENROL_PORT = "18084", TENANT_SEED = "render-only-not-a-secret", WELLKNOWN_PORT = "18085", CA_PEM = "render-only", E2EE_PORT = "18086", PKI_PORT = "18090", ISSUER_CN = "render-only", TRUST_DOMAIN = "render.invalid", ISSUER = "https://issuer.invalid", MAIL_FROM = "enrol@issuer.invalid", MAIL_HELO = "issuer.invalid", SMTP_AUTHORITY = "127.0.0.1:7649", CONTROL_CERT = "render-only.pem", CONTROL_KEY = "render-only.key", CONTROL_TRUST = "render-only-ca.pem", CONTROL_SVID = "", CUSTODY_POSTURE = "development", LATTICE_PORT = "7501", LATTICE_PORT2 = "7502", LATTICE_PORT3 = "7503", LATTICE_EPOCH = "1" }
 
 [required]
 # Optional wire-ABI assertion (defence in depth). The authoritative

@@ -73,7 +73,7 @@ module:
 - Encoding DER; key PKCS#8 or SEC1 DER.
 - `subjectAltName = URI:spiffe://<td>/<class>/<path>` — the SVID SAN.
 - CA-signed by the kagi issuing CA; relying parties trust that CA
-  (`trust_cert_file` / `ca_pubkey`).
+  (`trust` / `ca_pubkey`).
 
 **The issuing CA must be P-256 / ECDSA-SHA256.** fluxor's `tls` module
 validates the leaf with `ecdsa_verify(ca_pubkey, tbs_hash, sig)` against the

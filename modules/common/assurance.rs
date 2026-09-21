@@ -146,15 +146,41 @@ impl AuthMethod {
     /// matches no method".
     #[must_use]
     pub fn parse_bytes(text: &[u8]) -> Option<Self> {
-        let mut i = 0usize;
-        while i < Self::ALL.len() {
-            let method = Self::ALL[i];
-            if method.as_str().as_bytes() == text {
-                return Some(method);
-            }
-            i += 1;
+        // Spelled out per arm, never as a walk over `ALL` comparing
+        // `as_str()`.
+        //
+        // The walk reads better and compiles to a pair of lookup tables —
+        // one of lengths, one of `&'static str` POINTERS. A pointer table
+        // is a table of addresses, and a position-independent module has
+        // nothing that relocates it: the first byte read through one
+        // faults, inside whatever inlined this rather than here. `jose.rs`
+        // spells its reserved keys out one by one for the same reason.
+        //
+        // `every_method_parses_its_own_name` in the host suite is what
+        // keeps this list and `as_str` from drifting apart.
+        if text == b"email" {
+            Some(Self::Email)
+        } else if text == b"bootstrap" {
+            Some(Self::Bootstrap)
+        } else if text == b"pop" {
+            Some(Self::Pop)
+        } else if text == b"swk" {
+            Some(Self::Swk)
+        } else if text == b"hwk" {
+            Some(Self::Hwk)
+        } else if text == b"otp" {
+            Some(Self::Otp)
+        } else if text == b"user" {
+            Some(Self::User)
+        } else if text == b"webauthn" {
+            Some(Self::Webauthn)
+        } else if text == b"recovery" {
+            Some(Self::Recovery)
+        } else if text == b"mfa" {
+            Some(Self::Mfa)
+        } else {
+            None
         }
-        None
     }
 
     /// Parse an `amr` entry. Unknown values return `None` and are dropped
@@ -253,11 +279,15 @@ impl AssuranceLevel {
     /// question with no better answer than "it names no level".
     #[must_use]
     pub fn parse_bytes(text: &[u8]) -> Option<Self> {
-        match text {
-            b"aal1" => Some(Self::Aal1),
-            b"aal2" => Some(Self::Aal2),
-            b"aal3" => Some(Self::Aal3),
-            _ => None,
+        // Per-arm comparisons, as `AuthMethod::parse_bytes` explains.
+        if text == b"aal1" {
+            Some(Self::Aal1)
+        } else if text == b"aal2" {
+            Some(Self::Aal2)
+        } else if text == b"aal3" {
+            Some(Self::Aal3)
+        } else {
+            None
         }
     }
 

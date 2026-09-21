@@ -41,7 +41,7 @@ The control listener also needs `__CONTROL_CERT__`, `__CONTROL_KEY__`,
 `__CONTROL_TRUST__` and `__CONTROL_SVID__` — the issuer's own certificate
 and key, the trust anchor operator certificates are checked against, and the
 allowlisted operator identity. The enrolment mail path needs
-`__SMTP_ENDPOINT__`, `__MAIL_FROM__` and `__MAIL_HELO__`.
+`__SMTP_AUTHORITY__`, `__MAIL_FROM__` and `__MAIL_HELO__`.
 
 `__TENANT_SEED__` is the HKDF input behind every tenant identifier; changing
 it later changes every tenant id the deployment has ever issued. `__ISSUER__`
