@@ -45,6 +45,30 @@ forbid_inline_tests = ["modules"]
 mode = "strict"
 max_inline_lines = 80
 
+# Crate-root `#![allow(...)]` is otherwise refused, because it suppresses a
+# lint for everything in the file including code written later. These two
+# prefixes are the case where there is no item to move the attribute onto,
+# because the code the lint fires about is not in the file.
+#
+# Every module here is a MOUNT POINT. A PIC module `include!`s the whole
+# fluxor SDK and a `#[path]` fragment is compiled into several modules at
+# once; each compilation therefore sees a surface larger than it uses, and
+# the unused half is a different half every time. `#[expect]` cannot express
+# that — it is an error wherever the lint does not fire, which for a shared
+# fragment is most of its consumers.
+#
+# This is scoped as tightly as a path prefix can be. Nothing under it is a
+# suppression whose cause is local: the ABI entry points that dereference
+# runtime-owned pointers carry `#[expect(clippy::not_unsafe_ptr_arg_deref)]`
+# on the function itself.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """PIC modules mount the SDK wholesale via include! and the common fragments by #[path], so each compile sees the entire surface and uses a subset."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/harness/tests/support/"
+reason = """Each e2e suite mounts this support module by #[path] and drives only the part of the graph it tests, so every compile leaves a different part unused."""
+
 [ci.test]
 # Shadow-checkout hard-fail guard: tests/ and configs/ live in
 # .git-shadow/, so a primary-only checkout cannot run the test suite or

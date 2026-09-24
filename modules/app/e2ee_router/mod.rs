@@ -25,13 +25,6 @@
     dead_code,
     reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "the fluxor module ABI entry points (module_init/module_new/module_step): the \
-              runtime owns these pointers and their validity is the ABI's contract, and the \
-              signature is fixed by that contract rather than chosen here. The same allow \
-              wave's and lattice's PIC modules carry."
-)]
 
 use core::ffi::c_void;
 

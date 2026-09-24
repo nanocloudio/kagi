@@ -32,10 +32,6 @@
     dead_code,
     reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
-#![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "the fluxor module ABI entry points: the runtime owns these pointers and their validity is the ABI's contract. Same allow the other PIC modules carry."
-)]
 
 use core::ffi::c_void;
 
@@ -278,6 +274,14 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// The module ABI's constructor. The runtime owns every pointer here and
+/// their validity is the contract; the signature is fixed by that contract
+/// rather than chosen, so the fn cannot be marked `unsafe`.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "fluxor module ABI entry point: the runtime owns these pointers \
+              and the signature is fixed by the contract"
+)]
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(

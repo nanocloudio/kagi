@@ -45,10 +45,6 @@
 
 #![no_std]
 #![allow(
-    clippy::not_unsafe_ptr_arg_deref,
-    reason = "the fluxor module ABI entry points: the runtime owns these pointers and their validity is the ABI's contract. Same allow the other PIC modules carry."
-)]
-#![allow(
     unused_imports,
     dead_code,
     reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
@@ -368,6 +364,11 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "fluxor module ABI entry point: the runtime owns these pointers \
+              and the signature is fixed by the contract"
+)]
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
