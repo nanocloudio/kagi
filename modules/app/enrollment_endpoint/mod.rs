@@ -795,24 +795,55 @@ impl Refusal {
     /// client debugging its own integration cannot make progress otherwise,
     /// and neither reveals anything an attacker did not already supply: both
     /// are statements about material the caller itself sent.
-    const fn body(self) -> &'static [u8] {
+    /// The body a refusal answers with, out of [`REFUSAL_BODIES`].
+    ///
+    /// An index rather than the bytes: a `match` RETURNING literals lowers
+    /// to a switch table of absolute pointers, and a module is placed at a
+    /// load address with nothing relocating it, so every one of those
+    /// pointers reads somewhere wrong. A match returning integers carries
+    /// no address at all. `fluxor modules build --strict` refuses the
+    /// former, which is how this was found rather than by a fault.
+    const fn body_index(self) -> usize {
         match self {
-            Self::NoKey => br#"{"error":"temporarily_unavailable"}"#,
-            Self::NoEntropy => br#"{"error":"server_error","detail":"entropy"}"#,
-            Self::Malformed => br#"{"error":"invalid_request"}"#,
-            Self::BadChallenge => br#"{"error":"invalid_grant","detail":"challenge"}"#,
-            Self::PkceMismatch => br#"{"error":"invalid_grant","detail":"pkce"}"#,
-            Self::BadPossession => br#"{"error":"invalid_grant","detail":"possession"}"#,
-            Self::Unauthenticated => br#"{"error":"invalid_client"}"#,
-            Self::AlreadyRegistered => br#"{"error":"conflict","detail":"authenticator_exists"}"#,
-            Self::NoAuthenticator => br#"{"error":"not_found","detail":"no_authenticator"}"#,
-            // Deliberately the same shape as a bad possession proof: a code
-            // that did not match and a code already used are the same answer
-            // to whoever is guessing.
-            Self::BadCode => br#"{"error":"invalid_grant","detail":"code"}"#,
+            Self::NoKey => 0,
+            Self::NoEntropy => 1,
+            Self::Malformed => 2,
+            Self::BadChallenge => 3,
+            Self::PkceMismatch => 4,
+            Self::BadPossession => 5,
+            Self::Unauthenticated => 6,
+            Self::AlreadyRegistered => 7,
+            Self::NoAuthenticator => 8,
+            Self::BadCode => 9,
         }
     }
+
+    fn body(self) -> &'static [u8] {
+        REFUSAL_BODIES.get(self.body_index())
+    }
 }
+
+// The refusal bodies, held as one run of bytes with integer ends so the
+// only address in play is the table's own, computed PC-relative. Order is
+// `Refusal::body_index`'s and the two move together.
+//
+// `BadCode` is deliberately the same shape as `BadPossession`: a code that
+// did not match and a code already used are the same answer to whoever is
+// guessing.
+name_table!(
+    REFUSAL_BODIES = [
+        br#"{"error":"temporarily_unavailable"}"#,
+        br#"{"error":"server_error","detail":"entropy"}"#,
+        br#"{"error":"invalid_request"}"#,
+        br#"{"error":"invalid_grant","detail":"challenge"}"#,
+        br#"{"error":"invalid_grant","detail":"pkce"}"#,
+        br#"{"error":"invalid_grant","detail":"possession"}"#,
+        br#"{"error":"invalid_client"}"#,
+        br#"{"error":"conflict","detail":"authenticator_exists"}"#,
+        br#"{"error":"not_found","detail":"no_authenticator"}"#,
+        br#"{"error":"invalid_grant","detail":"code"}"#,
+    ]
+);
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]

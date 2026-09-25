@@ -118,6 +118,22 @@ struct ModuleState {
     issuer_cn_len: u16,
     trust_domain: [u8; MAX_FIELD],
     trust_domain_len: u16,
+    /// The one DNS suffix this authority may put in a certificate
+    /// (`.svc.cluster.local`). A graph parameter: a caller that chose its own
+    /// DNS names from an open endpoint could get a certificate for a name it
+    /// has no claim to. Unset = no DNS names at all.
+    dns_suffix: [u8; MAX_FIELD],
+    dns_suffix_len: u16,
+    /// The vault label of the CA key, when the GRAPH names it rather than an
+    /// operator pushing a keyset record on `signing_key`. A label is not a
+    /// secret — it names a key the vault generates and never exports — so it
+    /// can be configuration, and a deployment whose trust root is one vault
+    /// key needs no control channel to bring its authority up. Opened on the
+    /// first step; unset = wait for `signing_key`, as before.
+    key_label: [u8; auth_wire::MAX_KEY_LABEL],
+    key_label_len: u8,
+    /// `auth_wire::suite` the labelled key is opened under.
+    label_suite: u16,
 
     /// Serial numbers, monotonic. Two certificates from one CA sharing a
     /// serial is what makes revocation ambiguous.
@@ -145,6 +161,36 @@ define_params! {
         {
             s.issuer_cn_len = n as u16;
         }
+    };
+
+    3, dns_suffix, str, 0 => |s, d, len| {
+        let n = if len > MAX_FIELD { MAX_FIELD } else { len };
+        let mut i = 0usize;
+        while i < n {
+            s.dns_suffix[i] = *d.add(i);
+            i += 1;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "clamped to MAX_FIELD above")]
+        {
+            s.dns_suffix_len = n as u16;
+        }
+    };
+
+    4, key_label, str, 0 => |s, d, len| {
+        let n = if len > auth_wire::MAX_KEY_LABEL { 0 } else { len };
+        let mut i = 0usize;
+        while i < n {
+            s.key_label[i] = *d.add(i);
+            i += 1;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_KEY_LABEL above")]
+        {
+            s.key_label_len = n as u8;
+        }
+    };
+
+    5, key_suite, u16, 1 => |s, d, len| {
+        s.label_suite = p_u16(d, len, 0, auth_wire::suite::ES256);
     };
 
     2, trust_domain, str, 0 => |s, d, len| {
@@ -211,6 +257,11 @@ pub extern "C" fn module_new(
         s.issuer_cn_len = 0;
         s.trust_domain = [0; MAX_FIELD];
         s.trust_domain_len = 0;
+        s.dns_suffix = [0; MAX_FIELD];
+        s.dns_suffix_len = 0;
+        s.key_label = [0; auth_wire::MAX_KEY_LABEL];
+        s.key_label_len = 0;
+        s.label_suite = auth_wire::suite::ES256;
         s.next_serial = 1;
         s.certificate_issued = 0;
         s.certificate_no_key = 0;
@@ -231,6 +282,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
+        open_labelled_key(s, sys);
         drain_key(s, sys);
 
         let mut worked = false;
@@ -252,6 +304,41 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             0
         }
     }
+}
+
+/// Open the graph-named CA key, once. A label that does not open (no vault,
+/// an unimplemented suite) is logged and cleared rather than retried every
+/// step: the endpoint then answers 503 until a `signing_key` record arrives.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a live syscall table.
+unsafe fn open_labelled_key(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.key_label_len == 0 {
+        return;
+    }
+    let n = usize::from(s.key_label_len);
+    s.key_label_len = 0;
+    let mut label = [0u8; auth_wire::MAX_KEY_LABEL];
+    label[..n].copy_from_slice(&s.key_label[..n]);
+    if !auth_wire::suite::is_implemented(s.label_suite)
+        || !s.key.open(sys, s.label_suite, &label[..n])
+    {
+        let m = b"[pki] key_label did not open";
+        dev_log(sys, 1, m.as_ptr(), m.len());
+        return;
+    }
+    s.key_suite = s.label_suite;
+    let mut issuer = [0u8; MAX_FIELD];
+    let il = usize::from(s.issuer_cn_len);
+    issuer[..il].copy_from_slice(&s.issuer_cn[..il]);
+    announce_public_key(
+        s,
+        sys,
+        &issuer[..il.min(255)],
+        b"ca",
+        auth_wire::suite::profile::DEVICE_CERTIFICATE,
+    );
 }
 
 /// # Safety
@@ -386,8 +473,10 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let mut device = [0u8; MAX_FIELD];
     let mut ed25519_key = [0u8; 32];
     let mut p256_point = [0u8; 65];
-    let (subject_len, tenant_len, device_len, key_bytes) = {
+    let mut dns = [0u8; MAX_DNS];
+    let (subject_len, tenant_len, device_len, key_bytes, dns_len) = {
         let body = &s.buf[body_at..body_end];
+        let dns_len = json_string(body, b"dns", &mut dns);
         let subject_len = json_string(body, b"subject", &mut subject);
         let tenant_len = json_string(body, b"tenant", &mut tenant);
         let device_len = json_string(body, b"device", &mut device);
@@ -408,8 +497,29 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             65 => p256_point.copy_from_slice(&scratch),
             _ => {}
         }
-        (subject_len, tenant_len, device_len, key_bytes)
+        (subject_len, tenant_len, device_len, key_bytes, dns_len)
     };
+    // DNS names, when asked for: each must be a plain hostname ending in the
+    // configured suffix. One name outside it refuses the whole request —
+    // issuing the rest would be a certificate the caller did not ask for.
+    if dns_len > 0
+        && !dns_names_allowed(
+            &dns[..dns_len],
+            &s.dns_suffix[..usize::from(s.dns_suffix_len)],
+        )
+    {
+        s.certificate_malformed = s.certificate_malformed.saturating_add(1);
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            400,
+            b"application/json",
+            br#"{"error":"invalid_request","error_description":"dns name not allowed"}"#,
+        );
+        return;
+    }
     let subject_key = match key_bytes {
         32 => der::SubjectKey::Ed25519(&ed25519_key),
         // An uncompressed point starts 0x04; a compressed one would need the
@@ -501,6 +611,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             now,
             now + CERTIFICATE_TTL_SECS,
             &san[..san_len],
+            &dns[..dns_len],
         )
         .is_err()
         {
@@ -551,10 +662,44 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         );
         return;
     };
-    let mut body = [0u8; MAX_DER * 2 + 128];
+    // The chain the leaf verifies against, in the same answer: a caller that
+    // must fetch the root separately is a caller whose root and leaf can come
+    // from two different moments of this authority (as ACME answers with the
+    // chain). The CA certificate is re-sealed per answer, so its window runs
+    // from now like `GET /pki/ca`'s does.
+    let mut ca_der = [0u8; MAX_DER];
+    let ca_len = ca_public_key(s).and_then(|public| ca_certificate(s, &public, now, &mut ca_der));
+    let Some(ca_len) = ca_len else {
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            500,
+            b"application/json",
+            br#"{"error":"server_error"}"#,
+        );
+        return;
+    };
+    let mut ca_b64 = [0u8; MAX_DER * 2];
+    let Some(ca_b64_len) = b64::encode(&ca_der[..ca_len], &mut ca_b64) else {
+        respond(
+            s,
+            sys,
+            conn,
+            stream,
+            500,
+            b"application/json",
+            br#"{"error":"server_error"}"#,
+        );
+        return;
+    };
+    let mut body = [0u8; MAX_DER * 4 + 160];
     let mut at = 0usize;
     let _ = put(&mut body, &mut at, br#"{"certificate":""#);
     let _ = put(&mut body, &mut at, &encoded[..encoded_len]);
+    let _ = put(&mut body, &mut at, br#"","ca":""#);
+    let _ = put(&mut body, &mut at, &ca_b64[..ca_b64_len]);
     let _ = put(&mut body, &mut at, br#"","spiffe_id":""#);
     let _ = put(&mut body, &mut at, &san[..san_len]);
     let _ = put(&mut body, &mut at, b"\"}");
@@ -599,6 +744,37 @@ fn seal(s: &mut ModuleState, tbs: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// The authority's own certificate: self-signed, and a CA.
 ///
+/// The authority's self-signed certificate, DER, into `out`. Issuer and
+/// subject are the same name: that is what self-signed means, and a verifier
+/// reads the pair to decide it is a root.
+fn ca_certificate(
+    s: &mut ModuleState,
+    public: &CaPublicKey,
+    now: u64,
+    out: &mut [u8],
+) -> Option<usize> {
+    let cn_len = usize::from(s.issuer_cn_len);
+    let mut tbs = [0u8; MAX_DER];
+    let tbs_len = {
+        let mut w = der::Writer::new(&mut tbs);
+        let subject_key = match public {
+            CaPublicKey::Ed25519(key) => der::SubjectKey::Ed25519(key),
+            CaPublicKey::P256(point) => der::SubjectKey::P256(point),
+        };
+        w.ca_certificate(
+            &1u64.to_be_bytes(),
+            &s.issuer_cn[..cn_len],
+            subject_key,
+            algorithm(s.key_suite),
+            now,
+            now + CA_TTL_SECS,
+        )
+        .ok()?;
+        w.len()
+    };
+    seal(s, &tbs[..tbs_len], out)
+}
+
 /// # Safety
 ///
 /// As `drain_key`.
@@ -645,43 +821,8 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
         );
         return;
     };
-    let cn_len = usize::from(s.issuer_cn_len);
-
-    let mut tbs = [0u8; MAX_DER];
-    let tbs_len = {
-        let mut w = der::Writer::new(&mut tbs);
-        let subject_key = match &public {
-            CaPublicKey::Ed25519(key) => der::SubjectKey::Ed25519(key),
-            CaPublicKey::P256(point) => der::SubjectKey::P256(point),
-        };
-        // Issuer and subject are the same name: that is what self-signed
-        // means, and a verifier reads the pair to decide it is a root.
-        if w.ca_certificate(
-            &1u64.to_be_bytes(),
-            &s.issuer_cn[..cn_len],
-            subject_key,
-            algorithm(s.key_suite),
-            now,
-            now + CA_TTL_SECS,
-        )
-        .is_err()
-        {
-            respond(
-                s,
-                sys,
-                conn,
-                stream,
-                500,
-                b"application/json",
-                br#"{"error":"server_error"}"#,
-            );
-            return;
-        }
-        w.len()
-    };
-
     let mut certificate = [0u8; MAX_DER];
-    let Some(cert_len) = seal(s, &tbs[..tbs_len], &mut certificate) else {
+    let Some(cert_len) = ca_certificate(s, &public, now, &mut certificate) else {
         respond(
             s,
             sys,
@@ -841,6 +982,25 @@ fn write_pem(der_bytes: &[u8], out: &mut [u8]) -> Option<usize> {
     }
     put(out, &mut at, b"-----END CERTIFICATE-----\n")?;
     Some(at)
+}
+
+/// Longest `dns` list (comma-separated names) a request may carry.
+const MAX_DNS: usize = 512;
+
+/// Every comma-separated name is `[a-z0-9-.]`, at most 253 bytes, and ends in
+/// `suffix` (which must be set).
+fn dns_names_allowed(list: &[u8], suffix: &[u8]) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    list.split(|&b| b == b',').all(|n| {
+        !n.is_empty()
+            && n.len() <= 253
+            && n.len() > suffix.len()
+            && n.ends_with(suffix)
+            && n.iter()
+                .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
+    })
 }
 
 fn json_string(body: &[u8], key: &[u8], out: &mut [u8]) -> usize {

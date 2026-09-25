@@ -40,6 +40,8 @@ const TAG_CONTEXT_0: u8 = 0xA0;
 const TAG_CONTEXT_3: u8 = 0xA3;
 /// `[6]` primitive — `uniformResourceIdentifier` in a `GeneralName`.
 const TAG_URI: u8 = 0x86;
+/// `GeneralName` dNSName: context-specific primitive [2], an IA5String.
+const TAG_DNS: u8 = 0x82;
 
 /// `id-Ed25519` (1.3.101.112), used as both the signature and the key
 /// algorithm. RFC 8410 says an Ed25519 `AlgorithmIdentifier` carries no
@@ -391,7 +393,9 @@ impl<'a> Writer<'a> {
     /// authorize on the SAN URI, not on the subject `CN`, and putting the
     /// identity only in the `CN` is how a certificate ends up authorizing
     /// nothing.
-    pub fn leaf_extensions(&mut self, san_uri: &[u8]) -> Result<(), DerError> {
+    /// `dns_names` is a comma-separated list of dNSName entries added to the
+    /// subjectAltName beside the URI; empty adds none.
+    pub fn leaf_extensions(&mut self, san_uri: &[u8], dns_names: &[u8]) -> Result<(), DerError> {
         self.constructed(TAG_CONTEXT_3, |explicit| {
             explicit.constructed(TAG_SEQUENCE, |extensions| {
                 // basicConstraints: cA FALSE, critical. A leaf that did not
@@ -434,19 +438,30 @@ impl<'a> Writer<'a> {
                     ext.primitive(TAG_OCTET_STRING, &value[..len])
                 })?;
 
-                if san_uri.is_empty() {
+                if san_uri.is_empty() && dns_names.is_empty() {
                     return Ok(());
                 }
-                // subjectAltName: one URI. Critical, because the subject is
-                // empty — RFC 5280 requires it then, and a verifier that
-                // enforces that would otherwise refuse the certificate.
+                // subjectAltName: the URI, then any dNSNames. Critical, because
+                // the subject is empty — RFC 5280 requires it then, and a
+                // verifier that enforces that would otherwise refuse the
+                // certificate.
                 extensions.constructed(TAG_SEQUENCE, |ext| {
                     ext.oid(OID_SAN)?;
                     ext.boolean(true)?;
-                    let mut value = [0u8; 512];
+                    let mut value = [0u8; 1024];
                     let len = {
                         let mut w = Writer::new(&mut value);
-                        w.constructed(TAG_SEQUENCE, |names| names.primitive(TAG_URI, san_uri))?;
+                        w.constructed(TAG_SEQUENCE, |names| {
+                            if !san_uri.is_empty() {
+                                names.primitive(TAG_URI, san_uri)?;
+                            }
+                            for name in dns_names.split(|&b| b == b',') {
+                                if !name.is_empty() {
+                                    names.primitive(TAG_DNS, name)?;
+                                }
+                            }
+                            Ok(())
+                        })?;
                         w.at
                     };
                     ext.primitive(TAG_OCTET_STRING, &value[..len])
@@ -530,6 +545,7 @@ impl<'a> Writer<'a> {
         not_before: u64,
         not_after: u64,
         san_uri: &[u8],
+        dns_names: &[u8],
     ) -> Result<(), DerError> {
         self.constructed(TAG_SEQUENCE, |tbs| {
             // version: v3, explicit [0].
@@ -549,7 +565,7 @@ impl<'a> Writer<'a> {
                 SubjectKey::Ed25519(key) => tbs.ed25519_spki(key)?,
                 SubjectKey::P256(point) => tbs.p256_spki(point)?,
             }
-            tbs.leaf_extensions(san_uri)
+            tbs.leaf_extensions(san_uri, dns_names)
         })
     }
 }
