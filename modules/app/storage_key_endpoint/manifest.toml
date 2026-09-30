@@ -1,0 +1,47 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712"]
+
+# The storage-key service's network edge (modules/common/storage_key_endpoint.rs):
+# `POST /storage-key`, one REQUEST payload in the body, the REPLY payload back.
+# Only a challenge, an attach, a recovery and a renewal pass — the operations
+# that carry a node's own proof; every control verb is refused 403 and reaches
+# the service only on an edge inside the control plane's graph.
+#
+# The service's `replies` fan out to every party on them. This endpoint gives
+# the service correlations in its own space (high bit set) and answers only
+# those; a party feeding the service directly keeps its correlations below.
+
+# Requests from `http.req_out`.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "HttpRequest"
+
+# Answers to `http.resp_in`.
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "HttpResponse"
+
+# Requests to `storage_key.requests`.
+[[ports]]
+name = "service_out"
+direction = "output"
+index = 1
+content_type = "OctetStream"
+buffer_size = 8192
+
+# Replies from `storage_key.replies`.
+[[ports]]
+name = "service_in"
+direction = "input"
+index = 1
+content_type = "OctetStream"
+buffer_size = 8192
+
+[observability]
+exempt = "edge — every decision it carries is the service's, audited in its ledger"

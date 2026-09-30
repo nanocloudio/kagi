@@ -220,7 +220,7 @@ fn build_aad(id: &[u8], version_id: &[u8], out: &mut [u8; MAX_AAD]) -> usize {
     n + version_id.len()
 }
 
-// ── Key wrapping (envelope encryption / DEK service, P4) ─────────────────
+// ── Key wrapping: envelope encryption for a DEK ──────────────────────────
 //
 // A compact self-contained wrapped blob for small secrets (data-encryption
 // keys, key material): `[nonce 12][ciphertext][tag 16]`, AES-256-GCM under a

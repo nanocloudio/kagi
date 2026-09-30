@@ -65,6 +65,7 @@ metrics = [
     "state_delete",
     "state_conflict",
     "state_unavailable",
+    "state_pending",
     "state_malformed",
     "state_read_too_weak",
 ]

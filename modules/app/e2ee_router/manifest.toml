@@ -5,11 +5,48 @@ entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712"]
 
-# One `HttpRequest` in, the same envelope out on one of three ports.
+# One `HttpRequest` in, the same envelope out on one of three ports — and the
+# answers back the same way.
 [[ports]]
 name = "request_in"
 direction = "input"
 content_type = "HttpRequest"
+
+# The endpoints' answers arrive here rather than going straight to the
+# listener.
+#
+# An application record states no length of its own: where one ends is the
+# record boundary the edge keeps, so it travels on an edge that carries whole
+# records (a `buffer_group`) and nowhere else. Several producers writing into
+# one input is a fan, the runtime inserts a byte merge to serve it, and a byte
+# merge cannot carry records that do not say how long they are — the kernel
+# strips the `buffer_group` it is incompatible with and the boundaries go with
+# it. So each endpoint gets its own edge and this module does the merging,
+# which it can do because it understands the record.
+#
+# No correlation table is needed and none exists: a response carries the
+# origin, connection and stream of the exchange it answers, so forwarding it
+# verbatim addresses it. There is nothing here to mis-address.
+[[ports]]
+name = "credential_resp_in"
+index = 1
+direction = "input"
+content_type = "HttpResponse"
+buffer_size = 8192
+
+[[ports]]
+name = "keypkg_resp_in"
+index = 2
+direction = "input"
+content_type = "HttpResponse"
+buffer_size = 8192
+
+[[ports]]
+name = "state_resp_in"
+index = 3
+direction = "input"
+content_type = "HttpResponse"
+buffer_size = 8192
 
 [[ports]]
 name = "credential_out"
@@ -31,10 +68,11 @@ direction = "output"
 content_type = "HttpRequest"
 buffer_size = 8192
 
-# A path this router does not recognise is answered here rather than
-# forwarded: an unrouted request that simply vanished would leave the
-# connection open until the listener timed it out, which reads to a client as
-# a hung server rather than a 404.
+# Every answer this listener sends leaves here: the endpoints' responses
+# forwarded verbatim, and this router's own refusals. A path it does not
+# recognise is answered rather than forwarded — an unrouted request that simply
+# vanished would leave the connection open until the listener timed it out,
+# which reads to a client as a hung server rather than a 404.
 [[ports]]
 name = "response_out"
 index = 3
@@ -43,4 +81,10 @@ content_type = "HttpResponse"
 buffer_size = 4096
 
 [observability]
-metrics = ["routed_credential", "routed_keypackage", "routed_state", "unrouted"]
+metrics = [
+  "routed_credential",
+  "routed_keypackage",
+  "routed_state",
+  "unrouted",
+  "answers_forwarded",
+]

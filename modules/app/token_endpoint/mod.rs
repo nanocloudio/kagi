@@ -76,6 +76,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -95,11 +103,6 @@ use auth_wire::{ExtraClaims, MintRequest, PayloadReader};
 
 /// `module_step` return code for "did work, step me again".
 const STEP_DID_WORK: i32 = 2;
-
-/// `HttpRequest`  `[conn u16][stream u16][method u8][flags u8][path_len u16][hdr_len u16][body_len u16]`
-const REQ_HDR: usize = 12;
-/// `HttpResponse` `[conn u16][stream u16][status u16][flags u8][ct_len u8][hdr_len u16][body_len u16]`
-const RESP_HDR: usize = 12;
 
 /// wave's `wire::method::METHOD_POST`.
 const METHOD_POST: u8 = 3;
@@ -140,8 +143,8 @@ const MAX_OTP: usize = 8;
 #[derive(Clone, Copy)]
 struct Pending {
     corr: u32,
-    conn: u16,
-    stream: u16,
+    id: http_app::AppId,
+    credit: u32,
     /// `STAGE_ADMIT` while admission is deciding, `STAGE_MINT` once the
     /// mint has the request.
     stage: u8,
@@ -174,8 +177,12 @@ impl Pending {
     const fn zero() -> Self {
         Self {
             corr: 0,
-            conn: 0,
-            stream: 0,
+            id: http_app::AppId {
+                origin: 0,
+                conn: 0,
+                stream: 0,
+            },
+            credit: 0,
             stage: STAGE_ADMIT,
             sub: [0u8; MAX_FIELD],
             sub_len: 0,
@@ -238,6 +245,17 @@ struct ModuleState {
     token_revoked: u32,
     token_caller_authority: u32,
     token_unmatched_reply: u32,
+
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -318,6 +336,8 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.out_mint = dev_channel_port(sys, 1, 1);
         s.in_mint = dev_channel_port(sys, 0, 1);
 
@@ -362,20 +382,52 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         worked |= drain_mint_replies(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
                 break;
             }
-            if !chan::can_write(sys, s.out_responses) {
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             // A raw envelope, not a typed message: wave's `http` writes the
             // HttpRequest with `channel_write`.
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            // A refusal is still a decision, and the caller is owed it: an
+            // endpoint that drops one answers with silence, which a client
+            // cannot tell from a server that hung.
+            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
+                respond(
+                    s,
+                    sys,
+                    &rid,
+                    rcredit,
+                    why.status(),
+                    b"application/json",
+                    why.body(),
+                );
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_request(s, sys, at);
+            }
         }
 
         if worked {
@@ -398,10 +450,10 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return worked;
     }
     for _ in 0..MAX_REPLIES_PER_STEP {
-        if !chan::can_read(sys, s.in_mint) {
+        if !s.outbox.flush(sys, s.out_responses, &s.out) {
             break;
         }
-        if !chan::can_write(sys, s.out_responses) {
+        if !chan::can_read(sys, s.in_mint) {
             break;
         }
         let mut buf = [0u8; MAX_TOKEN + 64];
@@ -443,8 +495,8 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             respond(
                 s,
                 sys,
-                slot.conn,
-                slot.stream,
+                &slot.id,
+                slot.credit,
                 200,
                 b"application/json",
                 &body[..len],
@@ -454,8 +506,8 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             respond(
                 s,
                 sys,
-                slot.conn,
-                slot.stream,
+                &slot.id,
+                slot.credit,
                 400,
                 b"application/json",
                 br#"{"error":"invalid_request"}"#,
@@ -470,37 +522,32 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 /// # Safety
 ///
 /// As `drain_mint_replies`.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
-        return;
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
-
-    let Some(body_at) = REQ_HDR
-        .checked_add(path_len)
-        .and_then(|at| at.checked_add(hdr_len))
-    else {
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
         return;
     };
-    let Some(body_end) = body_at.checked_add(body_len) else {
-        return;
-    };
-    if body_end > plen {
-        s.token_malformed = s.token_malformed.saturating_add(1);
-        refuse(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
-        return;
-    }
+    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    // Copied out of the collector so the handler can still take `&mut s`:
+    // the request borrows the table, and answering borrows the module.
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let hdr_len = req.headers.len().min(header_buf.len());
+    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let body_len = req.body.len().min(body_buf.len());
+    body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
+    s.exch.release(at);
+    let path = &target_buf[..path_len];
+    let headers = &header_buf[..hdr_len];
+    let body = &body_buf[..body_len];
 
     if method != METHOD_POST {
         // RFC 6749 §3.2: the token endpoint takes POST. A GET carrying
         // credentials in a query string would put them in every log between
         // here and the caller.
-        refuse(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
+        refuse(s, sys, &id, credit, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
 
@@ -511,7 +558,6 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     // the subject, and the next person to read the code would have to guess
     // which behaviour was intended.
     {
-        let body = &s.buf[body_at..body_end];
         let mut scratch = [0u8; MAX_FIELD];
         if form_value(body, b"sub", &mut scratch) != 0
             || form_value(body, b"jkt", &mut scratch) != 0
@@ -520,8 +566,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             refuse(
                 s,
                 sys,
-                conn,
-                stream,
+                &id,
+                credit,
                 400,
                 br#"{"error":"invalid_request","detail":"authority_not_caller_selected"}"#,
             );
@@ -537,7 +583,6 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     // the only thing that could check one.
     let mut otp = [0u8; MAX_OTP];
     let (aud_len, scope_len, ttl, otp_len) = {
-        let body = &s.buf[body_at..body_end];
         (
             form_value(body, b"aud", &mut aud),
             form_value(body, b"scope", &mut scope),
@@ -562,7 +607,6 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let mut credential = [0u8; MAX_PRESENTED];
     let mut proof = [0u8; MAX_PRESENTED];
     let (credential_len, proof_len) = {
-        let headers = &s.buf[REQ_HDR + path_len..body_at];
         (
             header_value(headers, b"authorization")
                 .and_then(strip_dpop_scheme)
@@ -575,24 +619,24 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         // `AdmitRequest` refuses one at decode, so forwarding would spend a
         // round trip to be told what is already known.
         s.token_unauthenticated = s.token_unauthenticated.saturating_add(1);
-        refuse(s, sys, conn, stream, 401, UNAUTHORIZED_BODY);
+        refuse(s, sys, &id, credit, 401, UNAUTHORIZED_BODY);
         return;
     }
 
     if s.out_admit < 0 {
         // No admission, no mint. Issuing here would mean issuing without
         // anyone having decided who the caller is.
-        refuse(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
         return;
     }
 
     let uri_len = path_len.min(MAX_FIELD);
     let mut uri = [0u8; MAX_FIELD];
-    uri[..uri_len].copy_from_slice(&s.buf[REQ_HDR..REQ_HDR + uri_len]);
+    uri[..uri_len].copy_from_slice(&path[..uri_len]);
 
     let mut entry = Pending::zero();
-    entry.conn = conn;
-    entry.stream = stream;
+    entry.id = id;
+    entry.credit = credit;
     entry.stage = STAGE_ADMIT;
     entry.ttl = ttl;
     entry.aud[..aud_len].copy_from_slice(&aud[..aud_len]);
@@ -617,20 +661,20 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     };
     let mut framed = [0u8; 4096];
     let Ok(n) = ask.encode(&mut framed) else {
-        refuse(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
         return;
     };
     let Ok((wire_type, payload)) = auth_wire::read_envelope(&framed[..n]) else {
-        refuse(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
         return;
     };
     let Some(index) = free_slot(s) else {
         s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
-        refuse(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
         return;
     };
     if chan::channel_write_msg(sys, s.out_admit, wire_type, payload) <= 0 {
-        refuse(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
         return;
     }
     entry.live = true;
@@ -716,7 +760,7 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                     (503, UNAVAILABLE_BODY)
                 }
             };
-            refuse(s, sys, entry.conn, entry.stream, status, body);
+            refuse(s, sys, &entry.id, entry.credit, status, body);
             continue;
         }
 
@@ -750,7 +794,7 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending) {
     if !chan::can_write(sys, s.out_mint) {
         s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
-        refuse(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     }
     let corr = s.next_corr;
@@ -801,17 +845,17 @@ unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending
         extra: ExtraClaims::Slice(&extra),
     };
     let Ok(n) = request.encode(&mut framed) else {
-        refuse(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
     let Some(index) = free_slot(s) else {
         s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
-        refuse(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
     if (sys.channel_write)(s.out_mint, framed.as_ptr(), n) < n as i32 {
         s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
-        refuse(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     }
     let mut next = *entry;
@@ -1050,12 +1094,12 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 unsafe fn refuse(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     body: &[u8],
 ) {
-    respond(s, sys, conn, stream, status, b"application/json", body);
+    respond(s, sys, id, credit, status, b"application/json", body);
 }
 
 /// Emit one `HttpResponse`.
@@ -1066,39 +1110,18 @@ unsafe fn refuse(
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     content_type: &[u8],
     body: &[u8],
 ) {
-    let total = RESP_HDR + content_type.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) =
+        http_exchange::write_response(id, status, content_type, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0; // flags: a complete body in one envelope
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "content types here are short literals"
-    )]
-    {
-        s.out[7] = content_type.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + content_type.len()].copy_from_slice(content_type);
-    s.out[RESP_HDR + content_type.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 #[no_mangle]

@@ -52,6 +52,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -76,8 +84,6 @@ use credential::Ciphersuite;
 
 const STEP_DID_WORK: i32 = 2;
 
-const REQ_HDR: usize = 12;
-const RESP_HDR: usize = 12;
 const METHOD_POST: u8 = 3;
 
 /// The `cty` a credential carries. The contract owns the value; this is the
@@ -106,8 +112,8 @@ const MAX_REPLIES_PER_STEP: usize = 4;
 #[derive(Clone, Copy)]
 struct Pending {
     corr: u32,
-    conn: u16,
-    stream: u16,
+    id: http_app::AppId,
+    credit: u32,
     device_id: [u8; MAX_FIELD],
     device_id_len: u16,
     canonical: [u8; jwk::MAX_CANONICAL],
@@ -125,8 +131,12 @@ impl Pending {
     const fn empty() -> Self {
         Self {
             corr: 0,
-            conn: 0,
-            stream: 0,
+            id: http_app::AppId {
+                origin: 0,
+                conn: 0,
+                stream: 0,
+            },
+            credit: 0,
             device_id: [0; MAX_FIELD],
             device_id_len: 0,
             canonical: [0; jwk::MAX_CANONICAL],
@@ -173,6 +183,17 @@ struct ModuleState {
     credential_unknown_device: u32,
     credential_bad_possession: u32,
     credential_in_flight_full: u32,
+
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -269,6 +290,8 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_directory = dev_channel_port(sys, 1, 1);
         s.in_directory = dev_channel_port(sys, 0, 2);
@@ -309,15 +332,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let mut worked = drain_directory(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) || !chan::can_write(sys, s.out_responses) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            // A refusal is still a decision, and the caller is owed it: an
+            // endpoint that drops one answers with silence, which a client
+            // cannot tell from a server that hung.
+            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, rcredit, why.status(), why.body());
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_request(s, sys, at);
+            }
         }
 
         if worked {
@@ -401,7 +451,10 @@ unsafe fn drain_directory(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     }
     let mut worked = false;
     for _ in 0..MAX_REPLIES_PER_STEP {
-        if !chan::can_read(sys, s.in_directory) || !chan::can_write(sys, s.out_responses) {
+        if !s.outbox.flush(sys, s.out_responses, &s.out) {
+            break;
+        }
+        if !chan::can_read(sys, s.in_directory) {
             break;
         }
         let mut buf = [0u8; abi::CHANNEL_BUFFER_SIZE];
@@ -426,7 +479,7 @@ unsafe fn drain_directory(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 
         if status != auth_wire::ST_OK {
             s.credential_unknown_device = s.credential_unknown_device.saturating_add(1);
-            refuse(s, sys, slot.conn, slot.stream, Refusal::UnknownDevice);
+            refuse(s, sys, &slot.id, slot.credit, Refusal::UnknownDevice);
             continue;
         }
 
@@ -437,13 +490,13 @@ unsafe fn drain_directory(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 token[..len].copy_from_slice(&s.out[..len]);
                 let mut body = [0u8; MAX_TOKEN + 64];
                 let n = write_json_field(&mut body, b"credential", &token[..len]);
-                respond(s, sys, slot.conn, slot.stream, 200, &body[..n]);
+                respond(s, sys, &slot.id, slot.credit, 200, &body[..n]);
             }
             Err(refusal) => {
                 if refusal == Refusal::BadPossession {
                     s.credential_bad_possession = s.credential_bad_possession.saturating_add(1);
                 }
-                refuse(s, sys, slot.conn, slot.stream, refusal);
+                refuse(s, sys, &slot.id, slot.credit, refusal);
             }
         }
     }
@@ -455,45 +508,38 @@ unsafe fn drain_directory(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
         return;
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
+    };
+    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    // Copied out of the collector so the handler can still take `&mut s`:
+    // the request borrows the table, and answering borrows the module.
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let body_len = req.body.len().min(body_buf.len());
+    body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
+    s.exch.release(at);
+    let path = &target_buf[..path_len];
+    let body = &body_buf[..body_len];
 
-    let Some(body_at) = REQ_HDR
-        .checked_add(path_len)
-        .and_then(|at| at.checked_add(hdr_len))
-    else {
-        return;
-    };
-    let Some(body_end) = body_at.checked_add(body_len) else {
-        return;
-    };
-    if body_end > plen {
-        refuse(s, sys, conn, stream, Refusal::Malformed);
-        return;
-    }
-    if &s.buf[REQ_HDR..body_at.min(plen)][..path_len.min(16)] != b"/e2ee/credential" {
-        respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
+    if path.get(..16) != Some(b"/e2ee/credential") {
+        respond(s, sys, &id, credit, 404, br#"{"error":"not_found"}"#);
         return;
     }
     if method != METHOD_POST {
-        respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, &id, credit, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
     if !s.key.is_open() {
         s.credential_no_key = s.credential_no_key.saturating_add(1);
-        refuse(s, sys, conn, stream, Refusal::NoKey);
+        refuse(s, sys, &id, credit, Refusal::NoKey);
         return;
     }
 
-    match accept(s, sys, conn, stream, body_at, body_end) {
+    match accept(s, sys, &id, credit, body) {
         Ok(()) => {}
         Err(refusal) => {
             if refusal == Refusal::Malformed {
@@ -502,7 +548,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             if refusal == Refusal::Busy {
                 s.credential_in_flight_full = s.credential_in_flight_full.saturating_add(1);
             }
-            refuse(s, sys, conn, stream, refusal);
+            refuse(s, sys, &id, credit, refusal);
         }
     }
 }
@@ -515,15 +561,13 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 unsafe fn accept(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
-    body_at: usize,
-    body_end: usize,
+    id: &http_app::AppId,
+    credit: u32,
+    body: &[u8],
 ) -> Result<(), Refusal> {
     let mut slot = Pending::empty();
 
     let (device_len, canonical_len, sig_len, hpke_len, nonce_len, generation, signature_len) = {
-        let body = &s.buf[body_at..body_end];
         let device_len = json_string(body, b"device_id", &mut slot.device_id);
         let canonical_len = canonical_jwk_of(body, b"device_pubkey", &mut slot.canonical);
         let mut sig_jwk = [0u8; jwk::MAX_CANONICAL];
@@ -578,8 +622,8 @@ unsafe fn accept(
         slot.nonce_len = nonce_len as u16;
     }
     slot.generation = u32::try_from(generation).map_err(|_| Refusal::Malformed)?;
-    slot.conn = conn;
-    slot.stream = stream;
+    slot.id = *id;
+    slot.credit = credit;
     slot.corr = s.next_corr;
     slot.live = true;
 
@@ -913,11 +957,11 @@ fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
 unsafe fn refuse(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     refusal: Refusal,
 ) {
-    respond(s, sys, conn, stream, refusal.status(), refusal.body());
+    respond(s, sys, id, credit, refusal.status(), refusal.body());
 }
 
 /// # Safety
@@ -926,39 +970,17 @@ unsafe fn refuse(
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"application/json";
-    let total = RESP_HDR + CT.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "CT is a 16-byte literal, so the length fits a u8"
-    )]
-    {
-        s.out[7] = CT.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + CT.len()].copy_from_slice(CT);
-    s.out[RESP_HDR + CT.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 #[no_mangle]

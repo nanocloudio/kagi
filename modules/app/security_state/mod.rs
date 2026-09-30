@@ -116,13 +116,11 @@ const CONTENT_TYPE: &[u8] = b"application/vnd.kagi.state";
 
 /// The `storage.object` precondition values.
 ///
-/// These used to be a synthesised 32-byte all-zero etag meaning "must not
-/// exist" — a convention that lived in the Linux provider and in no
-/// contract, so a second provider had no way to reproduce it and this module
-/// had no way to know whether it still held. Worse, it was not expressible:
-/// "must not exist" and "must be at revision 0" were the same value, so one
-/// of those two requests was always answered wrongly. The contract now
-/// states the condition, and this is the mapping.
+/// The contract names the condition rather than encoding it in the etag
+/// bytes. A synthesised all-zero etag cannot express one: "must not exist"
+/// and "must be at revision 0" would be the same request, so one of the two
+/// is always answered wrongly, and the convention would have to be
+/// reproduced by every provider to mean anything.
 const PRECONDITION_ABSENT: u8 = 1;
 const PRECONDITION_ETAG: u8 = 2;
 
@@ -160,6 +158,54 @@ define_params! {
 
 const BACKEND_OBJECT: u8 = 0;
 const BACKEND_LATTICE: u8 = 1;
+
+/// A write the `object` provider took but has not decided.
+///
+/// `EINPROGRESS` is not a failure and not a success: it means the request
+/// was accepted and the answer is not ready, and the caller asks again with
+/// BYTE-IDENTICAL arguments. Reporting it as `ST_UNAVAILABLE` would tell a
+/// caller there is no ledger while the write is still on its way to landing
+/// — the one answer this module must never give, because a credential
+/// refused against state that then commits is a record nobody knows exists.
+///
+/// ONE slot, and new requests stop being drained while it is live. The retry
+/// has to be byte-identical, and the argument buffers it points into
+/// (`key_buf`, `value_buf`, `arg_buf`) are exactly the ones the next request
+/// would overwrite. Back-pressure, not a queue: this is the same posture the
+/// lattice lane takes when its table is full.
+///
+/// Unlike [`KvPending`], nothing arrives on a channel to match this against.
+/// The provider is asked again directly, so there is no correlation id here.
+#[derive(Clone, Copy)]
+struct WritePending {
+    live: bool,
+    opcode: u32,
+    arg_len: usize,
+    /// Carried because the answer needs them: the namespace decides which
+    /// fence the commit had to achieve, and the key is re-read for the etag.
+    namespace: u8,
+    key_len: usize,
+    corr: u32,
+    client: u8,
+    /// A `DELETE` answers `ENXIO` for a key that was not there and checks no
+    /// fence; a `PUT` does neither.
+    is_delete: bool,
+}
+
+impl WritePending {
+    const fn zero() -> Self {
+        Self {
+            live: false,
+            opcode: 0,
+            arg_len: 0,
+            namespace: 0,
+            key_len: 0,
+            corr: 0,
+            client: 0,
+            is_delete: false,
+        }
+    }
+}
 
 /// Requests parked on a lattice answer. Small and refusing when full —
 /// parked requests are admissions-in-waiting, and an unbounded queue is
@@ -213,6 +259,8 @@ struct ModuleState {
     out_kv: i32,
     in_kv: i32,
     kv_pending: [KvPending; MAX_KV_PENDING],
+    /// The one `object` write awaiting a decision, if any.
+    write_pending: WritePending,
     next_kv_corr: u64,
     kv_buf: [u8; MSG_BUF_LEN],
 
@@ -231,6 +279,9 @@ struct ModuleState {
     state_delete: u32,
     state_conflict: u32,
     state_unavailable: u32,
+    /// Writes the provider took without deciding. A rising count is a slow
+    /// store, not a broken one — it is the back-pressure made visible.
+    state_pending: u32,
     state_malformed: u32,
     /// Reads refused because the view they were served from is weaker than
     /// the namespace allows a decision to rest on.
@@ -322,6 +373,7 @@ pub extern "C" fn module_new(
         s.out_kv = dev_channel_port(sys, 1, 1);
         s.in_kv = dev_channel_port(sys, 0, 1);
         s.kv_pending = [KvPending::zero(); MAX_KV_PENDING];
+        s.write_pending = WritePending::zero();
         s.next_kv_corr = 1;
         parse_tlv(s, params, params_len);
         s.state_get = 0;
@@ -330,6 +382,7 @@ pub extern "C" fn module_new(
         s.state_delete = 0;
         s.state_conflict = 0;
         s.state_unavailable = 0;
+        s.state_pending = 0;
         s.state_malformed = 0;
         s.state_read_too_weak = 0;
         dev_log(sys, 3, b"[state] init".as_ptr(), 12);
@@ -351,6 +404,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         drain_kv(s, sys);
+
+        // A write the provider took but has not decided is asked again, with
+        // byte-identical arguments, before anything else is read. Until it
+        // decides, NO new request is drained: the retry's arguments live in
+        // the same buffers the next request would overwrite, and the caller
+        // waiting on it is owed exactly one reply.
+        if s.write_pending.live {
+            let p = s.write_pending;
+            if !chan::can_write(sys, s.out_replies) {
+                return 0;
+            }
+            issue_write(s, sys, p);
+            if s.write_pending.live {
+                return 0;
+            }
+        }
 
         for _ in 0..MAX_REQS_PER_STEP {
             if !chan::can_read(sys, s.in_requests) {
@@ -681,13 +750,80 @@ unsafe fn do_write(
         return;
     };
 
-    let rc = (sys.provider_call)(-1, OBJECT_PUT, s.arg_buf.as_mut_ptr(), arg_len);
+    issue_write(
+        s,
+        sys,
+        WritePending {
+            live: true,
+            opcode: OBJECT_PUT,
+            arg_len,
+            namespace,
+            key_len,
+            corr,
+            client,
+            is_delete: false,
+        },
+    );
+}
+
+/// Issue a write and answer it, or park it if the provider has not decided.
+///
+/// Every write goes through here, so the first attempt and a retry cannot
+/// come to disagree about what a return code means.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`,
+/// and `s.arg_buf[..p.arg_len]` holds the encoded request.
+unsafe fn issue_write(s: &mut ModuleState, sys: &SyscallTable, p: WritePending) {
+    // Cleared before every attempt, retry included: a provider that writes
+    // no fence must not leave the previous attempt's standing in for this
+    // one. Zero is `Volatile`, which no namespace accepts.
+    s.fence_buf = [0u8; FENCE_CAP];
+    let rc = (sys.provider_call)(-1, p.opcode, s.arg_buf.as_mut_ptr(), p.arg_len);
+    match abi::contracts::storage::object::write_answer(rc) {
+        abi::contracts::storage::object::WriteAnswer::Pending => {
+            // No reply: the caller is owed exactly one, and this write has
+            // not earned it yet. `module_step` asks again next step and the
+            // request buffers stay untouched until it does.
+            s.write_pending = p;
+            s.state_pending = s.state_pending.saturating_add(1);
+        }
+        abi::contracts::storage::object::WriteAnswer::Decided(rc) => {
+            s.write_pending = WritePending::zero();
+            finish_write(s, sys, p, rc);
+        }
+    }
+}
+
+/// Answer a decided write.
+///
+/// # Safety
+///
+/// As `issue_write`.
+unsafe fn finish_write(s: &mut ModuleState, sys: &SyscallTable, p: WritePending, rc: i32) {
+    let (corr, client, namespace, key_len) = (p.corr, p.client, p.namespace, p.key_len);
+
     // `EEXIST` — the key was already there, so a create-only caller LOST.
     // `EAGAIN` — the key moved under a compare-and-swap. Both mean "you did
     // not win"; only the second is worth retrying after a re-read.
     if rc == abi::kernel_abi::errno::EEXIST || rc == abi::kernel_abi::errno::EAGAIN {
         s.state_conflict = s.state_conflict.saturating_add(1);
         reply(s, sys, corr, client, auth_wire::ST_CONFLICT, &[], false);
+        return;
+    }
+    // A `DELETE` of a key that was not there is an absence, not a fault, and
+    // it checks no fence: there is no commit to have achieved one.
+    if p.is_delete {
+        let status = if rc == abi::kernel_abi::errno::ENXIO {
+            auth_wire::ST_NOT_FOUND
+        } else if rc < 0 {
+            s.state_unavailable = s.state_unavailable.saturating_add(1);
+            auth_wire::ST_UNAVAILABLE
+        } else {
+            auth_wire::ST_OK
+        };
+        reply(s, sys, corr, client, status, &[], false);
         return;
     }
     if rc < 0 {
@@ -772,19 +908,20 @@ unsafe fn do_delete(
         reply(s, sys, corr, client, auth_wire::ST_FULL, &[], false);
         return;
     };
-    let rc = (sys.provider_call)(-1, OBJECT_DELETE, s.arg_buf.as_mut_ptr(), arg_len);
-    let status = if rc == abi::kernel_abi::errno::EAGAIN {
-        s.state_conflict = s.state_conflict.saturating_add(1);
-        auth_wire::ST_CONFLICT
-    } else if rc == abi::kernel_abi::errno::ENXIO {
-        auth_wire::ST_NOT_FOUND
-    } else if rc < 0 {
-        s.state_unavailable = s.state_unavailable.saturating_add(1);
-        auth_wire::ST_UNAVAILABLE
-    } else {
-        auth_wire::ST_OK
-    };
-    reply(s, sys, corr, client, status, &[], false);
+    issue_write(
+        s,
+        sys,
+        WritePending {
+            live: true,
+            opcode: OBJECT_DELETE,
+            arg_len,
+            namespace: 0,
+            key_len,
+            corr,
+            client,
+            is_delete: true,
+        },
+    );
 }
 
 /// `HEAD` a key into `s.head_buf`. Returns the provider's result: bytes

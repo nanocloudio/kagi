@@ -411,11 +411,13 @@ pub mod profile {
     pub const E2EE_CREDENTIAL: u16 = 5;
     /// OIDC ID token signing key.
     pub const ID_TOKEN: u16 = 6;
+    /// Storage-key grant and release records.
+    pub const STORAGE_GRANT: u16 = 7;
 
     /// Highest profile this registry defines. Raise it with every profile
     /// added above: a bound that trails the list silently excludes the
     /// newest profile from anything that range-checks one.
-    pub const MAX_ID: u16 = ID_TOKEN;
+    pub const MAX_ID: u16 = STORAGE_GRANT;
 
     /// Short stable token, for an operator-facing log line.
     #[must_use]
@@ -427,6 +429,7 @@ pub mod profile {
             ENROLMENT_CHALLENGE => b"enrolment-challenge",
             E2EE_CREDENTIAL => b"e2ee-credential",
             ID_TOKEN => b"id-token",
+            STORAGE_GRANT => b"storage-grant",
             _ => b"none",
         }
     }

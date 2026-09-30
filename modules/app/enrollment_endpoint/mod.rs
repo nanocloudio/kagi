@@ -59,6 +59,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
 include!("../../common/sdk_bridge.rs");
 
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -67,6 +75,15 @@ mod b64;
 mod chan;
 #[path = "../../common/device_auth.rs"]
 mod device_auth;
+
+/// The request collector sizes its header block from what a device presents,
+/// and it restates that size rather than importing this module. This is what
+/// keeps the two honest: a wider credential here refuses to build until the
+/// collector that has to hold it is widened too.
+const _: () = assert!(
+    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    "a presented credential must fit the request collector's header block"
+);
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/ids.rs"]
@@ -99,11 +116,6 @@ mod smtp_wire;
 use auth_wire::PayloadReader;
 
 const STEP_DID_WORK: i32 = 2;
-
-/// `HttpRequest`  `[conn u16][stream u16][method u8][flags u8][path_len u16][hdr_len u16][body_len u16]`
-const REQ_HDR: usize = 12;
-/// `HttpResponse` `[conn u16][stream u16][status u16][flags u8][ct_len u8][hdr_len u16][body_len u16]`
-const RESP_HDR: usize = 12;
 
 /// wave's `wire::method::METHOD_POST`.
 const METHOD_POST: u8 = 3;
@@ -254,6 +266,17 @@ struct ModuleState {
     pending: [Pending; MAX_PENDING],
     next_corr: u32,
 
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
+
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
 }
@@ -296,8 +319,8 @@ struct Pending {
     /// `STAGE_CONSUME` while the nonce is being spent, `STAGE_COMMIT` while
     /// the device record is being written.
     stage: u8,
-    conn: u16,
-    stream: u16,
+    id: http_app::AppId,
+    credit: u32,
     corr: u32,
     cert: [u8; MAX_TOKEN],
     cert_len: u16,
@@ -369,8 +392,12 @@ impl Pending {
             totp_confirming: false,
             caller_corr: 0,
             auth_exp: 0,
-            conn: 0,
-            stream: 0,
+            id: http_app::AppId {
+                origin: 0,
+                conn: 0,
+                stream: 0,
+            },
+            credit: 0,
             corr: 0,
             cert: [0u8; MAX_TOKEN],
             cert_len: 0,
@@ -889,6 +916,8 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_state = dev_channel_port(sys, 1, 1);
         s.in_state = dev_channel_port(sys, 0, 2);
@@ -968,15 +997,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) || !chan::can_write(sys, s.out_responses) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            // A refusal is still a decision, and the caller is owed it: an
+            // endpoint that drops one answers with silence, which a client
+            // cannot tell from a server that hung.
+            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, rcredit, why.status(), why.body());
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_request(s, sys, at);
+            }
         }
 
         if worked {
@@ -1083,32 +1139,27 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
-        return;
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
-
-    let Some(body_at) = REQ_HDR
-        .checked_add(path_len)
-        .and_then(|at| at.checked_add(hdr_len))
-    else {
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
         return;
     };
-    let Some(body_end) = body_at.checked_add(body_len) else {
-        return;
-    };
-    if body_end > plen {
-        refuse(s, sys, conn, stream, Refusal::Malformed);
-        return;
-    }
+    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    // Copied out of the collector so the handler can still take `&mut s`:
+    // the request borrows the table, and answering borrows the module.
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let hdr_len = req.headers.len().min(header_buf.len());
+    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let body_len = req.body.len().min(body_buf.len());
+    body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
+    s.exch.release(at);
+    let path = &target_buf[..path_len];
+    let headers = &header_buf[..hdr_len];
+    let body = &body_buf[..body_len];
 
-    let path = &s.buf[REQ_HDR..(REQ_HDR + path_len).min(plen)];
     let confirming = path.starts_with(b"/authenticators/totp/confirm");
     let registering = !confirming && path.starts_with(b"/authenticators/totp");
     let path_start = if path.starts_with(b"/start") {
@@ -1119,33 +1170,31 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         None
     };
     if path_start.is_none() && !registering && !confirming {
-        respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
+        respond(s, sys, &id, credit, 404, br#"{"error":"not_found"}"#);
         return;
     }
     if method != METHOD_POST {
-        respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, &id, credit, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
     if registering || confirming {
-        totp_route(
-            s, sys, conn, stream, confirming, path_len, body_at, body_end,
-        );
+        totp_route(s, sys, &id, credit, confirming, path, headers, body);
         return;
     }
     let Some(is_start) = path_start else {
-        respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
+        respond(s, sys, &id, credit, 404, br#"{"error":"not_found"}"#);
         return;
     };
     if !s.key.is_open() {
         s.enrol_no_key = s.enrol_no_key.saturating_add(1);
-        refuse(s, sys, conn, stream, Refusal::NoKey);
+        refuse(s, sys, &id, credit, Refusal::NoKey);
         return;
     }
 
     let outcome = if is_start {
-        start(s, sys, body_at, body_end)
+        start(s, sys, body)
     } else {
-        redeem(s, sys, body_at, body_end)
+        redeem(s, sys, body)
     };
 
     match outcome {
@@ -1164,14 +1213,14 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
                 // enrolment started: a challenge whose code the ledger never
                 // recorded could never be redeemed, and the client would be
                 // waiting on a mail that opens nothing.
-                begin_start(s, sys, conn, stream, &token[..len]);
+                begin_start(s, sys, &id, credit, &token[..len]);
             } else {
                 // A verified redemption is not yet a successful one. The
                 // challenge's nonce has to be consumed in the ledger first,
                 // and the certificate is only handed over if this redemption
                 // is the one that consumed it. Everything below happens when
                 // the ledger answers.
-                begin_lookup(s, sys, conn, stream, &token[..len]);
+                begin_lookup(s, sys, &id, credit, &token[..len]);
             }
         }
         Err(refusal) => {
@@ -1197,7 +1246,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
                 | Refusal::NoAuthenticator
                 | Refusal::BadCode => {}
             }
-            refuse(s, sys, conn, stream, refusal);
+            refuse(s, sys, &id, credit, refusal);
         }
     }
 }
@@ -1322,18 +1371,12 @@ fn hmac_sha256_into(key: &[u8], message: &[u8], out: &mut [u8]) -> usize {
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn start(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    body_at: usize,
-    body_end: usize,
-) -> Result<usize, Refusal> {
+unsafe fn start(s: &mut ModuleState, sys: &SyscallTable, body: &[u8]) -> Result<usize, Refusal> {
     let mut email = [0u8; MAX_FIELD];
     let mut challenge = [0u8; MAX_FIELD];
     let mut canonical = [0u8; jwk::MAX_CANONICAL];
     let mut adopt = [0u8; MAX_FIELD];
     let (email_len, challenge_len, canonical_len, adopt_len) = {
-        let body = &s.buf[body_at..body_end];
         let email_len = json_string(body, b"email", &mut email);
         let challenge_len = json_string(body, b"code_challenge", &mut challenge);
         let canonical_len = canonical_device_jwk(body, &mut canonical).unwrap_or(0);
@@ -1469,19 +1512,13 @@ unsafe fn start(
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn redeem(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    body_at: usize,
-    body_end: usize,
-) -> Result<usize, Refusal> {
+unsafe fn redeem(s: &mut ModuleState, sys: &SyscallTable, body: &[u8]) -> Result<usize, Refusal> {
     let mut token = [0u8; MAX_TOKEN];
     let mut verifier = [0u8; MAX_VERIFIER];
     let mut signature_b64 = [0u8; 128];
     let mut canonical = [0u8; jwk::MAX_CANONICAL];
     let mut code = [0u8; CODE_DIGITS];
     let (token_len, verifier_len, sig_len, canonical_len, code_len) = {
-        let body = &s.buf[body_at..body_end];
         (
             json_string(body, b"challenge_token", &mut token),
             json_string(body, b"code_verifier", &mut verifier),
@@ -1721,13 +1758,13 @@ fn next_corr(s: &mut ModuleState) -> u32 {
 unsafe fn begin_start(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     token: &[u8],
 ) {
     if s.out_state < 0 || s.start_nonce_len == 0 {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
         return;
     }
     if s.start_adopted {
@@ -1739,7 +1776,7 @@ unsafe fn begin_start(
         // would lose to the operator's own record and this would answer 503
         // for a ceremony that is perfectly valid.
         s.enrol_started = s.enrol_started.saturating_add(1);
-        respond_token(s, sys, conn, stream, token);
+        respond_token(s, sys, id, credit, token);
         return;
     }
     let nonce_len = usize::from(s.start_nonce_len);
@@ -1767,8 +1804,8 @@ unsafe fn begin_start(
 
     let mut entry = Pending::zero();
     entry.stage = STAGE_START;
-    entry.conn = conn;
-    entry.stream = stream;
+    entry.id = *id;
+    entry.credit = credit;
     entry.nonce = nonce;
     entry.nonce_len = s.start_nonce_len;
     entry.code = s.start_code;
@@ -1784,7 +1821,7 @@ unsafe fn begin_start(
 
     if !dispatch(s, sys, state_wire::MSG_STATE_PUT_ABS, &request, entry) {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
     }
 }
 
@@ -1958,13 +1995,13 @@ unsafe fn reply_auth_refused(s: &mut ModuleState, sys: &SyscallTable, corr: u32,
 unsafe fn begin_lookup(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     certificate: &[u8],
 ) {
     if s.out_state < 0 || s.redeem_nonce_len == 0 {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
         return;
     }
     let nonce_len = usize::from(s.redeem_nonce_len);
@@ -1981,8 +2018,8 @@ unsafe fn begin_lookup(
 
     let mut entry = Pending::zero();
     entry.stage = STAGE_LOOKUP;
-    entry.conn = conn;
-    entry.stream = stream;
+    entry.id = *id;
+    entry.credit = credit;
     entry.nonce = nonce;
     entry.nonce_len = s.redeem_nonce_len;
     entry.code = s.redeem_code;
@@ -1998,7 +2035,7 @@ unsafe fn begin_lookup(
 
     if !dispatch(s, sys, state_wire::MSG_STATE_GET, &request, entry) {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
     }
 }
 
@@ -2084,16 +2121,16 @@ fn trim_ws(value: &[u8]) -> &[u8] {
 unsafe fn totp_route(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     confirming: bool,
-    path_len: usize,
-    body_at: usize,
-    body_end: usize,
+    path: &[u8],
+    headers: &[u8],
+    body: &[u8],
 ) {
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
         return;
     };
 
@@ -2101,8 +2138,6 @@ unsafe fn totp_route(
     let mut proof = [0u8; MAX_TOKEN];
     let mut uri = [0u8; MAX_FIELD];
     let (credential_len, proof_len, uri_len) = {
-        let path = &s.buf[REQ_HDR..REQ_HDR + path_len];
-        let headers = &s.buf[REQ_HDR + path_len..body_at];
         let uri_len = path.len().min(uri.len());
         uri[..uri_len].copy_from_slice(&path[..uri_len]);
         (
@@ -2124,7 +2159,7 @@ unsafe fn totp_route(
         match authenticate_device(s, &presented, now) {
             Ok(who) => who,
             Err(refusal) => {
-                refuse(s, sys, conn, stream, refusal);
+                refuse(s, sys, id, credit, refusal);
                 return;
             }
         }
@@ -2134,13 +2169,11 @@ unsafe fn totp_route(
         // JSON, as `/start` and `/redeem` take: one body shape for one
         // endpoint, rather than a second parser for one field.
         let mut code = [0u8; totp::MAX_DIGITS as usize];
-        let code_len = {
-            let body = &s.buf[body_at..body_end];
-            jose::claim_str(body, b"code").map_or(0, |value| copy_into(value, &mut code))
-        };
-        begin_totp_confirm(s, sys, conn, stream, &who, &code[..code_len]);
+        let code_len =
+            { jose::claim_str(body, b"code").map_or(0, |value| copy_into(value, &mut code)) };
+        begin_totp_confirm(s, sys, id, credit, &who, &code[..code_len]);
     } else {
-        begin_totp_register(s, sys, conn, stream, &who);
+        begin_totp_register(s, sys, id, credit, &who);
     }
 }
 
@@ -2166,30 +2199,30 @@ unsafe fn totp_route(
 unsafe fn begin_totp_register(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     who: &Authenticated,
 ) {
     if s.out_state < 0 {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
         return;
     }
     let mut raw = [0u8; TOTP_SECRET_BYTES];
     if (sys.provider_call)(-1, 0x0C3C, raw.as_mut_ptr(), raw.len()) < 0 {
-        refuse(s, sys, conn, stream, Refusal::NoEntropy);
+        refuse(s, sys, id, credit, Refusal::NoEntropy);
         return;
     }
     let mut secret = [0u8; TOTP_SECRET_B32];
     let Ok(secret_len) = totp::base32_encode(&raw, &mut secret) else {
-        refuse(s, sys, conn, stream, Refusal::NoEntropy);
+        refuse(s, sys, id, credit, Refusal::NoEntropy);
         return;
     };
 
     let mut entry = Pending::zero();
     entry.stage = STAGE_TOTP_READ;
-    entry.conn = conn;
-    entry.stream = stream;
+    entry.id = *id;
+    entry.credit = credit;
     entry.totp_confirming = false;
     entry.totp_secret = secret;
     #[expect(
@@ -2199,7 +2232,7 @@ unsafe fn begin_totp_register(
     {
         entry.totp_secret_len = secret_len as u8;
     }
-    stage_device_read(s, sys, conn, stream, who, entry);
+    stage_device_read(s, sys, id, credit, who, entry);
 }
 
 /// `POST /authenticators/totp/confirm` — prove the authenticator works.
@@ -2220,31 +2253,31 @@ unsafe fn begin_totp_register(
 unsafe fn begin_totp_confirm(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     who: &Authenticated,
     code: &[u8],
 ) {
     if s.out_state < 0 {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
         return;
     }
     if code.is_empty() || code.len() > usize::from(totp::MAX_DIGITS) {
-        refuse(s, sys, conn, stream, Refusal::Malformed);
+        refuse(s, sys, id, credit, Refusal::Malformed);
         return;
     }
     let mut entry = Pending::zero();
     entry.stage = STAGE_TOTP_READ;
-    entry.conn = conn;
-    entry.stream = stream;
+    entry.id = *id;
+    entry.credit = credit;
     entry.totp_confirming = true;
     entry.totp_code[..code.len()].copy_from_slice(code);
     #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_DIGITS")]
     {
         entry.totp_code_len = code.len() as u8;
     }
-    stage_device_read(s, sys, conn, stream, who, entry);
+    stage_device_read(s, sys, id, credit, who, entry);
 }
 
 /// Read the device record both authenticator routes act on.
@@ -2255,8 +2288,8 @@ unsafe fn begin_totp_confirm(
 unsafe fn stage_device_read(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     who: &Authenticated,
     mut entry: Pending,
 ) {
@@ -2268,7 +2301,7 @@ unsafe fn stage_device_read(
     entry.device_id[..n].copy_from_slice(&key[..n]);
     if !dispatch(s, sys, state_wire::MSG_STATE_GET, &request, entry) {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, id, credit, 503, UNAVAILABLE_BODY);
     }
 }
 
@@ -2466,10 +2499,10 @@ unsafe fn totp_read_done(
             Refusal::Unauthenticated
         } else {
             s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-            respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+            respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
             return;
         };
-        refuse(s, sys, entry.conn, entry.stream, refusal);
+        refuse(s, sys, &entry.id, entry.credit, refusal);
         return;
     }
 
@@ -2483,7 +2516,7 @@ unsafe fn totp_read_done(
         // authenticator whose codes no longer verify, with nothing having
         // said so. Removing an authenticator is its own decision.
         s.enrol_totp_conflict = s.enrol_totp_conflict.saturating_add(1);
-        refuse(s, sys, entry.conn, entry.stream, Refusal::AlreadyRegistered);
+        refuse(s, sys, &entry.id, entry.credit, Refusal::AlreadyRegistered);
     }
 }
 
@@ -2502,7 +2535,7 @@ unsafe fn attach_authenticator(
     let secret = &entry.totp_secret[..usize::from(entry.totp_secret_len)];
     let mut record = [0u8; 1536];
     let Some(len) = write_device_record(&mut record, value, secret, false, 0) else {
-        refuse(s, sys, entry.conn, entry.stream, Refusal::Malformed);
+        refuse(s, sys, &entry.id, entry.credit, Refusal::Malformed);
         return;
     };
 
@@ -2510,7 +2543,7 @@ unsafe fn attach_authenticator(
     next.stage = STAGE_TOTP_WRITE;
     if !cas_device(s, sys, &mut next, etag, &record[..len]) {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
     }
 }
 
@@ -2528,32 +2561,32 @@ unsafe fn confirm_against(
     held: &[u8],
 ) {
     if held.is_empty() {
-        refuse(s, sys, entry.conn, entry.stream, Refusal::NoAuthenticator);
+        refuse(s, sys, &entry.id, entry.credit, Refusal::NoAuthenticator);
         return;
     }
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
         // A code is a statement about the current step, so a window cannot
         // be judged without a clock this deployment trusts.
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
     let Some(matched) = verify_presented_code(entry, held, value, now) else {
         s.enrol_totp_bad_code = s.enrol_totp_bad_code.saturating_add(1);
-        refuse(s, sys, entry.conn, entry.stream, Refusal::BadCode);
+        refuse(s, sys, &entry.id, entry.credit, Refusal::BadCode);
         return;
     };
 
     let mut record = [0u8; 1536];
     let Some(len) = write_device_record(&mut record, value, held, true, matched) else {
-        refuse(s, sys, entry.conn, entry.stream, Refusal::Malformed);
+        refuse(s, sys, &entry.id, entry.credit, Refusal::Malformed);
         return;
     };
     let mut next = *entry;
     next.stage = STAGE_TOTP_WRITE;
     if !cas_device(s, sys, &mut next, etag, &record[..len]) {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
     }
 }
 
@@ -2594,7 +2627,7 @@ unsafe fn totp_write_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pendi
         // advanced — either way this one did not happen, and saying so is
         // the only honest answer.
         s.enrol_totp_conflict = s.enrol_totp_conflict.saturating_add(1);
-        refuse(s, sys, entry.conn, entry.stream, Refusal::AlreadyRegistered);
+        refuse(s, sys, &entry.id, entry.credit, Refusal::AlreadyRegistered);
         return;
     }
     if entry.totp_confirming {
@@ -2602,8 +2635,8 @@ unsafe fn totp_write_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pendi
         respond(
             s,
             sys,
-            entry.conn,
-            entry.stream,
+            &entry.id,
+            entry.credit,
             200,
             br#"{"confirmed":true}"#,
         );
@@ -2626,9 +2659,9 @@ unsafe fn totp_write_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pendi
         )
         .is_ok();
     if ok {
-        respond(s, sys, entry.conn, entry.stream, 200, &body[..at]);
+        respond(s, sys, &entry.id, entry.credit, 200, &body[..at]);
     } else {
-        respond(s, sys, entry.conn, entry.stream, 500, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 500, UNAVAILABLE_BODY);
     }
 }
 
@@ -2646,7 +2679,7 @@ unsafe fn start_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, s
         // so a conflict here means the ledger is answering about something
         // else. Either way there is no transaction, so there is no enrolment.
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     }
     let email_len = usize::from(entry.claims_len);
@@ -2659,7 +2692,7 @@ unsafe fn start_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, s
     let len = usize::from(entry.cert_len);
     let mut token = [0u8; MAX_TOKEN];
     token[..len].copy_from_slice(&entry.cert[..len]);
-    respond_token(s, sys, entry.conn, entry.stream, &token[..len]);
+    respond_token(s, sys, &entry.id, entry.credit, &token[..len]);
 }
 
 /// Hand back the challenge token — the answer to a successful `/start`,
@@ -2675,13 +2708,13 @@ unsafe fn start_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, s
 unsafe fn respond_token(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     token: &[u8],
 ) {
     let mut body = [0u8; MAX_TOKEN + 64];
     let n = write_json_field(&mut body, b"challenge_token", token);
-    respond(s, sys, conn, stream, 200, &body[..n]);
+    respond(s, sys, id, credit, 200, &body[..n]);
 }
 
 /// The transaction came back: check the code, then spend it.
@@ -2702,12 +2735,12 @@ unsafe fn lookup_done(
         // wrong codes. Answered exactly as a wrong code is, so probing for
         // which one it was tells an attacker nothing.
         s.enrol_code_bad = s.enrol_code_bad.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 401, CODE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 401, CODE_BODY);
         return;
     }
     if status != auth_wire::ST_OK {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     }
     // A transaction that is not `pending` has already been spent.
@@ -2715,14 +2748,14 @@ unsafe fn lookup_done(
         Some(state) if state == b"pending" => {}
         _ => {
             s.enrol_replayed = s.enrol_replayed.saturating_add(1);
-            respond(s, sys, entry.conn, entry.stream, 409, CONSUMED_BODY);
+            respond(s, sys, &entry.id, entry.credit, 409, CONSUMED_BODY);
             return;
         }
     }
     let attempts = jose::claim_u64(value, b"attempts").unwrap_or(0);
     let Some(stored) = jose::claim_str(value, b"code_hash") else {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
 
@@ -2754,7 +2787,7 @@ unsafe fn lookup_done(
     next.stage = STAGE_CONSUME;
     if !dispatch(s, sys, state_wire::MSG_STATE_CAS, &request, next) {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
     }
 }
 
@@ -2813,7 +2846,7 @@ unsafe fn burn_or_count(
             let _ = chan::channel_write_msg(sys, s.out_state, wire_type, payload);
         }
     }
-    respond(s, sys, entry.conn, entry.stream, 401, CODE_BODY);
+    respond(s, sys, &entry.id, entry.credit, 401, CODE_BODY);
 }
 
 /// The transaction is spent: commit the device.
@@ -2827,11 +2860,11 @@ unsafe fn consume_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending,
         auth_wire::ST_CONFLICT => {
             // Somebody else spent it between the read and the swap.
             s.enrol_replayed = s.enrol_replayed.saturating_add(1);
-            respond(s, sys, entry.conn, entry.stream, 409, CONSUMED_BODY);
+            respond(s, sys, &entry.id, entry.credit, 409, CONSUMED_BODY);
         }
         _ => {
             s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-            respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+            respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         }
     }
 }
@@ -2855,7 +2888,7 @@ unsafe fn begin_commit(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending)
         // starting a new one, where a device issued a certificate and never
         // recorded is not. Refusing is the safe direction.
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
 
@@ -2876,16 +2909,16 @@ unsafe fn begin_commit(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending)
     let mut frame = [0u8; 2048];
     let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)
     else {
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
     let Ok((msg_type, payload)) = auth_wire::read_envelope(&frame[..n]) else {
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
     if chan::channel_write_msg(sys, s.out_state, msg_type, payload) <= 0 {
         s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-        respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+        respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     }
 
@@ -2914,14 +2947,14 @@ unsafe fn commit_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, 
             let len = usize::from(entry.cert_len);
             let mut body = [0u8; MAX_TOKEN + 64];
             let n = write_json_field(&mut body, b"device_certificate", &entry.cert[..len]);
-            respond(s, sys, entry.conn, entry.stream, 200, &body[..n]);
+            respond(s, sys, &entry.id, entry.credit, 200, &body[..n]);
         }
         _ => {
             // The write did not land. The challenge is spent and no
             // certificate is issued — an enrolment that has to be restarted,
             // rather than a device holding a credential nothing can revoke.
             s.enrol_state_unavailable = s.enrol_state_unavailable.saturating_add(1);
-            respond(s, sys, entry.conn, entry.stream, 503, UNAVAILABLE_BODY);
+            respond(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         }
     }
 }
@@ -3146,11 +3179,11 @@ fn hkdf_into(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8; 32]) {
 unsafe fn refuse(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     refusal: Refusal,
 ) {
-    respond(s, sys, conn, stream, refusal.status(), refusal.body());
+    respond(s, sys, id, credit, refusal.status(), refusal.body());
 }
 
 /// Emit one `HttpResponse` carrying `body` as JSON.
@@ -3161,39 +3194,17 @@ unsafe fn refuse(
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"application/json";
-    let total = RESP_HDR + CT.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "CT is a 16-byte literal, so the length fits a u8"
-    )]
-    {
-        s.out[7] = CT.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + CT.len()].copy_from_slice(CT);
-    s.out[RESP_HDR + CT.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 #[no_mangle]

@@ -70,10 +70,16 @@ prefix = "tests/harness/tests/support/"
 reason = """Each e2e suite mounts this support module by #[path] and drives only the part of the graph it tests, so every compile leaves a different part unused."""
 
 [ci.test]
+# No e2e wrapper script. Required-ness is read from the environment by the
+# suites themselves (`support::e2e_required`): `fluxor ci` sets `$FLUXOR_BIN`
+# and builds the modules and runtime before any suite, so a graph that will
+# not launch is a real failure there and never a missing prerequisite. A
+# wrapper that re-ran the whole suite with `KAGI_REQUIRE_E2E=1` set doubled
+# every graph launch for the same signal.
 # Shadow-checkout hard-fail guard: tests/ and configs/ live in
 # .git-shadow/, so a primary-only checkout cannot run the test suite or
 # render the deployment graph templates. The guard fails CI instead.
-scripts = ["tools/ci-shadow-guard.sh", "tools/ci-e2e-required.sh", "tools/ci-docs-coherence.sh"]
+scripts = ["tools/ci-shadow-guard.sh", "tools/ci-docs-coherence.sh"]
 
 [ci.templates]
 dir = "configs"

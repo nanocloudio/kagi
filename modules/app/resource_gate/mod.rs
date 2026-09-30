@@ -72,6 +72,14 @@ include!("../../common/sdk_bridge.rs");
 /// The assurance ladder, reached through `auth_wire` so this module and the
 /// wire it reads cannot mount two copies of one vocabulary.
 use auth_wire::assurance;
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -80,6 +88,15 @@ mod b64;
 mod chan;
 #[path = "../../common/device_auth.rs"]
 mod device_auth;
+
+/// The request collector sizes its header block from what a device presents,
+/// and it restates that size rather than importing this module. This is what
+/// keeps the two honest: a wider credential here refuses to build until the
+/// collector that has to hold it is widened too.
+const _: () = assert!(
+    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    "a presented credential must fit the request collector's header block"
+);
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/jose.rs"]
@@ -101,11 +118,6 @@ use auth_wire::PayloadReader;
 /// `1` would retire the module for the life of the process after its first
 /// answer, so a module that serves many requests reports `Burst`.
 const STEP_DID_WORK: i32 = 2;
-
-/// `HttpRequest`  `[conn u16][stream u16][method u8][flags u8][path_len u16][hdr_len u16][body_len u16]`
-const REQ_HDR: usize = 12;
-/// `HttpResponse` `[conn u16][stream u16][status u16][flags u8][ct_len u8][hdr_len u16][body_len u16]`
-const RESP_HDR: usize = 12;
 
 /// SEC1 uncompressed P-256 points are 65 bytes — the widest key we store.
 const MAX_PUBKEY_LEN: usize = 65;
@@ -163,8 +175,8 @@ const POLICY: device_auth::Policy = device_auth::Policy {
 #[derive(Clone, Copy)]
 struct PendingClaim {
     live: bool,
-    conn: u16,
-    stream: u16,
+    id: http_app::AppId,
+    credit: u32,
     subject: [u8; MAX_SUBJECT],
     subject_len: u16,
     state_corr: u32,
@@ -174,8 +186,12 @@ impl PendingClaim {
     const fn zero() -> Self {
         Self {
             live: false,
-            conn: 0,
-            stream: 0,
+            id: http_app::AppId {
+                origin: 0,
+                conn: 0,
+                stream: 0,
+            },
+            credit: 0,
             subject: [0; MAX_SUBJECT],
             subject_len: 0,
             state_corr: 0,
@@ -234,6 +250,17 @@ struct ModuleState {
     gate_assurance: u32,
     gate_replayed_ledger: u32,
     gate_state_unavailable: u32,
+
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -347,6 +374,8 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_state = dev_channel_port(sys, 1, 1);
         s.in_state = dev_channel_port(sys, 0, 2);
@@ -398,12 +427,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let mut worked = drain_claims(s, sys);
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
                 break;
             }
-            // Every request produces exactly one response; don't consume a
-            // request we cannot answer.
-            if !chan::can_write(sys, s.out_responses) {
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             // A raw envelope, not a typed message: wave's `http` writes the
@@ -411,11 +441,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // message framing would consume a type byte the envelope does
             // not carry and misread every field after it.
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            // A refusal is still a decision, and the caller is owed it: an
+            // endpoint that drops one answers with silence, which a client
+            // cannot tell from a server that hung.
+            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, rcredit, why.status(), why.body());
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_request(s, sys, at);
+            }
         }
 
         if worked {
@@ -458,15 +509,13 @@ unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
 /// # Safety
 ///
 /// As `drain_key_material`.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
-        return; // No connection or stream id — nowhere to address a response.
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
+        return; // Nothing collected under that slot — nowhere to answer.
+    };
+    let (id, credit) = (req.id, req.resp_credit);
     let mut proof_id = [0u8; 32];
-    match admit(s, sys, plen, &mut proof_id) {
+    match admit(s, sys, at, &mut proof_id) {
         Ok(subject_len) => {
             // `subject` lives in `s.out`'s tail, disjoint from the response
             // this writes into its head.
@@ -479,10 +528,10 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
                 // a proof whose freshness nothing established, and letting
                 // the ledger's absence admit would make losing the ledger a
                 // way to replay.
-                claim_and_pend(s, sys, conn, stream, &subject[..subject_len], &proof_id);
+                claim_and_pend(s, sys, &id, credit, &subject[..subject_len], &proof_id);
             } else {
                 s.gate_admitted = s.gate_admitted.saturating_add(1);
-                respond(s, sys, conn, stream, 200, &subject[..subject_len]);
+                respond(s, sys, &id, credit, 200, &subject[..subject_len]);
             }
         }
         Err(refusal) => {
@@ -492,7 +541,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
                 Refusal::Proof => s.gate_bad_proof = s.gate_bad_proof.saturating_add(1),
                 Refusal::Assurance => s.gate_assurance = s.gate_assurance.saturating_add(1),
             }
-            respond(s, sys, conn, stream, refusal.status(), refusal.reason());
+            respond(s, sys, &id, credit, refusal.status(), refusal.reason());
         }
     }
 }
@@ -509,29 +558,28 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 unsafe fn admit(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    plen: usize,
+    at: usize,
     proof_id: &mut [u8; 32],
 ) -> Result<usize, Refusal> {
     if s.keyset.is_empty() {
         return Err(Refusal::NoKey);
     }
 
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let path_at = REQ_HDR;
-    let hdr_at = path_at.checked_add(path_len).ok_or(Refusal::Token)?;
-    let body_at = hdr_at.checked_add(hdr_len).ok_or(Refusal::Token)?;
-    if body_at > plen {
+    let Some(req) = s.exch.request(at) else {
         return Err(Refusal::Token);
-    }
-
-    // Copy the two credentials out of `s.buf` before anything else borrows
-    // it: the decode scratch below writes into buffers of its own, but the
-    // header block is about to be re-read for the second of them.
+    };
+    let method = req.method;
+    // Copied out of the collector before anything else borrows the module:
+    // the header block is read twice below, once per credential.
+    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let hdr_len = req.headers.len().min(header_buf.len());
+    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
     let mut token = [0u8; MAX_SEGMENT];
     let mut proof = [0u8; MAX_SEGMENT];
-    let headers = &s.buf[hdr_at..body_at];
+    let headers = &header_buf[..hdr_len];
     let token_len = header_value(headers, b"authorization")
         .and_then(strip_dpop_scheme)
         .and_then(|value| copy_into(value, &mut token))
@@ -603,7 +651,7 @@ unsafe fn admit(
         },
         &device_auth::Request {
             method: method_name(method),
-            uri: &s.buf[path_at..hdr_at],
+            uri: &target_buf[..path_len],
             now,
         },
         &POLICY,
@@ -790,8 +838,8 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
 unsafe fn claim_and_pend(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     subject: &[u8],
     proof_id: &[u8; 32],
 ) {
@@ -799,7 +847,7 @@ unsafe fn claim_and_pend(
         // Full is a refusal, not a queue: unbounded parked admissions is
         // the eviction-under-load shape with extra steps.
         s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        respond(s, sys, id, credit, 503, b"state_unavailable");
         return;
     };
     // The proof's digest in the keyspace's alphabet — the digest, not the
@@ -808,13 +856,13 @@ unsafe fn claim_and_pend(
     let mut replay_key = [0u8; 43];
     let Some(replay_key_len) = b64::encode(proof_id, &mut replay_key) else {
         s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        respond(s, sys, id, credit, 503, b"state_unavailable");
         return;
     };
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
         s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        respond(s, sys, id, credit, 503, b"state_unavailable");
         return;
     };
 
@@ -835,14 +883,14 @@ unsafe fn claim_and_pend(
         });
     if !sent {
         s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
-        respond(s, sys, conn, stream, 503, b"state_unavailable");
+        respond(s, sys, id, credit, 503, b"state_unavailable");
         return;
     }
 
     let mut entry = PendingClaim::zero();
     entry.live = true;
-    entry.conn = conn;
-    entry.stream = stream;
+    entry.id = *id;
+    entry.credit = credit;
     let len = subject.len().min(MAX_SUBJECT);
     entry.subject[..len].copy_from_slice(&subject[..len]);
     #[expect(clippy::cast_possible_truncation, reason = "bounded by MAX_SUBJECT")]
@@ -893,8 +941,8 @@ unsafe fn drain_claims(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 respond(
                     s,
                     sys,
-                    entry.conn,
-                    entry.stream,
+                    &entry.id,
+                    entry.credit,
                     200,
                     &subject[..usize::from(entry.subject_len)],
                 );
@@ -904,11 +952,11 @@ unsafe fn drain_claims(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 // another replica. The local window said fresh; the shared
                 // state outranks it.
                 s.gate_replayed_ledger = s.gate_replayed_ledger.saturating_add(1);
-                respond(s, sys, entry.conn, entry.stream, 401, b"proof_replayed");
+                respond(s, sys, &entry.id, entry.credit, 401, b"proof_replayed");
             }
             state_wire::ReplayClaim::Unavailable => {
                 s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
-                respond(s, sys, entry.conn, entry.stream, 503, b"state_unavailable");
+                respond(s, sys, &entry.id, entry.credit, 503, b"state_unavailable");
             }
         }
     }
@@ -918,39 +966,17 @@ unsafe fn drain_claims(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"text/plain";
-    let total = RESP_HDR + CT.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0; // flags: a complete body in one envelope
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "CT is a 10-byte literal, so the length fits a u8"
-    )]
-    {
-        s.out[7] = CT.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes()); // no extra headers
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + CT.len()].copy_from_slice(CT);
-    s.out[RESP_HDR + CT.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 #[no_mangle]

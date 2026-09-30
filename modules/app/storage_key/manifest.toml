@@ -1,0 +1,80 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# bcm2712 only: the service's state is its ledger's, and the ledger module
+# is bcm2712 only.
+hardware_targets = ["bcm2712"]
+
+# Control and attach requests, `storage_key_service::msg::REQUEST`. The
+# control verbs are unauthenticated here; the edge feeding this port is the
+# control plane's and belongs behind its admission.
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# Replies: the record decided, and on a release the FXSB bundle.
+[[ports]]
+name = "replies"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# The storage-grant signing key, in the MSG_KEY_ADD shape every kagi module
+# takes: a vault label, never key material.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The security-state ledger: grants, recovery sets, tickets, anti-replay
+# claims and the audit trail.
+[[ports]]
+name = "ledger_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "ledger_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# Signed rewrap orders to the three custodians, fanned out; each custodian
+# answers only orders addressed to its index.
+[[ports]]
+name = "custodian_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "custodian_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# The signing key's public half, as a VERIFY MSG_KEY_ADD, once it is open:
+# to every custodian's `verify_key`. Only this module can name it — the
+# vault label is this module's own.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 512
+max_record = 512
+
+[observability]
+metrics = [
+  "storage_key_allowed",
+  "storage_key_refused",
+  "storage_key_released",
+  "storage_key_replayed",
+  "storage_key_audit_failed",
+  "storage_key_busy",
+]

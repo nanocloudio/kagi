@@ -78,6 +78,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
 include!("../../common/sdk_bridge.rs");
 
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -86,6 +94,15 @@ mod b64;
 mod chan;
 #[path = "../../common/device_auth.rs"]
 mod device_auth;
+
+/// The request collector sizes its header block from what a device presents,
+/// and it restates that size rather than importing this module. This is what
+/// keeps the two honest: a wider credential here refuses to build until the
+/// collector that has to hold it is widened too.
+const _: () = assert!(
+    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    "a presented credential must fit the request collector's header block"
+);
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/jose.rs"]
@@ -98,8 +115,6 @@ mod time_policy;
 mod verify_keyset;
 
 const STEP_DID_WORK: i32 = 2;
-const REQ_HDR: usize = 12;
-const RESP_HDR: usize = 12;
 const METHOD_POST: u8 = 3;
 
 /// Endpoints this module holds state for.
@@ -219,6 +234,17 @@ struct ModuleState {
     state_poisoned: u32,
     state_table_full: u32,
 
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
+
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
 }
@@ -265,6 +291,8 @@ pub extern "C" fn module_new(
         s.state_unauthenticated = 0;
         s.state_not_owner = 0;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.endpoints = [Endpoint::empty(); MAX_ENDPOINTS];
         s.state_loaded = 0;
         s.state_committed = 0;
@@ -291,15 +319,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) || !chan::can_write(sys, s.out_responses) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            // A refusal is still a decision, and the caller is owed it: an
+            // endpoint that drops one answers with silence, which a client
+            // cannot tell from a server that hung.
+            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, rcredit, why.status(), why.body());
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_request(s, sys, at);
+            }
         }
 
         if worked {
@@ -313,40 +368,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and a live syscall table.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
-        return;
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
-
-    let Some(body_at) = REQ_HDR
-        .checked_add(path_len)
-        .and_then(|at| at.checked_add(hdr_len))
-    else {
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
         return;
     };
-    let Some(body_end) = body_at.checked_add(body_len) else {
-        return;
-    };
-    if body_end > plen {
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
-        return;
-    }
+    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    // Copied out of the collector so the handler can still take `&mut s`:
+    // the request borrows the table, and answering borrows the module.
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let hdr_len = req.headers.len().min(header_buf.len());
+    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let body_len = req.body.len().min(body_buf.len());
+    body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
+    s.exch.release(at);
+    let path = &target_buf[..path_len];
+    let headers = &header_buf[..hdr_len];
+    let body = &body_buf[..body_len];
 
-    let path = &s.buf[REQ_HDR..REQ_HDR + path_len];
     let loading = path == b"/e2ee/state/load";
     let committing = path == b"/e2ee/state/commit";
     if !loading && !committing {
-        respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
+        respond(s, sys, &id, credit, 404, br#"{"error":"not_found"}"#);
         return;
     }
     if method != METHOD_POST {
-        respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, &id, credit, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
 
@@ -359,15 +409,15 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     // defeat — and it was the one with no authentication at all.
     let mut route = [0u8; MAX_KEY];
     let route_len = path_len.min(MAX_KEY);
-    route[..route_len].copy_from_slice(&s.buf[REQ_HDR..REQ_HDR + route_len]);
-    let Some(device) = authenticate(s, sys, conn, stream, &route[..route_len], body_at) else {
+    route[..route_len].copy_from_slice(&path[..route_len]);
+    let Some(device) = authenticate(s, sys, &id, credit, &route[..route_len], headers) else {
         return;
     };
 
     if loading {
-        load(s, sys, conn, stream, body_at, body_end, &device);
+        load(s, sys, &id, credit, body, &device);
     } else {
-        commit(s, sys, conn, stream, body_at, body_end, &device);
+        commit(s, sys, &id, credit, body, &device);
     }
 }
 
@@ -407,19 +457,15 @@ impl AuthenticatedDevice {
 unsafe fn load(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
-    body_at: usize,
-    body_end: usize,
+    id: &http_app::AppId,
+    credit: u32,
+    body: &[u8],
     device: &AuthenticatedDevice,
 ) {
     let mut key = [0u8; MAX_KEY];
-    let key_len = {
-        let body = &s.buf[body_at..body_end];
-        json_string(body, b"endpoint", &mut key)
-    };
+    let key_len = { json_string(body, b"endpoint", &mut key) };
     if key_len == 0 {
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, id, credit, 400, br#"{"error":"invalid_request"}"#);
         return;
     }
 
@@ -428,7 +474,7 @@ unsafe fn load(
     // poisoned flag would be a denial-of-service anybody could reach.
     if !device.owns(&key[..key_len]) {
         s.state_not_owner = s.state_not_owner.saturating_add(1);
-        respond(s, sys, conn, stream, 403, br#"{"error":"forbidden"}"#);
+        respond(s, sys, id, credit, 403, br#"{"error":"forbidden"}"#);
         return;
     }
     let Some(index) = find(s, &key[..key_len]) else {
@@ -439,8 +485,8 @@ unsafe fn load(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             200,
             br#"{"revision":0,"present":false}"#,
         );
@@ -451,8 +497,8 @@ unsafe fn load(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             409,
             br#"{"error":"poisoned","detail":"the endpoint is stopped and needs a person"}"#,
         );
@@ -465,8 +511,8 @@ unsafe fn load(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             200,
             br#"{"revision":0,"present":false}"#,
         );
@@ -478,7 +524,7 @@ unsafe fn load(
         &endpoint.payload[..usize::from(endpoint.payload_len)],
         &mut encoded,
     ) else {
-        respond(s, sys, conn, stream, 500, br#"{"error":"server_error"}"#);
+        respond(s, sys, id, credit, 500, br#"{"error":"server_error"}"#);
         return;
     };
 
@@ -495,7 +541,7 @@ unsafe fn load(
     let _ = put(&mut body, &mut at, b"}");
 
     s.state_loaded = s.state_loaded.saturating_add(1);
-    respond(s, sys, conn, stream, 200, &body[..at]);
+    respond(s, sys, id, credit, 200, &body[..at]);
 }
 
 /// Advance the state, conditionally.
@@ -506,16 +552,14 @@ unsafe fn load(
 unsafe fn commit(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
-    body_at: usize,
-    body_end: usize,
+    id: &http_app::AppId,
+    credit: u32,
+    body: &[u8],
     device: &AuthenticatedDevice,
 ) {
     let mut key = [0u8; MAX_KEY];
     let mut payload = [0u8; MAX_PAYLOAD];
     let (key_len, payload_len, expected, epoch, generation) = {
-        let body = &s.buf[body_at..body_end];
         let key_len = json_string(body, b"endpoint", &mut key);
         let mut encoded = [0u8; MAX_PAYLOAD * 2];
         let encoded_len = json_string(body, b"payload", &mut encoded);
@@ -534,11 +578,11 @@ unsafe fn commit(
     };
 
     let Ok(generation) = u32::try_from(generation) else {
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, id, credit, 400, br#"{"error":"invalid_request"}"#);
         return;
     };
     if key_len == 0 || payload_len == 0 || expected == u64::MAX {
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, id, credit, 400, br#"{"error":"invalid_request"}"#);
         return;
     }
     let offered = Marker { epoch, generation };
@@ -556,7 +600,7 @@ unsafe fn commit(
     // poisoned flag would be a denial-of-service anybody could reach.
     if !device.owns(&key[..key_len]) {
         s.state_not_owner = s.state_not_owner.saturating_add(1);
-        respond(s, sys, conn, stream, 403, br#"{"error":"forbidden"}"#);
+        respond(s, sys, id, credit, 403, br#"{"error":"forbidden"}"#);
         return;
     }
     let existing = find(s, &key[..key_len]);
@@ -572,7 +616,7 @@ unsafe fn commit(
 
     if held_poisoned {
         s.state_poisoned = s.state_poisoned.saturating_add(1);
-        respond(s, sys, conn, stream, 409, br#"{"error":"poisoned"}"#);
+        respond(s, sys, id, credit, 409, br#"{"error":"poisoned"}"#);
         return;
     }
 
@@ -586,7 +630,7 @@ unsafe fn commit(
         let _ = put(&mut body, &mut at, br#"{"error":"superseded","found":"#);
         let _ = put_u64(&mut body, &mut at, held_revision);
         let _ = put(&mut body, &mut at, b"}");
-        respond(s, sys, conn, stream, 409, &body[..at]);
+        respond(s, sys, id, credit, 409, &body[..at]);
         return;
     }
 
@@ -598,7 +642,7 @@ unsafe fn commit(
             // turns into a reused generation — but it is not evidence that
             // anything is wrong, so the endpoint keeps running.
             s.state_not_advancing = s.state_not_advancing.saturating_add(1);
-            respond(s, sys, conn, stream, 409, br#"{"error":"not_advancing"}"#);
+            respond(s, sys, id, credit, 409, br#"{"error":"not_advancing"}"#);
         } else {
             // Behind the current position, while quoting the current
             // revision: the caller loaded this state and is offering
@@ -611,7 +655,7 @@ unsafe fn commit(
                 s.endpoints[index].poisoned = true;
             }
             s.state_rolled_back = s.state_rolled_back.saturating_add(1);
-            respond(s, sys, conn, stream, 409, br#"{"error":"rolled_back"}"#);
+            respond(s, sys, id, credit, 409, br#"{"error":"rolled_back"}"#);
         }
         return;
     }
@@ -625,8 +669,8 @@ unsafe fn commit(
                 respond(
                     s,
                     sys,
-                    conn,
-                    stream,
+                    id,
+                    credit,
                     503,
                     br#"{"error":"temporarily_unavailable"}"#,
                 );
@@ -662,7 +706,7 @@ unsafe fn commit(
     let _ = put(&mut body, &mut at, br#"{"committed":true,"revision":"#);
     let _ = put_u64(&mut body, &mut at, revision);
     let _ = put(&mut body, &mut at, b"}");
-    respond(s, sys, conn, stream, 200, &body[..at]);
+    respond(s, sys, id, credit, 200, &body[..at]);
 }
 
 fn find(s: &ModuleState, key: &[u8]) -> Option<usize> {
@@ -713,39 +757,17 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Option<()> {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"application/json";
-    let total = RESP_HDR + CT.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "CT is a 16-byte literal, so the length fits a u8"
-    )]
-    {
-        s.out[7] = CT.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + CT.len()].copy_from_slice(CT);
-    s.out[RESP_HDR + CT.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 /// The primitives the shared authentication fragment is given.
@@ -775,27 +797,25 @@ fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
 unsafe fn authenticate(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     path: &[u8],
-    body_at: usize,
+    headers: &[u8],
 ) -> Option<AuthenticatedDevice> {
     if s.keyset.is_empty() {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             br#"{"error":"temporarily_unavailable"}"#,
         );
         return None;
     }
-    let path_len = path.len();
     let mut credential = [0u8; device_auth::MAX_SEGMENT];
     let mut proof = [0u8; device_auth::MAX_SEGMENT];
     let (credential_len, proof_len) = {
-        let headers = &s.buf[REQ_HDR + path_len..body_at];
         (
             header_value(headers, b"authorization")
                 .and_then(strip_dpop_scheme)
@@ -805,7 +825,7 @@ unsafe fn authenticate(
     };
     if credential_len == 0 || proof_len == 0 {
         s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
-        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        respond(s, sys, id, credit, 401, br#"{"error":"invalid_client"}"#);
         return None;
     }
 
@@ -824,8 +844,8 @@ unsafe fn authenticate(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             br#"{"error":"temporarily_unavailable"}"#,
         );
@@ -881,12 +901,12 @@ unsafe fn authenticate(
     };
     let Ok(admitted) = admitted else {
         s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
-        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        respond(s, sys, id, credit, 401, br#"{"error":"invalid_client"}"#);
         return None;
     };
     let Some(device_id) = jose::claim_str(admitted.claims, b"device_id") else {
         s.state_unauthenticated = s.state_unauthenticated.saturating_add(1);
-        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        respond(s, sys, id, credit, 401, br#"{"error":"invalid_client"}"#);
         return None;
     };
     let mut out = AuthenticatedDevice {

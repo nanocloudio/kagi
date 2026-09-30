@@ -1,5 +1,5 @@
 //! `DPoP` proof-of-possession verification (RFC 9449) — the deterministic,
-//! reusable parts (P6). Pure `no_std` fragment; crypto is injected.
+//! reusable parts. Pure `no_std` fragment; crypto is injected.
 //!
 //! A `DPoP` proof is a compact JWS whose header carries the prover's public
 //! `jwk` and `typ:"dpop+jwt"`, and whose claims are `htm` (HTTP method),

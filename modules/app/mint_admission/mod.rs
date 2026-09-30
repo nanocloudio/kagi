@@ -559,8 +559,13 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_requests < 0 {
         return false;
     }
+    // Nothing is taken off an input while the answer to it has nowhere to go.
+    // Every record here ends in a reply on `out_replies`, and a reply lost to
+    // a full edge is a caller left waiting on a request this module already
+    // consumed — which surfaces as an HTTP request that never completes, not
+    // as an error anybody can see.
     let mut worked = false;
-    while chan::can_read(sys, s.in_requests) {
+    while chan::can_write(sys, s.out_replies) && chan::can_read(sys, s.in_requests) {
         let buf_ptr = s.buf.as_mut_ptr();
         let (msg_type, plen) = {
             let buf = core::slice::from_raw_parts_mut(buf_ptr, abi::CHANNEL_BUFFER_SIZE);
@@ -851,7 +856,12 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    while chan::can_read(sys, s.in_state) {
+    // Nothing is taken off an input while the answer to it has nowhere to go.
+    // Every record here ends in a reply on `out_replies`, and a reply lost to
+    // a full edge is a caller left waiting on a request this module already
+    // consumed — which surfaces as an HTTP request that never completes, not
+    // as an error anybody can see.
+    while chan::can_write(sys, s.out_replies) && chan::can_read(sys, s.in_state) {
         let mut buf = [0u8; 1024];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_state, &mut buf);
         if msg_type == 0 {
@@ -1269,7 +1279,12 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    while chan::can_read(sys, s.in_mint) {
+    // Nothing is taken off an input while the answer to it has nowhere to go.
+    // Every record here ends in a reply on `out_replies`, and a reply lost to
+    // a full edge is a caller left waiting on a request this module already
+    // consumed — which surfaces as an HTTP request that never completes, not
+    // as an error anybody can see.
+    while chan::can_write(sys, s.out_replies) && chan::can_read(sys, s.in_mint) {
         // A token-bearing MintResponse can approach TOKEN_BUF_LEN; size for
         // the whole envelope so a real JWT is never truncated.
         let mut buf = [0u8; 8192];

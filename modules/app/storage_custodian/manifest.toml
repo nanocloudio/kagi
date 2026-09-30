@@ -1,0 +1,37 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# The recovery key is a persistent labelled vault key, which needs a vault
+# with a durable sealed-object store.
+hardware_targets = ["bcm2712"]
+
+# Rewrap orders from the storage-key issuer's `custodian_out`, and requests
+# for this custodian's recovery public key.
+[[ports]]
+name = "orders"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# Released envelopes and refusals, to the issuer's `custodian_in`.
+[[ports]]
+name = "results"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The issuer's storage-grant VERIFICATION key, as a MSG_KEY_ADD VERIFY
+# record: the key an order's authorisation must be signed under.
+[[ports]]
+name = "verify_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+[observability]
+metrics = [
+  "custodian_released",
+  "custodian_refused",
+]

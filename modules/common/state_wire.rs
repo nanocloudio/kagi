@@ -79,6 +79,19 @@ pub const NS_REPLAY: u8 = 6;
 pub const NS_OAUTH_CODE: u8 = 7;
 /// OIDC client registry — allowed redirect_uris and scopes per client_id.
 pub const NS_OAUTH_CLIENT: u8 = 8;
+/// Storage-key grants: one per protected resource, its device policy and
+/// key epochs.
+pub const NS_STORAGE_GRANT: u8 = 9;
+/// Storage-key recovery sets: per resource and epoch, the creation
+/// authorisation and then the three custody envelopes.
+pub const NS_STORAGE_SET: u8 = 10;
+/// One-time recovery authorisations.
+pub const NS_STORAGE_TICKET: u8 = 11;
+/// The storage-key decision audit trail, append-only.
+pub const NS_STORAGE_AUDIT: u8 = 12;
+/// Storage-key attachment renewal chains: per attachment, the latest
+/// renewal, advanced by compare-and-swap.
+pub const NS_STORAGE_ATTACHMENT: u8 = 13;
 
 /// The prefix a namespace maps to under the provider's keyspace.
 ///
@@ -96,6 +109,11 @@ pub const fn namespace_prefix(ns: u8) -> Option<&'static str> {
         NS_REPLAY => Some("kagi/replay/"),
         NS_OAUTH_CODE => Some("kagi/oauth/code/"),
         NS_OAUTH_CLIENT => Some("kagi/oauth/client/"),
+        NS_STORAGE_GRANT => Some("kagi/sk/grant/"),
+        NS_STORAGE_SET => Some("kagi/sk/set/"),
+        NS_STORAGE_TICKET => Some("kagi/sk/ticket/"),
+        NS_STORAGE_AUDIT => Some("kagi/sk/audit/"),
+        NS_STORAGE_ATTACHMENT => Some("kagi/sk/attach/"),
         _ => None,
     }
 }
@@ -523,6 +541,10 @@ pub const fn requires_linearized(ns: u8) -> bool {
             | NS_REPLAY
             | NS_OAUTH_CODE
             | NS_OAUTH_CLIENT
+            | NS_STORAGE_GRANT
+            | NS_STORAGE_SET
+            | NS_STORAGE_TICKET
+            | NS_STORAGE_ATTACHMENT
     )
 }
 
@@ -547,9 +569,18 @@ pub const fn requires_linearized(ns: u8) -> bool {
 ///   ratchet. Losing either hands out key material twice.
 /// - **`NS_ENROL_TXN`** also carries operator-minted transactions — the QR
 ///   ceremony writes exactly the same record `/start` does, because it IS
-///   the same object with a different delivery channel. A separate namespace
-///   was drafted for it and dropped: two record types with one meaning is
-///   how a `/redeem` ends up able to consume the wrong one.
+///   the same object with a different delivery channel. One namespace and
+///   not two: two record types with one meaning is how a `/redeem` ends up
+///   able to consume the wrong one.
+/// - **`NS_STORAGE_GRANT`**, **`NS_STORAGE_SET`** and
+///   **`NS_STORAGE_TICKET`** decide who may reconstruct a volume key.
+///   Losing a revocation re-admits a device, losing a recovery set loses the
+///   volume, and losing a ticket's consumption lets it recover twice.
+/// - **`NS_STORAGE_ATTACHMENT`** holds each attachment's latest renewal.
+///   Losing an advance lets a superseded link of the chain be renewed again.
+/// - **`NS_STORAGE_AUDIT`** is append-only under unique keys, so it needs
+///   no linearization, but an entry that does not survive is a release
+///   nobody can account for: it is durable like the grants it records.
 /// - **`NS_RATE`** is a counter. Losing it lets an attacker retry sooner,
 ///   which is a real cost but a bounded one, and paying for replication on
 ///   every increment would make the limiter the slowest thing in the path.
@@ -574,9 +605,17 @@ pub const fn min_fence_replicated(ns: u8) -> u8 {
     match ns {
         NS_REPLAY => fence::VIEW_CONSISTENT,
         NS_RATE => fence::VOLATILE,
-        NS_DEVICE | NS_ENROL_TXN | NS_KEYPKG | NS_E2EE_STATE | NS_OAUTH_CODE | NS_OAUTH_CLIENT => {
-            fence::REPLICATED_DURABLE
-        }
+        NS_DEVICE
+        | NS_ENROL_TXN
+        | NS_KEYPKG
+        | NS_E2EE_STATE
+        | NS_OAUTH_CODE
+        | NS_OAUTH_CLIENT
+        | NS_STORAGE_GRANT
+        | NS_STORAGE_SET
+        | NS_STORAGE_TICKET
+        | NS_STORAGE_AUDIT
+        | NS_STORAGE_ATTACHMENT => fence::REPLICATED_DURABLE,
         _ => fence::LOCAL_DURABLE,
     }
 }

@@ -53,6 +53,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -75,8 +83,6 @@ mod time_policy;
 use auth_wire::PayloadReader;
 
 const STEP_DID_WORK: i32 = 2;
-const REQ_HDR: usize = 12;
-const RESP_HDR: usize = 12;
 const METHOD_POST: u8 = 3;
 
 /// How long an issued certificate is valid, in seconds.
@@ -142,6 +148,17 @@ struct ModuleState {
     certificate_issued: u32,
     certificate_no_key: u32,
     certificate_malformed: u32,
+
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -249,6 +266,8 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.in_requests = in_chan;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_key_announce = dev_channel_port(sys, 1, 1);
         s.key = issuer_key::IssuerKey::empty();
@@ -287,15 +306,50 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) || !chan::can_write(sys, s.out_responses) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            // A refusal is still a decision, and the caller is owed it: an
+            // endpoint that drops one answers with silence, which a client
+            // cannot tell from a server that hung.
+            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
+                respond(
+                    s,
+                    sys,
+                    &rid,
+                    rcredit,
+                    why.status(),
+                    b"application/json",
+                    why.body(),
+                );
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_request(s, sys, at);
+            }
         }
 
         if worked {
@@ -391,47 +445,31 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
         return;
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
+    };
+    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    // Copied out of the collector so the handler can still take `&mut s`:
+    // the request borrows the table, and answering borrows the module.
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let body_len = req.body.len().min(body_buf.len());
+    body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
+    s.exch.release(at);
+    let path = &target_buf[..path_len];
+    let body = &body_buf[..body_len];
 
-    let Some(body_at) = REQ_HDR
-        .checked_add(path_len)
-        .and_then(|at| at.checked_add(hdr_len))
-    else {
-        return;
-    };
-    let Some(body_end) = body_at.checked_add(body_len) else {
-        return;
-    };
-    if body_end > plen {
-        respond(
-            s,
-            sys,
-            conn,
-            stream,
-            400,
-            b"application/json",
-            br#"{"error":"invalid_request"}"#,
-        );
-        return;
-    }
-    let path = &s.buf[REQ_HDR..REQ_HDR + path_len];
     let issuing = path == b"/pki/certificate";
     let root = path == b"/pki/ca";
     if !issuing && !root {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             404,
             b"application/json",
             br#"{"error":"not_found"}"#,
@@ -439,15 +477,15 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         return;
     }
     if root {
-        serve_ca(s, sys, conn, stream);
+        serve_ca(s, sys, &id, credit);
         return;
     }
     if method != METHOD_POST {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             405,
             b"application/json",
             br#"{"error":"invalid_request"}"#,
@@ -459,8 +497,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             503,
             b"application/json",
             br#"{"error":"temporarily_unavailable"}"#,
@@ -475,7 +513,6 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let mut p256_point = [0u8; 65];
     let mut dns = [0u8; MAX_DNS];
     let (subject_len, tenant_len, device_len, key_bytes, dns_len) = {
-        let body = &s.buf[body_at..body_end];
         let dns_len = json_string(body, b"dns", &mut dns);
         let subject_len = json_string(body, b"subject", &mut subject);
         let tenant_len = json_string(body, b"tenant", &mut tenant);
@@ -512,8 +549,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             400,
             b"application/json",
             br#"{"error":"invalid_request","error_description":"dns name not allowed"}"#,
@@ -530,8 +567,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             respond(
                 s,
                 sys,
-                conn,
-                stream,
+                &id,
+                credit,
                 400,
                 b"application/json",
                 br#"{"error":"invalid_request"}"#,
@@ -545,8 +582,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             400,
             b"application/json",
             br#"{"error":"invalid_request"}"#,
@@ -569,8 +606,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             400,
             b"application/json",
             br#"{"error":"invalid_request"}"#,
@@ -589,8 +626,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             503,
             b"application/json",
             br#"{"error":"temporarily_unavailable"}"#,
@@ -618,8 +655,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
             respond(
                 s,
                 sys,
-                conn,
-                stream,
+                &id,
+                credit,
                 500,
                 b"application/json",
                 br#"{"error":"server_error"}"#,
@@ -634,8 +671,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             500,
             b"application/json",
             br#"{"error":"server_error"}"#,
@@ -654,8 +691,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             500,
             b"application/json",
             br#"{"error":"server_error"}"#,
@@ -673,8 +710,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             500,
             b"application/json",
             br#"{"error":"server_error"}"#,
@@ -686,8 +723,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            &id,
+            credit,
             500,
             b"application/json",
             br#"{"error":"server_error"}"#,
@@ -704,7 +741,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let _ = put(&mut body, &mut at, &san[..san_len]);
     let _ = put(&mut body, &mut at, b"\"}");
 
-    respond(s, sys, conn, stream, 200, b"application/json", &body[..at]);
+    respond(s, sys, &id, credit, 200, b"application/json", &body[..at]);
 }
 
 /// The algorithm the loaded key signs with.
@@ -778,14 +815,14 @@ fn ca_certificate(
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u16) {
+unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, id: &http_app::AppId, credit: u32) {
     if !s.key.is_open() {
         s.certificate_no_key = s.certificate_no_key.saturating_add(1);
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             b"application/json",
             br#"{"error":"temporarily_unavailable"}"#,
@@ -798,8 +835,8 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             b"application/json",
             br#"{"error":"temporarily_unavailable"}"#,
@@ -813,8 +850,8 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             b"application/json",
             br#"{"error":"temporarily_unavailable"}"#,
@@ -826,8 +863,8 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             500,
             b"application/json",
             br#"{"error":"server_error"}"#,
@@ -841,8 +878,8 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             500,
             b"application/json",
             br#"{"error":"server_error"}"#,
@@ -852,8 +889,8 @@ unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, conn: u16, stream: u
     respond(
         s,
         sys,
-        conn,
-        stream,
+        id,
+        credit,
         200,
         b"application/x-pem-file",
         &pem[..pem_len],
@@ -1027,39 +1064,18 @@ fn put(out: &mut [u8], at: &mut usize, bytes: &[u8]) -> Option<()> {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     content_type: &[u8],
     body: &[u8],
 ) {
-    let total = RESP_HDR + content_type.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) =
+        http_exchange::write_response(id, status, content_type, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "content types here are short literals"
-    )]
-    {
-        s.out[7] = content_type.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + content_type.len()].copy_from_slice(content_type);
-    s.out[RESP_HDR + content_type.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 #[no_mangle]

@@ -255,6 +255,16 @@ primitive the key's own suite names — `ecdsa_verify`, `ed25519_verify` or
 60-second skew. The reply is a typed identity, so the caller authorises on fields it
 did not have to parse.
 
+## storage_key, storage_custodian and storage_key_endpoint
+
+The storage-key service: signed grants for encrypted volumes, fresh
+attachment bundles released after a device proof, rotation, renewal,
+recovery and erasure, every decision audited in the ledger. Kagi holds no
+volume key; the custodians' vaults rewrap shares under orders it signed.
+Message ids `0x80`–`0x87`, ledger namespaces 9–13. Nodes reach the service
+over `POST /storage-key`, which admits only the operations that carry their
+own proof. See [storage-key.md](storage-key.md).
+
 ## Embedding elsewhere
 
 kagi publishes to the local OCI store (`fluxor publish` → the `kagi-common`

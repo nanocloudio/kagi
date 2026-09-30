@@ -381,6 +381,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_events(s, sys);
         drain_admissions(s, sys);
         service_pending(s, sys);
+
         0
     }
 }
@@ -401,12 +402,19 @@ unsafe fn drain_peer_identities(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
         let at = PEER_ENVELOPE_HDR;
-        let conn = u32::from_le_bytes([
+        // The field is a SESSION id, not a connection id: the low half is
+        // the connection and the high half the generation the session stage
+        // stamped on it. `http` reports the bare connection on its admission
+        // request, so the join is on the connection alone — comparing whole
+        // session ids never matches, and the gate then refuses every
+        // handshake for want of an identity it was in fact sent.
+        let session = u32::from_le_bytes([
             s.buf[at + PEER_OFF_SESSION],
             s.buf[at + PEER_OFF_SESSION + 1],
             s.buf[at + PEER_OFF_SESSION + 2],
             s.buf[at + PEER_OFF_SESSION + 3],
         ]);
+        let conn = session & 0xFFFF;
         let flags = u32::from_le_bytes([
             s.buf[at + PEER_OFF_FLAGS],
             s.buf[at + PEER_OFF_FLAGS + 1],

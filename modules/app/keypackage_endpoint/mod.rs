@@ -54,6 +54,14 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
 include!("../../common/sdk_bridge.rs");
 
+// wave's application-exchange contract, mounted from the materialised
+// `wave-common` tree: the record layout and its accessors belong to the
+// server that defines them, not to a copy here.
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[path = "../../common/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/b64.rs"]
@@ -64,6 +72,15 @@ mod chan;
 mod credential;
 #[path = "../../common/device_auth.rs"]
 mod device_auth;
+
+/// The request collector sizes its header block from what a device presents,
+/// and it restates that size rather than importing this module. This is what
+/// keeps the two honest: a wider credential here refuses to build until the
+/// collector that has to hold it is widened too.
+const _: () = assert!(
+    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    "a presented credential must fit the request collector's header block"
+);
 #[path = "../../common/dpop.rs"]
 mod dpop;
 #[path = "../../common/jose.rs"]
@@ -78,8 +95,6 @@ mod verify_keyset;
 use credential::Ciphersuite;
 
 const STEP_DID_WORK: i32 = 2;
-const REQ_HDR: usize = 12;
-const RESP_HDR: usize = 12;
 const METHOD_POST: u8 = 3;
 
 /// Devices whose pools this module holds.
@@ -208,6 +223,17 @@ struct ModuleState {
     package_pool_full: u32,
     package_malformed: u32,
 
+    /// Requests being collected: wave's exchanges are streamed, so a
+
+    /// request is answered once its body is whole.
+    exch: http_exchange::Table,
+    /// One response or body-credit record owed to `out_responses`.
+    ///
+    /// The step loop places what is owed before it reads anything new, so a
+    /// refused write holds the answer instead of losing it. See
+    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
+    outbox: http_exchange::Outbox,
+
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
 }
@@ -254,6 +280,8 @@ pub extern "C" fn module_new(
         s.keypkg_unauthenticated = 0;
         s.keypkg_wrong_device = 0;
         s.out_responses = out_chan;
+        s.exch = http_exchange::Table::new();
+        s.outbox = http_exchange::Outbox::new();
         s.pools = [Pool::empty(); MAX_DEVICES];
         s.package_published = 0;
         s.package_claimed_exclusive = 0;
@@ -279,15 +307,46 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         let mut worked = false;
         for _ in 0..MAX_REQS_PER_STEP {
-            if !chan::can_read(sys, s.in_requests) || !chan::can_write(sys, s.out_responses) {
+            // What is already owed goes out first, and nothing new is read
+            // until it has gone: a record read and then dropped on a refused
+            // write answers its request with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
+            if !chan::can_read(sys, s.in_requests) {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < REQ_HDR as i32 {
+            if n < http_app::APP_HDR as i32 {
                 break;
             }
-            handle_request(s, sys, n as usize);
             worked = true;
+            // Disjoint fields: the collector and the read buffer are borrowed
+            // separately so the record needs no copy.
+            let outcome = {
+                let ModuleState { exch, buf, .. } = &mut *s;
+                exch.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // Request-body credit the collector owes: the server forwards a
+            // body only up to what this endpoint has granted.
+            if let Some((gid, bytes)) = s.exch.take_grant() {
+                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, n);
+                }
+            }
+            match outcome {
+                Ok(Some(at)) => handle_request(s, sys, at),
+                // Collecting; the answer waits for the rest of the body.
+                Ok(None) => {}
+                // Refusing is a decision, and the caller is owed it. The
+                // collector kept the exchange it belongs to, unless the record
+                // named none this could answer.
+                Err(why) => {
+                    if let Some((rid, rcredit, _)) = s.exch.take_refusal() {
+                        respond(s, sys, &rid, rcredit, why.status(), why.body());
+                    }
+                }
+            }
         }
 
         if worked {
@@ -301,40 +360,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and a live syscall table.
-unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < REQ_HDR {
-        return;
-    }
-    let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
-    let stream = u16::from_le_bytes([s.buf[2], s.buf[3]]);
-    let method = s.buf[4];
-    let path_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([s.buf[8], s.buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
-
-    let Some(body_at) = REQ_HDR
-        .checked_add(path_len)
-        .and_then(|at| at.checked_add(hdr_len))
-    else {
+unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(req) = s.exch.request(at) else {
         return;
     };
-    let Some(body_end) = body_at.checked_add(body_len) else {
-        return;
-    };
-    if body_end > plen {
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
-        return;
-    }
+    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    // Copied out of the collector so the handler can still take `&mut s`:
+    // the request borrows the table, and answering borrows the module.
+    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let path_len = req.target.len().min(target_buf.len());
+    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let hdr_len = req.headers.len().min(header_buf.len());
+    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let body_len = req.body.len().min(body_buf.len());
+    body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
+    s.exch.release(at);
+    let path = &target_buf[..path_len];
+    let headers = &header_buf[..hdr_len];
+    let body = &body_buf[..body_len];
 
-    let path = &s.buf[REQ_HDR..REQ_HDR + path_len];
     let claiming = path == b"/e2ee/keypackages/claim";
     let publishing = path == b"/e2ee/keypackages";
     if !claiming && !publishing {
-        respond(s, sys, conn, stream, 404, br#"{"error":"not_found"}"#);
+        respond(s, sys, &id, credit, 404, br#"{"error":"not_found"}"#);
         return;
     }
     if method != METHOD_POST {
-        respond(s, sys, conn, stream, 405, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, &id, credit, 405, br#"{"error":"invalid_request"}"#);
         return;
     }
 
@@ -351,14 +405,14 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let mut route = [0u8; MAX_ID];
     let route_len = path.len().min(MAX_ID);
     route[..route_len].copy_from_slice(&path[..route_len]);
-    let Some(device_id) = authenticate(s, sys, conn, stream, &route[..route_len], body_at) else {
+    let Some(device_id) = authenticate(s, sys, &id, credit, &route[..route_len], headers) else {
         return;
     };
 
     if claiming {
-        claim(s, sys, conn, stream, body_at, body_end, &device_id);
+        claim(s, sys, &id, credit, body, &device_id);
     } else {
-        publish(s, sys, conn, stream, body_at, body_end, &device_id);
+        publish(s, sys, &id, credit, body, &device_id);
     }
 }
 
@@ -373,31 +427,29 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
 unsafe fn authenticate(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     path: &[u8],
-    body_at: usize,
+    headers: &[u8],
 ) -> Option<AuthenticatedDevice> {
     if s.keyset.is_empty() {
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             br#"{"error":"temporarily_unavailable"}"#,
         );
         return None;
     }
-    let path_len = path.len();
     let mut uri = [0u8; MAX_ID];
-    let uri_len = path_len.min(MAX_ID);
+    let uri_len = path.len().min(MAX_ID);
     uri[..uri_len].copy_from_slice(&path[..uri_len]);
 
     let mut credential = [0u8; device_auth::MAX_SEGMENT];
     let mut proof = [0u8; device_auth::MAX_SEGMENT];
     let (credential_len, proof_len) = {
-        let headers = &s.buf[REQ_HDR + path_len..body_at];
         (
             header_value(headers, b"authorization")
                 .and_then(strip_dpop_scheme)
@@ -407,7 +459,7 @@ unsafe fn authenticate(
     };
     if credential_len == 0 || proof_len == 0 {
         s.keypkg_unauthenticated = s.keypkg_unauthenticated.saturating_add(1);
-        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        respond(s, sys, id, credit, 401, br#"{"error":"invalid_client"}"#);
         return None;
     }
 
@@ -426,8 +478,8 @@ unsafe fn authenticate(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             br#"{"error":"temporarily_unavailable"}"#,
         );
@@ -483,12 +535,12 @@ unsafe fn authenticate(
     };
     let Ok(admitted) = admitted else {
         s.keypkg_unauthenticated = s.keypkg_unauthenticated.saturating_add(1);
-        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        respond(s, sys, id, credit, 401, br#"{"error":"invalid_client"}"#);
         return None;
     };
     let Some(device_id) = jose::claim_str(admitted.claims, b"device_id") else {
         s.keypkg_unauthenticated = s.keypkg_unauthenticated.saturating_add(1);
-        respond(s, sys, conn, stream, 401, br#"{"error":"invalid_client"}"#);
+        respond(s, sys, id, credit, 401, br#"{"error":"invalid_client"}"#);
         return None;
     };
     let mut out = AuthenticatedDevice {
@@ -522,16 +574,14 @@ impl AuthenticatedDevice {
 unsafe fn publish(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
-    body_at: usize,
-    body_end: usize,
+    id: &http_app::AppId,
+    credit: u32,
+    body: &[u8],
     authenticated: &AuthenticatedDevice,
 ) {
     let mut device = [0u8; MAX_ID];
     let mut payload = [0u8; MAX_PAYLOAD];
     let (device_len, payload_len, generation, not_after, reuse, suite_ok) = {
-        let body = &s.buf[body_at..body_end];
         let device_len = json_string(body, b"device_id", &mut device);
         let mut encoded = [0u8; MAX_PAYLOAD * 2];
         let encoded_len = json_string(body, b"payload", &mut encoded);
@@ -572,8 +622,8 @@ unsafe fn publish(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             400,
             br#"{"error":"invalid_request","detail":"device_not_caller_selected"}"#,
         );
@@ -585,12 +635,12 @@ unsafe fn publish(
 
     if device_len == 0 || payload_len == 0 || generation == 0 || not_after == 0 || !suite_ok {
         s.package_malformed = s.package_malformed.saturating_add(1);
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, id, credit, 400, br#"{"error":"invalid_request"}"#);
         return;
     }
     let Ok(generation) = u32::try_from(generation) else {
         s.package_malformed = s.package_malformed.saturating_add(1);
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, id, credit, 400, br#"{"error":"invalid_request"}"#);
         return;
     };
 
@@ -599,8 +649,8 @@ unsafe fn publish(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             br#"{"error":"temporarily_unavailable"}"#,
         );
@@ -609,7 +659,7 @@ unsafe fn publish(
 
     let Some(slot) = s.pools[index].packages.iter().position(|p| !p.live) else {
         s.package_pool_full = s.package_pool_full.saturating_add(1);
-        respond(s, sys, conn, stream, 409, br#"{"error":"pool_full"}"#);
+        respond(s, sys, id, credit, 409, br#"{"error":"pool_full"}"#);
         return;
     };
 
@@ -626,7 +676,7 @@ unsafe fn publish(
     package.live = true;
 
     s.package_published = s.package_published.saturating_add(1);
-    respond(s, sys, conn, stream, 200, br#"{"published":true}"#);
+    respond(s, sys, id, credit, 200, br#"{"published":true}"#);
 }
 
 /// Consume one package for a device.
@@ -637,20 +687,16 @@ unsafe fn publish(
 unsafe fn claim(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
-    body_at: usize,
-    body_end: usize,
+    id: &http_app::AppId,
+    credit: u32,
+    body: &[u8],
     _authenticated: &AuthenticatedDevice,
 ) {
     let mut device = [0u8; MAX_ID];
-    let device_len = {
-        let body = &s.buf[body_at..body_end];
-        json_string(body, b"device_id", &mut device)
-    };
+    let device_len = { json_string(body, b"device_id", &mut device) };
     if device_len == 0 {
         s.package_malformed = s.package_malformed.saturating_add(1);
-        respond(s, sys, conn, stream, 400, br#"{"error":"invalid_request"}"#);
+        respond(s, sys, id, credit, 400, br#"{"error":"invalid_request"}"#);
         return;
     }
     // A credential's validity window is a statement about a date, so it
@@ -668,8 +714,8 @@ unsafe fn claim(
         respond(
             s,
             sys,
-            conn,
-            stream,
+            id,
+            credit,
             503,
             br#"{"error":"temporarily_unavailable"}"#,
         );
@@ -682,7 +728,7 @@ unsafe fn claim(
         .position(|p| p.live && p.device[..usize::from(p.device_len)] == device[..device_len])
     else {
         s.package_pool_empty = s.package_pool_empty.saturating_add(1);
-        respond(s, sys, conn, stream, 404, br#"{"error":"no_packages"}"#);
+        respond(s, sys, id, credit, 404, br#"{"error":"no_packages"}"#);
         return;
     };
 
@@ -701,7 +747,7 @@ unsafe fn claim(
     });
     let Some(slot) = chosen else {
         s.package_pool_empty = s.package_pool_empty.saturating_add(1);
-        respond(s, sys, conn, stream, 404, br#"{"error":"no_packages"}"#);
+        respond(s, sys, id, credit, 404, br#"{"error":"no_packages"}"#);
         return;
     };
 
@@ -723,7 +769,7 @@ unsafe fn claim(
         &package.payload[..usize::from(package.payload_len)],
         &mut encoded,
     ) else {
-        respond(s, sys, conn, stream, 500, br#"{"error":"server_error"}"#);
+        respond(s, sys, id, credit, 500, br#"{"error":"server_error"}"#);
         return;
     };
 
@@ -746,7 +792,7 @@ unsafe fn claim(
     let _ = put(&mut body, &mut at, &encoded[..encoded_len]);
     let _ = put(&mut body, &mut at, b"\"}");
 
-    respond(s, sys, conn, stream, 200, &body[..at]);
+    respond(s, sys, id, credit, 200, &body[..at]);
 }
 
 /// The pool for a device at `generation`, creating or rotating as needed.
@@ -830,39 +876,17 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Option<()> {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn: u16,
-    stream: u16,
+    id: &http_app::AppId,
+    credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"application/json";
-    let total = RESP_HDR + CT.len() + body.len();
-    if total > s.out.len() {
+    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    else {
         return;
-    }
-    s.out[0..2].copy_from_slice(&conn.to_le_bytes());
-    s.out[2..4].copy_from_slice(&stream.to_le_bytes());
-    s.out[4..6].copy_from_slice(&status.to_le_bytes());
-    s.out[6] = 0;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "CT is a 16-byte literal, so the length fits a u8"
-    )]
-    {
-        s.out[7] = CT.len() as u8;
-    }
-    s.out[8..10].copy_from_slice(&0u16.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "bounded by the `total > s.out.len()` check above"
-    )]
-    {
-        s.out[10..12].copy_from_slice(&(body.len() as u16).to_le_bytes());
-    }
-    s.out[RESP_HDR..RESP_HDR + CT.len()].copy_from_slice(CT);
-    s.out[RESP_HDR + CT.len()..total].copy_from_slice(body);
-
-    (sys.channel_write)(s.out_responses, s.out.as_ptr(), total);
+    };
+    s.outbox.send(sys, s.out_responses, &s.out, total);
 }
 
 /// The primitives the shared authentication fragment is given.
