@@ -113,9 +113,9 @@ configured, because the document's shape is what clients parse:
 | `capacity` | 1 000, at roughly a 1% false-positive rate |
 
 The bitmap is bounded by what one response can carry: the document must fit
-a single `HttpResponse` envelope, since a larger body needs `MORE_BODY`
-chunking and a document arriving in pieces needs a resumption story for the
-client fetching it. A document fetched on every cold start should be small.
+a single response record, since a larger body needs `MORE` streaming and a
+document arriving in pieces needs a resumption story for the client fetching
+it. A document fetched on every cold start should be small.
 
 The snapshot also carries `bitmap`, `salt`, `inserted` and `updated_at`. The
 salt is why one deployment's document says nothing about another's.

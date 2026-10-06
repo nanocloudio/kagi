@@ -64,10 +64,13 @@ use crate::storage_key::{self as sk, Binding, Record, Refusal};
 /// Message types. `0x80`+: `state_wire` holds `0x60`–`0x71`, the lattice
 /// adapter `0xC0`+.
 pub mod msg {
-    /// `[corr u32][op u8][resource kind u8][resource 16][body]`.
+    /// `[op u8][resource kind u8][resource 16][body]`: the body of a request
+    /// exchange to the `storage_key` module, inside its envelope. The
+    /// exchange id is the correlation.
     pub const REQUEST: u8 = 0x80;
-    /// `[corr u32][op u8][status u8][refusal u8][audited u8]
-    ///  [record f16][bundle f16][extra f16]`.
+    /// `[op u8][status u8][refusal u8][audited u8]
+    ///  [record f16][bundle f16][extra f16]`: the answer's body, inside its
+    /// envelope.
     pub const REPLY: u8 = 0x81;
     /// To custodians: `[corr u32][custodian u8][record f16][recipient f8]
     /// [envelope f16]`.
@@ -118,9 +121,13 @@ pub enum Port {
     Ledger,
     /// The custodians' shared order port.
     Custodian,
-    /// The requester.
-    Reply,
 }
+
+/// Length of a [`Caller`].
+pub const CALLER_LEN: usize = 14;
+/// Who asked: the id of the exchange a request arrived on, opaque here and
+/// handed back with its answer.
+pub type Caller = [u8; CALLER_LEN];
 
 /// What the service needs from wherever it runs.
 ///
@@ -149,6 +156,8 @@ pub trait Host {
     ) -> sk::DeviceFacts;
     /// Write one whole `[type][len][payload]` frame to `port`.
     fn send(&mut self, port: Port, frame: &[u8]) -> bool;
+    /// Answer `caller` with one whole `[REPLY][len][payload]` envelope.
+    fn answer(&mut self, caller: &Caller, frame: &[u8]) -> bool;
 }
 
 /// Counters, one per outcome an operator asks about.
@@ -334,8 +343,8 @@ struct Op {
     live: bool,
     code: u8,
     stage: u8,
-    /// The requester's correlation id.
-    corr: u32,
+    /// Who asked, answered when the operation ends.
+    caller: Caller,
     /// This operation's id towards the ledger and custodians.
     icorr: u32,
     deadline_ms: u64,
@@ -377,7 +386,7 @@ impl Op {
             live: false,
             code: 0,
             stage: 0,
-            corr: 0,
+            caller: [0; CALLER_LEN],
             icorr: 0,
             deadline_ms: 0,
             req: [0; MAX_REQUEST],
@@ -404,7 +413,7 @@ impl Op {
         self.live = false;
         self.code = 0;
         self.stage = 0;
-        self.corr = 0;
+        self.caller = [0; CALLER_LEN];
         self.icorr = 0;
         self.deadline_ms = 0;
         // A request and a released share envelope are not left in a free
@@ -668,10 +677,9 @@ fn read_attach_fields<'a>(
 }
 
 /// Encode a request frame.
-pub fn write_request(corr: u32, op: u8, body: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut payload = [0u8; 5 + MAX_REQUEST];
+pub fn write_request(op: u8, body: &[u8], out: &mut [u8]) -> Option<usize> {
+    let mut payload = [0u8; 1 + MAX_REQUEST];
     let mut w = sk::Writer::new(&mut payload);
-    w.u32(corr)?;
     w.u8(op)?;
     w.bytes(body)?;
     let n = w.len();
@@ -680,7 +688,6 @@ pub fn write_request(corr: u32, op: u8, body: &[u8], out: &mut [u8]) -> Option<u
 
 /// A decoded reply.
 pub struct Reply<'a> {
-    pub corr: u32,
     pub op: u8,
     pub status: u8,
     pub refusal: u8,
@@ -693,7 +700,6 @@ pub struct Reply<'a> {
 pub fn read_reply(payload: &[u8]) -> Option<Reply<'_>> {
     let mut r = sk::Reader::new(payload);
     let reply = Reply {
-        corr: r.u32()?,
         op: r.u8()?,
         status: r.u8()?,
         refusal: r.u8()?,
@@ -840,8 +846,8 @@ impl Service {
         self.ops.iter().filter(|o| o.live).count()
     }
 
-    /// A `REQUEST` payload arrived.
-    pub fn on_request<H: Host>(&mut self, host: &mut H, payload: &[u8]) {
+    /// A `REQUEST` payload arrived from `caller`.
+    pub fn on_request<H: Host>(&mut self, host: &mut H, caller: &Caller, payload: &[u8]) {
         let Self {
             cfg,
             next_corr,
@@ -857,15 +863,16 @@ impl Service {
             stats,
         };
         let mut r = sk::Reader::new(payload);
-        let (Some(corr), Some(code)) = (r.u32(), r.u8()) else {
+        let Some(code) = r.u8() else {
+            refuse_now(&mut cx, caller, 0, Refusal::Malformed);
             return;
         };
         let body = payload.get(r.position()..).unwrap_or(&[]);
         let now = cx.host.now_ms();
         if code == sk::op::CHALLENGE {
             match issue_challenge(&mut cx, challenges, body, now) {
-                Ok(extra) => send_reply(&mut cx, corr, code, None, true, &[], &[], &extra),
-                Err(refusal) => refuse_now(&mut cx, corr, code, refusal),
+                Ok(extra) => send_reply(&mut cx, caller, code, None, true, &[], &[], &extra),
+                Err(refusal) => refuse_now(&mut cx, caller, code, refusal),
             }
             return;
         }
@@ -880,18 +887,18 @@ impl Service {
             None
         };
         if let Some(refusal) = refusal {
-            refuse_now(&mut cx, corr, code, refusal);
+            refuse_now(&mut cx, caller, code, refusal);
             return;
         }
         let Some(op) = ops.iter_mut().find(|o| !o.live) else {
             cx.stats.busy = cx.stats.busy.saturating_add(1);
-            refuse_now(&mut cx, corr, code, Refusal::Busy);
+            refuse_now(&mut cx, caller, code, Refusal::Busy);
             return;
         };
         op.reset();
         op.live = true;
         op.code = code;
-        op.corr = corr;
+        op.caller = *caller;
         op.icorr = *next_corr;
         *next_corr = next_corr.wrapping_add(1).max(1);
         op.req[..body.len()].copy_from_slice(body);
@@ -999,25 +1006,27 @@ impl Service {
                 *c = Challenge::empty();
             }
         }
-        for op in ops.iter_mut() {
-            if !op.live || now < op.deadline_ms {
-                continue;
-            }
-            if op.stage == stage::WRITE_AUDIT {
-                // The audit write did not answer: the decision stands
-                // unrecorded, and a release is withheld.
-                cx.stats.audit_failed = cx.stats.audit_failed.saturating_add(1);
-                reply(&mut cx, op, false);
-                op.reset();
-                continue;
-            }
-            let refusal = if stage::custodians(op.stage) {
-                Refusal::CustodianRefused
-            } else {
-                Refusal::LedgerUnavailable
-            };
-            finish(&mut cx, op, Err(refusal));
+        // One expiry per tick: each ends in at most one frame — an answer or
+        // an audit write — so a host that places one record at a time never
+        // has a second offered before the first is away. The rest expire on
+        // the ticks that follow.
+        let Some(op) = ops.iter_mut().find(|op| op.live && now >= op.deadline_ms) else {
+            return;
+        };
+        if op.stage == stage::WRITE_AUDIT {
+            // The audit write did not answer: the decision stands
+            // unrecorded, and a release is withheld.
+            cx.stats.audit_failed = cx.stats.audit_failed.saturating_add(1);
+            reply(&mut cx, op, false);
+            op.reset();
+            return;
         }
+        let refusal = if stage::custodians(op.stage) {
+            Refusal::CustodianRefused
+        } else {
+            Refusal::LedgerUnavailable
+        };
+        finish(&mut cx, op, Err(refusal));
     }
 }
 
@@ -2331,20 +2340,29 @@ fn reply<H: Host>(cx: &mut Cx<'_, H>, op: &Op, audited: bool) {
         &[]
     };
     let bundle: &[u8] = if with_bundle { &bundle } else { &[] };
-    send_reply(cx, op.corr, op.code, refusal, audited, record, bundle, &[]);
+    send_reply(
+        cx,
+        &op.caller,
+        op.code,
+        refusal,
+        audited,
+        record,
+        bundle,
+        &[],
+    );
 }
 
 /// Answer a request that never took a slot: no key, no clock, no room, or
 /// a challenge. There is no decision about a resource to audit.
-fn refuse_now<H: Host>(cx: &mut Cx<'_, H>, corr: u32, op: u8, refusal: Refusal) {
+fn refuse_now<H: Host>(cx: &mut Cx<'_, H>, caller: &Caller, op: u8, refusal: Refusal) {
     cx.stats.refused = cx.stats.refused.saturating_add(1);
-    send_reply(cx, corr, op, Some(refusal), false, &[], &[], &[]);
+    send_reply(cx, caller, op, Some(refusal), false, &[], &[], &[]);
 }
 
 #[expect(clippy::too_many_arguments, reason = "one reply frame, field by field")]
 fn send_reply<H: Host>(
     cx: &mut Cx<'_, H>,
-    corr: u32,
+    caller: &Caller,
     op: u8,
     refusal: Option<Refusal>,
     audited: bool,
@@ -2359,8 +2377,7 @@ fn send_reply<H: Host>(
     } else {
         STATUS_OK
     };
-    let ok = w.u32(corr).is_some()
-        && w.u8(op).is_some()
+    let ok = w.u8(op).is_some()
         && w.u8(status).is_some()
         && w.u8(refusal.map_or(0, Refusal::code)).is_some()
         && w.u8(u8::from(audited)).is_some()
@@ -2374,7 +2391,7 @@ fn send_reply<H: Host>(
     if let Ok(n) =
         auth_wire::write_envelope(msg::REPLY, payload.get(..len).unwrap_or(&[]), cx.frame)
     {
-        let _ = cx.host.send(Port::Reply, cx.frame.get(..n).unwrap_or(&[]));
+        let _ = cx.host.answer(caller, cx.frame.get(..n).unwrap_or(&[]));
     }
 }
 

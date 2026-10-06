@@ -1,7 +1,11 @@
 //! Token Mint — ES256 / EdDSA JWS access-token minting.
 //!
-//! Consumes MSG_MINT_REQ on `mint_requests` and replies MSG_MINT_RESP
-//! on `tokens`. The signing key arrives on `key_material` as
+//! A typed operation: a PROVIDER of the workspace exchange contract on
+//! `request_in` / `response_out`, each request body one `MSG_MINT_REQ`
+//! envelope and each answer body one `MSG_MINT_RESP` envelope, every verdict
+//! a 200 exchange (`typed_exchange.rs`; byte layouts in
+//! `docs/architecture/typed-operations.md`). The signing key arrives on
+//! `key_material` as
 //! MSG_KEY_ADD (`[alg u8][kid f8][key 32B]` — P-256 private scalar
 //! big-endian for ES256, RFC 8032 seed for Ed25519); until one lands
 //! every mint replies ST_NO_KEY, and requests whose `alg` doesn't match
@@ -55,6 +59,8 @@ mod jose;
 mod key_custody;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
 
 // The fluxor key_vault capability surface (opcodes / key_types). When a
 // backend is present the signing key lives in it (kernel static slots on the
@@ -63,6 +69,7 @@ mod time_policy;
 #[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
 mod key_vault;
 
+use abi::contracts::exchange::{self as x, Collector, ExchangeId};
 use auth_wire::{MintClaimValue, MintRequest, PayloadWriter};
 
 // This deployment's posture, for the key-custody floor — a DECLARED graph
@@ -160,7 +167,7 @@ impl KeySlot {
             && &self.kid[..usize::from(self.kid_len)] == kid
     }
 }
-/// Compact JWS output cap; also bounds the `tokens` port max_record. Sized
+/// Compact JWS output cap, and so the bound on an answer's body. Sized
 /// to hold a token carrying a realistic set of custom claims, not just the
 /// fixed reserved-claim set.
 const TOKEN_BUF_LEN: usize = 4096;
@@ -171,13 +178,23 @@ const TOKEN_BUF_LEN: usize = 4096;
 /// suite this budget does not fit declares a `step_deadline_us` for the
 /// module rather than leaving the guard to discover it.
 const MAX_REQS_PER_STEP: usize = 4;
+/// Exchanges collected at once.
+const MAX_EXCHANGES: usize = 4;
+/// Longest target and header block held. Neither is read; they are bounded
+/// so the module can sit behind an HTTP route as well as a pipeline.
+const MAX_TARGET: usize = 256;
+const MAX_HEADERS: usize = 1024;
+/// Longest `MSG_MINT_REQ` payload, and so the longest request body: the
+/// payload plus its envelope.
+const MAX_REQUEST_PAYLOAD: usize = 4096;
+const MAX_REQUEST: usize = MAX_REQUEST_PAYLOAD + auth_wire::ENVELOPE;
 
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32, // in[0]: MSG_MINT_REQ
-    out_tokens: i32,  // out[0]: MSG_MINT_RESP
-    in_key: i32,      // in[1]: MSG_KEY_ADD
+    in_requests: i32,   // in[0]:  ExchangeRequest, MSG_MINT_REQ bodies
+    out_responses: i32, // out[0]: ExchangeResponse, MSG_MINT_RESP bodies
+    in_key: i32,        // in[1]: MSG_KEY_ADD
     /// out[1]: the public half of each signing key, as a VERIFY KEY_ADD.
     out_key_announce: i32,
 
@@ -203,7 +220,18 @@ struct ModuleState {
     no_key_errors: u32,
     sign_ops: u32,
 
-    msg_buf: [u8; 4096],
+    /// The payload of the request being minted.
+    msg_buf: [u8; MAX_REQUEST_PAYLOAD],
+
+    /// Requests being collected until their body is whole.
+    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    /// The one answer, credit or refusal owed to `response_out`. Nothing new
+    /// is read while it is held.
+    outbox: ExchangeOutbox,
+    /// The record being read.
+    buf: [u8; x::RECORD_MAX],
+    /// The record being written.
+    out: [u8; x::RECORD_MAX],
 }
 
 #[no_mangle]
@@ -251,7 +279,9 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
 
         s.in_requests = in_chan;
-        s.out_tokens = out_chan;
+        s.out_responses = out_chan;
+        s.requests = Collector::new();
+        s.outbox = ExchangeOutbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_key_announce = dev_channel_port(sys, 1, 1);
 
@@ -358,22 +388,70 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_key_material(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
+            // What is owed goes out first, and nothing new is read until it
+            // has: a request taken and then answered into a full channel
+            // would be answered with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
             if !chan::can_read(sys, s.in_requests) {
                 break;
             }
-            // Every request produces exactly one reply; don't consume a
-            // request we cannot answer.
-            if !chan::can_write(sys, s.out_tokens) {
+            let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
+            if n <= 0 {
                 break;
             }
-            let (msg_type, plen) = chan::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
-            if msg_type != auth_wire::MSG_MINT_REQ {
-                continue;
+            let outcome = {
+                let ModuleState { requests, buf, .. } = &mut *s;
+                requests.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // One record owes at most one thing: a body grant, a refusal, or
+            // (once whole) an answer.
+            if let Some((id, bytes)) = s.requests.take_grant() {
+                if let Some(len) = x::write_credit(&id, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, len);
+                }
             }
-            handle_mint(s, sys, plen as usize);
+            if let Some((id, why)) = s.requests.take_refusal() {
+                answer_status(s, sys, &id, why.status());
+            }
+            if let Ok(Some(at)) = outcome {
+                take_request(s, sys, at);
+            }
         }
 
         0
+    }
+}
+
+/// Take the request the collector completed in slot `at`: answer a status
+/// for one this operation does not read, or mint.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(request) = s.requests.request(at) else {
+        return;
+    };
+    let id = request.id;
+    let mut status = typed_exchange::admissible(request.method, request.resp_credit);
+    let mut plen = 0usize;
+    if status.is_none() {
+        match typed_exchange::message(request.body) {
+            Some((auth_wire::MSG_MINT_REQ, payload)) if payload.len() <= s.msg_buf.len() => {
+                s.msg_buf[..payload.len()].copy_from_slice(payload);
+                plen = payload.len();
+            }
+            _ => status = Some(x::status::BAD_REQUEST),
+        }
+    }
+    s.requests.release(at);
+    match status {
+        Some(status) => answer_status(s, sys, &id, status),
+        None => handle_mint(s, sys, &id, plen),
     }
 }
 
@@ -693,30 +771,23 @@ unsafe fn destroy_slot_key(s: &mut ModuleState, sys: &SyscallTable, i: usize) {
     s.keys[i].key.close(sys);
 }
 
-/// Handle one MSG_MINT_REQ payload sitting in `s.msg_buf[..plen]`.
+/// Mint for the `MSG_MINT_REQ` payload sitting in `s.msg_buf[..plen]`, and
+/// answer exchange `id`.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    // Layout is `[corr u32]…`; the correlation id we echo on a reply is the
-    // first field, so a request too short to hold one cannot be answered.
-    if plen < 4 {
-        // No correlation id — nowhere to address a reply.
-        return;
-    }
-    let corr = u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
-
+unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, plen: usize) {
     let Ok(req) = MintRequest::decode(&s.msg_buf[..plen]) else {
         s.mint_err = s.mint_err.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::mint_err::MALFORMED);
+        refuse(s, sys, id, auth_wire::mint_err::MALFORMED);
         return;
     };
     if !auth_wire::suite::is_implemented(req.suite) {
         s.mint_err = s.mint_err.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::mint_err::UNSUPPORTED_SUITE);
+        refuse(s, sys, id, auth_wire::mint_err::UNSUPPORTED_SUITE);
         return;
     }
 
@@ -732,7 +803,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
         s.mint_err = s.mint_err.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::mint_err::SIGN_FAILED);
+        refuse(s, sys, id, auth_wire::mint_err::SIGN_FAILED);
         return;
     };
     let Some(slot) = select_key(s, &req, now) else {
@@ -745,12 +816,12 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         } else {
             auth_wire::mint_err::UNKNOWN_KID
         };
-        refuse(s, sys, corr, why);
+        refuse(s, sys, id, why);
         return;
     };
     if s.keys[slot].suite != req.suite {
         s.mint_err = s.mint_err.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::mint_err::SUITE_NOT_PERMITTED);
+        refuse(s, sys, id, auth_wire::mint_err::SUITE_NOT_PERMITTED);
         return;
     }
 
@@ -772,7 +843,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     for claim in req.extra.iter() {
         if extra_len >= jose::MAX_EXTRA_CLAIMS {
             s.mint_err = s.mint_err.saturating_add(1);
-            refuse(s, sys, corr, auth_wire::mint_err::MALFORMED);
+            refuse(s, sys, id, auth_wire::mint_err::MALFORMED);
             return;
         }
         extra[extra_len] = jose::Claim {
@@ -809,7 +880,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     })();
     let Ok(input_len) = built else {
         s.mint_err = s.mint_err.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::mint_err::MALFORMED);
+        refuse(s, sys, id, auth_wire::mint_err::MALFORMED);
         return;
     };
 
@@ -853,13 +924,13 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         // Signing failed with a key that IS loaded — the vault refused, or
         // the slot never opened. Reported as itself: calling it malformed
         // would send an operator to inspect a request that was fine.
-        refuse(s, sys, corr, auth_wire::mint_err::SIGN_FAILED);
+        refuse(s, sys, id, auth_wire::mint_err::SIGN_FAILED);
         return;
     };
 
     let Ok(total) = jose::append_signature(&mut token, input_len, &sig_buf[..sig_len]) else {
         s.mint_err = s.mint_err.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::mint_err::MALFORMED);
+        refuse(s, sys, id, auth_wire::mint_err::MALFORMED);
         return;
     };
 
@@ -867,7 +938,8 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     emit(
         s,
         sys,
-        &auth_wire::MintResponse::inline(corr, &token[..total]),
+        id,
+        &auth_wire::MintResponse::inline(&token[..total]),
     );
 }
 
@@ -902,30 +974,62 @@ fn select_key(s: &ModuleState, req: &MintRequest<'_>, now: u64) -> Option<usize>
     None
 }
 
-/// Emit a `MSG_MINT_RESP`.
+/// Answer with a `MSG_MINT_RESP`: a 200 whose body is the envelope, encoded
+/// straight into the outgoing record.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn emit(s: &mut ModuleState, sys: &SyscallTable, resp: &auth_wire::MintResponse<'_>) {
-    let mut payload = [0u8; TOKEN_BUF_LEN + 64];
-    let mut w = PayloadWriter::new(&mut payload);
-    let _ = w.u32(resp.correlation);
-    let _ = w.u8(resp.status);
-    let _ = w.u8(resp.delivery);
-    let _ = w.u32(resp.required_len);
-    let _ = w.field16(resp.body);
-    let n = w.len();
-    chan::channel_write_msg(sys, s.out_tokens, auth_wire::MSG_MINT_RESP, &payload[..n]);
+unsafe fn emit(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    id: &ExchangeId,
+    resp: &auth_wire::MintResponse<'_>,
+) {
+    let at = typed_exchange::ANSWER_AT + auth_wire::ENVELOPE;
+    let written = {
+        let mut w = PayloadWriter::new(&mut s.out[at..]);
+        w.u8(resp.status)
+            .and_then(|()| w.u8(resp.delivery))
+            .and_then(|()| w.u32(resp.required_len))
+            .and_then(|()| w.field16(resp.body))
+            .map(|()| w.len())
+    };
+    // A credential that does not fit one answer is not delivered in part.
+    let Ok(n) = written else {
+        answer_status(s, sys, id, x::status::FAILED);
+        return;
+    };
+    let head = typed_exchange::ANSWER_AT;
+    s.out[head] = auth_wire::MSG_MINT_RESP;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by the record, far under u16::MAX"
+    )]
+    s.out[head + 1..head + 3].copy_from_slice(&(n as u16).to_le_bytes());
+    if let Some(len) = typed_exchange::seal_answer(id, auth_wire::ENVELOPE + n, &mut s.out) {
+        s.outbox.send(sys, s.out_responses, &s.out, len);
+    }
 }
 
-/// Emit a refusal carrying no credential.
+/// Answer with a refusal verdict carrying no credential.
 ///
 /// # Safety
 ///
 /// As [`emit`].
-unsafe fn refuse(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
-    emit(s, sys, &auth_wire::MintResponse::refused(corr, status, 0));
+unsafe fn refuse(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u8) {
+    emit(s, sys, id, &auth_wire::MintResponse::refused(status, 0));
+}
+
+/// Answer with a status alone: a request this operation did not read.
+///
+/// # Safety
+///
+/// As [`emit`].
+unsafe fn answer_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u16) {
+    if let Some(n) = typed_exchange::write_status(id, status, &mut s.out) {
+        s.outbox.send(sys, s.out_responses, &s.out, n);
+    }
 }

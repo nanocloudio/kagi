@@ -83,7 +83,14 @@ persisted. Kernel-backend evidence proves a tier but never hardware custody.
 
 ## Operations
 
-`storage_key_service::msg::REQUEST` is `[corr u32][op u8][resource kind u8][resource 16][body]`.
+The `storage_key` module is a PROVIDER of the workspace exchange contract on
+`request_in` / `response_out`: a request body is one
+`storage_key_service::msg::REQUEST` envelope, `[0x80][len u16 LE]` then
+`[op u8][resource kind u8][resource 16][body]`, and its answer body one
+`msg::REPLY` envelope; the exchange id is the correlation, so neither carries
+one of its own. The exchange rules — `POST`, response credit, statuses — are
+those of every typed operation
+([typed-operations.md](typed-operations.md)).
 
 | op | Body after the head | Record replied |
 | --- | --- | --- |
@@ -110,8 +117,9 @@ epoch 1, generation 1, no device yet — so a second creation of the same id
 stops there, and it replies with the creation authorisation a provisioning
 vault runs `SHARE_SPLIT` under. Op 4 is what names the device.
 
-The reply is `[corr][op][status][refusal][audited][record f16][bundle f16][extra f16]`;
-refusal codes are `storage_key::Refusal`.
+The reply payload is `[op u8][status u8][refusal u8][audited u8][record f16]
+[bundle f16][extra f16]`; refusal codes are `storage_key::Refusal`, and a
+refusal is still a 200 exchange.
 
 A release is decided in full — grant, directory record, ticket, recovery
 set, proof and evidence — before its anti-replay id is claimed; then two
@@ -123,18 +131,22 @@ lower-index envelope and the higher, 528 bytes.
 ## The network edge
 
 `storage_key_endpoint` serves `POST /storage-key`: the body is one
-`REQUEST` payload and the response is the `REPLY` payload. Only the four
-operations that carry their own proof are admitted there — challenge,
-attach, recover, renew. The control verbs are refused: they authenticate
-nothing at the service, so they belong on an edge inside the control plane's
-own graph.
+`REQUEST` payload (`[op u8][resource kind u8][resource 16][body]`, no
+envelope) and the response is the `REPLY` payload. Only the four operations
+that carry their own proof are admitted there — challenge, attach, recover,
+renew. The control verbs are refused 403: they authenticate nothing at the
+service, so they belong on an edge inside the control plane's own graph.
 
-The service answers every party on one `replies` edge, so the endpoint
-issues the service its own correlations with the high bit set, keeps which
-HTTP stream asked, and answers that stream with the caller's correlation
-restored. A reply outside that space is another party's. Sixteen requests
-are in flight at once, and one unanswered for `timeout_ms` — 30 seconds by
-default — is answered 504 and its slot released.
+Behind wave's `http` the endpoint is a provider; toward the service it is a
+requester, opening one exchange of its own per admitted request on
+`service_out` / `service_in`. The service's `response_out` fans out to every
+requester wired to it, and each answer names the exchange its requester
+opened — a requester's ids carry its own request port, so two never collide —
+so the endpoint answers only the exchanges it opened, to the HTTP stream that
+asked. A status the service raised itself (503 busy, 413 too large) reaches
+the node verbatim. Sixteen requests are in flight at once, and one unanswered
+for `timeout_ms` — 30 seconds by default — is answered 504 and its slot
+released.
 
 ## Renewal
 

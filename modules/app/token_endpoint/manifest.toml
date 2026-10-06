@@ -8,51 +8,52 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 buffer_size = 16384
 
 [[ports]]
 name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 buffer_size = 16384
 
 # To and from `token_mint`. The endpoint owns the HTTP shape of a token
 # request; what a token SAYS, and the key that signs it, stay where they
-# already are.
+# already are. This endpoint is the REQUESTER of the mint's exchange: one
+# POST per token, body a MSG_MINT_REQ envelope, answer a MSG_MINT_RESP.
 [[ports]]
 name = "mint_out"
 direction = "output"
-content_type = "OctetStream"
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
 name = "mint_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
 buffer_size = 16384
+max_record = 8192
 
-# Admission. The credential and DPoP proof go out on `admit_out` and the
-# verdict comes back on `admit_in` — this module holds no keyset, no replay
-# window and no ledger edge, because it decides none of what they are for.
-#
-# `admit_out` is sized for a presentation: a compact JWS credential plus its
-# proof, which a header can carry and a 512-byte record cannot.
+# Admission. The credential and DPoP proof go out on `admit_out` as a
+# MSG_ADMIT_REQ exchange and the verdict comes back on `admit_in` — this
+# module holds no keyset, no replay window and no ledger edge, because it
+# decides none of what they are for.
 [[ports]]
 name = "admit_out"
 index = 2
 direction = "output"
-content_type = "OctetStream"
-max_record = 4096
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
 name = "admit_in"
 index = 3
 direction = "input"
-content_type = "OctetStream"
-buffer_size = 4096
-
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 [observability]
 metrics = [

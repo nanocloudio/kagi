@@ -59,13 +59,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
 include!("../../common/sdk_bridge.rs");
 
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, ExchangeId};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -81,7 +78,7 @@ mod device_auth;
 /// keeps the two honest: a wider credential here refuses to build until the
 /// collector that has to hold it is widened too.
 const _: () = assert!(
-    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    http_endpoint::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
     "a presented credential must fit the request collector's header block"
 );
 #[path = "../../common/dpop.rs"]
@@ -104,12 +101,15 @@ mod state_wire;
 mod time_policy;
 #[path = "../../common/totp.rs"]
 mod totp;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
 #[path = "../../common/verify_keyset.rs"]
 mod verify_keyset;
 
-// wave's SMTP connector wire, mounted from the materialised `wave-common`
-// tree. A second copy of a layout is how two repos come to disagree about
-// one neither can check for the other.
+// wave's SMTP result layout, mounted from the materialised `wave-common`
+// tree: the body of the `smtp` provider's answer. A second copy of a layout
+// is how two repos come to disagree about one neither can check for the
+// other.
 #[path = "../../../target/fluxor/wave-common/smtp_wire.rs"]
 mod smtp_wire;
 
@@ -117,8 +117,8 @@ use auth_wire::PayloadReader;
 
 const STEP_DID_WORK: i32 = 2;
 
-/// wave's `wire::method::METHOD_POST`.
-const METHOD_POST: u8 = 3;
+/// The exchange contract's method byte for `POST`.
+const METHOD_POST: u8 = x::METHOD_POST;
 
 /// The `cty` a challenge token carries.
 ///
@@ -168,8 +168,15 @@ struct ModuleState {
     out_auth: i32,
     out_state: i32,
     in_state: i32,
+    /// The mail path: this endpoint is the REQUESTER of wave's `smtp`
+    /// exchange — one submission per exchange out, its result back.
     out_mail: i32,
     in_mail: i32,
+    /// Monotonic; numbers the submissions.
+    next_mail: u64,
+    /// The one submission owed to `out_mail`, and the record it lives in.
+    mail_outbox: ExchangeOutbox,
+    mail_buf: [u8; x::RECORD_MAX],
 
     /// The envelope sender enrolment mail is submitted from.
     mail_from: [u8; MAX_FIELD],
@@ -266,19 +273,18 @@ struct ModuleState {
     pending: [Pending; MAX_PENDING],
     next_corr: u32,
 
-    /// Requests being collected: wave's exchanges are streamed, so a
-
+    /// Requests being collected: an exchange's body may be streamed, so a
     /// request is answered once its body is whole.
-    exch: http_exchange::Table,
+    exch: http_endpoint::Requests,
     /// One response or body-credit record owed to `out_responses`.
     ///
     /// The step loop places what is owed before it reads anything new, so a
     /// refused write holds the answer instead of losing it. See
-    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
-    outbox: http_exchange::Outbox,
+    /// [`ExchangeOutbox`] for why silence is the worst way to fail.
+    outbox: ExchangeOutbox,
 
-    buf: [u8; abi::CHANNEL_BUFFER_SIZE],
-    out: [u8; abi::CHANNEL_BUFFER_SIZE],
+    buf: [u8; x::RECORD_MAX],
+    out: [u8; x::RECORD_MAX],
 }
 
 /// The longest base64url nonce a challenge carries.
@@ -319,7 +325,7 @@ struct Pending {
     /// `STAGE_CONSUME` while the nonce is being spent, `STAGE_COMMIT` while
     /// the device record is being written.
     stage: u8,
-    id: http_app::AppId,
+    id: ExchangeId,
     credit: u32,
     corr: u32,
     cert: [u8; MAX_TOKEN],
@@ -392,11 +398,7 @@ impl Pending {
             totp_confirming: false,
             caller_corr: 0,
             auth_exp: 0,
-            id: http_app::AppId {
-                origin: 0,
-                conn: 0,
-                stream: 0,
-            },
+            id: ExchangeId::NONE,
             credit: 0,
             corr: 0,
             cert: [0u8; MAX_TOKEN],
@@ -602,7 +604,16 @@ unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_DIGITS]) -> Result<(
     Err(Refusal::NoEntropy)
 }
 
+/// The mail-from header line every submission carries, before the address.
+const MAIL_FROM_HEADER: &[u8] = b"mail-from: ";
+/// Response credit granted with a submission: room for the relay's whole
+/// result, its text included.
+const MAIL_RESULT_CREDIT: u32 = 4096;
+
 /// Submit the enrolment mail carrying `code` to `to`.
+///
+/// One exchange with wave's `smtp`: `POST`, the recipient as the target, the
+/// envelope sender in a `mail-from` header, the message as the body.
 ///
 /// Fire-and-forget by design: the connector is a lockstep, single-submission
 /// machine, and blocking `/start` on a delivery round trip would serialise
@@ -612,8 +623,10 @@ unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_DIGITS]) -> Result<(
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn submit_mail(s: &mut ModuleState, sys: &SyscallTable, to: &[u8], code: &[u8], cid: u32) {
-    if s.out_mail < 0 || !chan::can_write(sys, s.out_mail) {
+unsafe fn submit_mail(s: &mut ModuleState, sys: &SyscallTable, to: &[u8], code: &[u8]) {
+    // A submission still held is one the relay has not taken: a second would
+    // overwrite it, so this one is counted as failed instead.
+    if s.out_mail < 0 || !s.mail_outbox.flush(sys, s.out_mail, &s.mail_buf) {
         s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
         return;
     }
@@ -640,28 +653,43 @@ unsafe fn submit_mail(s: &mut ModuleState, sys: &SyscallTable, to: &[u8], code: 
     put_str(&mut body, &mut at, code);
     put_str(&mut body, &mut at, b"\r\n");
 
-    let mut frame = [0u8; 1024];
-    let Some(n) = smtp_wire::write_smtp_request(
-        smtp_wire::SMTP_OP_SUBMIT,
-        cid,
-        0,
+    let mut headers = [0u8; MAIL_FROM_HEADER.len() + MAX_FIELD + 2];
+    let mut hdr_len = 0usize;
+    put_str(&mut headers, &mut hdr_len, MAIL_FROM_HEADER);
+    put_str(
+        &mut headers,
+        &mut hdr_len,
         &s.mail_from[..usize::from(s.mail_from_len)],
-        to,
-        &body[..at],
-        &mut frame,
-    ) else {
+    );
+    put_str(&mut headers, &mut hdr_len, b"\r\n");
+
+    let id = typed_exchange::call_id(s.next_mail, s.out_mail);
+    s.next_mail = s.next_mail.wrapping_add(1);
+    let head = x::RequestHead {
+        id,
+        flags: 0,
+        method: x::METHOD_POST,
+        target: to,
+        headers: &headers[..hdr_len],
+        peer: &[],
+        resp_credit: MAIL_RESULT_CREDIT,
+        body: &body[..at],
+    };
+    let Some(n) = x::write_request_head(&head, &mut s.mail_buf) else {
         s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
         return;
     };
-    if (sys.channel_write)(s.out_mail, frame.as_ptr(), n) > 0 {
-        s.enrol_mail_submitted = s.enrol_mail_submitted.saturating_add(1);
-    } else {
-        s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
-    }
+    // Placed now or held for the next step: either way it is submitted.
+    s.mail_outbox.send(sys, s.out_mail, &s.mail_buf, n);
+    s.enrol_mail_submitted = s.enrol_mail_submitted.saturating_add(1);
 }
 
 /// Drain delivery results, so a refused submission is counted rather than
 /// silently forgotten.
+///
+/// A result is the `smtp` provider's answer: 200 when the relay gave a
+/// verdict (the body is the `SmtpResult` saying which), or a status of the
+/// provider's own when it could not ask.
 ///
 /// # Safety
 ///
@@ -670,16 +698,27 @@ unsafe fn drain_mail(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_mail < 0 {
         return;
     }
+    // A held submission goes out before results are read, so a relay that
+    // was busy gets it as soon as it can take it.
+    s.mail_outbox.flush(sys, s.out_mail, &s.mail_buf);
     while chan::can_read(sys, s.in_mail) {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; x::RECORD_MAX];
         let n = (sys.channel_read)(s.in_mail, buf.as_mut_ptr(), buf.len());
         if n <= 0 {
             break;
         }
-        let Some(head) = smtp_wire::parse_smtp_result(&buf[..n as usize]) else {
-            continue;
+        let accepted = match x::parse_response(&buf[..n as usize]) {
+            Some(x::Record::Head(head)) => {
+                head.status == x::status::OK
+                    && smtp_wire::parse_smtp_result(head.body)
+                        .is_some_and(|r| r.outcome == smtp_wire::SMTP_OUT_ACCEPTED)
+            }
+            Some(x::Record::Abort { .. }) => false,
+            // A LINK change, a credit grant or a continuation: nothing to
+            // count.
+            _ => continue,
         };
-        if head.outcome != smtp_wire::SMTP_OUT_ACCEPTED {
+        if !accepted {
             // The code will never arrive. The transaction is left to expire
             // rather than burned here: burning it would need the nonce this
             // result does not carry, and an expiry is the same outcome a few
@@ -916,8 +955,10 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
-        s.exch = http_exchange::Table::new();
-        s.outbox = http_exchange::Outbox::new();
+        s.exch = http_endpoint::Requests::new();
+        s.outbox = ExchangeOutbox::new();
+        s.mail_outbox = ExchangeOutbox::new();
+        s.next_mail = 1;
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_state = dev_channel_port(sys, 1, 1);
         s.in_state = dev_channel_port(sys, 0, 2);
@@ -1007,7 +1048,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             worked = true;
@@ -1020,15 +1061,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Request-body credit the collector owes: the server forwards a
             // body only up to what this endpoint has granted.
             if let Some((gid, bytes)) = s.exch.take_grant() {
-                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                if let Some(n) = http_endpoint::write_grant(&gid, bytes, &mut s.out) {
                     s.outbox.send(sys, s.out_responses, &s.out, n);
                 }
             }
             // A refusal is still a decision, and the caller is owed it: an
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
-            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
-                respond(s, sys, &rid, rcredit, why.status(), why.body());
+            if let Some((rid, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, 0, why.status(), &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -1146,13 +1187,13 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let (id, credit, method) = (req.id, req.resp_credit, req.method);
     // Copied out of the collector so the handler can still take `&mut s`:
     // the request borrows the table, and answering borrows the module.
-    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len().min(target_buf.len());
     target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
-    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let mut header_buf = [0u8; http_endpoint::MAX_HEADERS];
     let hdr_len = req.headers.len().min(header_buf.len());
     header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
-    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let mut body_buf = [0u8; http_endpoint::MAX_BODY];
     let body_len = req.body.len().min(body_buf.len());
     body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
     s.exch.release(at);
@@ -1758,7 +1799,7 @@ fn next_corr(s: &mut ModuleState) -> u32 {
 unsafe fn begin_start(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     token: &[u8],
 ) {
@@ -1995,7 +2036,7 @@ unsafe fn reply_auth_refused(s: &mut ModuleState, sys: &SyscallTable, corr: u32,
 unsafe fn begin_lookup(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     certificate: &[u8],
 ) {
@@ -2121,7 +2162,7 @@ fn trim_ws(value: &[u8]) -> &[u8] {
 unsafe fn totp_route(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     confirming: bool,
     path: &[u8],
@@ -2199,7 +2240,7 @@ unsafe fn totp_route(
 unsafe fn begin_totp_register(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     who: &Authenticated,
 ) {
@@ -2253,7 +2294,7 @@ unsafe fn begin_totp_register(
 unsafe fn begin_totp_confirm(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     who: &Authenticated,
     code: &[u8],
@@ -2288,7 +2329,7 @@ unsafe fn begin_totp_confirm(
 unsafe fn stage_device_read(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     who: &Authenticated,
     mut entry: Pending,
@@ -2685,8 +2726,7 @@ unsafe fn start_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, s
     let email_len = usize::from(entry.claims_len);
     let mut email = [0u8; MAX_FIELD];
     email[..email_len].copy_from_slice(&entry.claims[..email_len]);
-    let cid = entry.corr;
-    submit_mail(s, sys, &email[..email_len], &entry.code, cid);
+    submit_mail(s, sys, &email[..email_len], &entry.code);
 
     s.enrol_started = s.enrol_started.saturating_add(1);
     let len = usize::from(entry.cert_len);
@@ -2708,7 +2748,7 @@ unsafe fn start_done(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending, s
 unsafe fn respond_token(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     token: &[u8],
 ) {
@@ -3179,14 +3219,14 @@ fn hkdf_into(salt: &[u8], ikm: &[u8], info: &[u8], okm: &mut [u8; 32]) {
 unsafe fn refuse(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     refusal: Refusal,
 ) {
     respond(s, sys, id, credit, refusal.status(), refusal.body());
 }
 
-/// Emit one `HttpResponse` carrying `body` as JSON.
+/// Answer one request: a response HEAD carrying `body` as JSON.
 ///
 /// # Safety
 ///
@@ -3194,13 +3234,13 @@ unsafe fn refuse(
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"application/json";
-    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    let Some(total) = http_endpoint::write_response(id, status, CT, body, credit, &mut s.out)
     else {
         return;
     };

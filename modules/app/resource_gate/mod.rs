@@ -1,9 +1,9 @@
 //! Resource gate — admit a DPoP-bound request, or say why not.
 //!
 //! The middleware a resource server would run, as a module instead. It
-//! sits behind wave's `foundation/http` as an application: an `HttpRequest`
-//! envelope arrives on `request_in`, and exactly one `HttpResponse` goes back
-//! on `response_out`.
+//! sits behind wave's `foundation/http` as an application — a PROVIDER of the
+//! workspace exchange contract: a request arrives on `request_in`, and
+//! exactly one response goes back on `response_out`.
 //!
 //! Five things must hold before a request is admitted, and each is decided by
 //! the shared fragment that owns it rather than here:
@@ -72,13 +72,10 @@ include!("../../common/sdk_bridge.rs");
 /// The assurance ladder, reached through `auth_wire` so this module and the
 /// wire it reads cannot mount two copies of one vocabulary.
 use auth_wire::assurance;
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, ExchangeId};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -94,7 +91,7 @@ mod device_auth;
 /// keeps the two honest: a wider credential here refuses to build until the
 /// collector that has to hold it is widened too.
 const _: () = assert!(
-    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    http_endpoint::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
     "a presented credential must fit the request collector's header block"
 );
 #[path = "../../common/dpop.rs"]
@@ -175,7 +172,7 @@ const POLICY: device_auth::Policy = device_auth::Policy {
 #[derive(Clone, Copy)]
 struct PendingClaim {
     live: bool,
-    id: http_app::AppId,
+    id: ExchangeId,
     credit: u32,
     subject: [u8; MAX_SUBJECT],
     subject_len: u16,
@@ -186,11 +183,7 @@ impl PendingClaim {
     const fn zero() -> Self {
         Self {
             live: false,
-            id: http_app::AppId {
-                origin: 0,
-                conn: 0,
-                stream: 0,
-            },
+            id: ExchangeId::NONE,
             credit: 0,
             subject: [0; MAX_SUBJECT],
             subject_len: 0,
@@ -201,8 +194,8 @@ impl PendingClaim {
 
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32,   // in[0]:  HttpRequest
-    out_responses: i32, // out[0]: HttpResponse
+    in_requests: i32,   // in[0]:  ExchangeRequest
+    out_responses: i32, // out[0]: ExchangeResponse
     in_key: i32,        // in[1]:  MSG_KEY_ADD
     /// out[1]/in[2]: the OPTIONAL durable replay lane to `security_state`.
     ///
@@ -251,16 +244,15 @@ struct ModuleState {
     gate_replayed_ledger: u32,
     gate_state_unavailable: u32,
 
-    /// Requests being collected: wave's exchanges are streamed, so a
-
+    /// Requests being collected: an exchange's body may be streamed, so a
     /// request is answered once its body is whole.
-    exch: http_exchange::Table,
+    exch: http_endpoint::Requests,
     /// One response or body-credit record owed to `out_responses`.
     ///
     /// The step loop places what is owed before it reads anything new, so a
     /// refused write holds the answer instead of losing it. See
-    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
-    outbox: http_exchange::Outbox,
+    /// [`ExchangeOutbox`] for why silence is the worst way to fail.
+    outbox: ExchangeOutbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -374,8 +366,8 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
-        s.exch = http_exchange::Table::new();
-        s.outbox = http_exchange::Outbox::new();
+        s.exch = http_endpoint::Requests::new();
+        s.outbox = ExchangeOutbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_state = dev_channel_port(sys, 1, 1);
         s.in_state = dev_channel_port(sys, 0, 2);
@@ -436,12 +428,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if !chan::can_read(sys, s.in_requests) {
                 break;
             }
-            // A raw envelope, not a typed message: wave's `http` writes the
-            // HttpRequest with `channel_write`, so reading it through the
-            // message framing would consume a type byte the envelope does
-            // not carry and misread every field after it.
+            // One exchange record per read: the edge is a mailbox, and the
+            // record carries no `auth_wire` envelope to read it through.
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             worked = true;
@@ -454,15 +444,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Request-body credit the collector owes: the server forwards a
             // body only up to what this endpoint has granted.
             if let Some((gid, bytes)) = s.exch.take_grant() {
-                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                if let Some(n) = http_endpoint::write_grant(&gid, bytes, &mut s.out) {
                     s.outbox.send(sys, s.out_responses, &s.out, n);
                 }
             }
             // A refusal is still a decision, and the caller is owed it: an
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
-            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
-                respond(s, sys, &rid, rcredit, why.status(), why.body());
+            if let Some((rid, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, 0, why.status(), &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -504,7 +494,7 @@ unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
-/// Decide one `HttpRequest` sitting in `s.buf[..plen]` and answer it.
+/// Decide one collected request and answer it.
 ///
 /// # Safety
 ///
@@ -571,10 +561,10 @@ unsafe fn admit(
     let method = req.method;
     // Copied out of the collector before anything else borrows the module:
     // the header block is read twice below, once per credential.
-    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let mut header_buf = [0u8; http_endpoint::MAX_HEADERS];
     let hdr_len = req.headers.len().min(header_buf.len());
     header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
-    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len().min(target_buf.len());
     target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
     let mut token = [0u8; MAX_SEGMENT];
@@ -744,26 +734,15 @@ fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
     *out = sha256(data);
 }
 
-/// The method word wave's envelope encodes as a byte.
+/// The method word a request's method byte names.
 ///
-/// The codes are wave's `wire::method::METHOD_*`, not a numbering of our own:
-/// this is one half of a comparison against the proof's `htm`, and a table
-/// that drifted from the encoder would refuse every honest request with the
-/// method it got wrong.
-const fn method_name(method: u8) -> &'static [u8] {
-    match method {
-        1 => b"GET",
-        2 => b"CONNECT",
-        3 => b"POST",
-        4 => b"HEAD",
-        5 => b"PUT",
-        6 => b"PATCH",
-        7 => b"DELETE",
-        8 => b"OPTIONS",
-        // METHOD_NONE (0) and anything unknown: no word to bind against, so
-        // the comparison fails and the request is refused.
-        _ => b"",
-    }
+/// The exchange contract's own table, not a numbering of ours: this is one
+/// half of a comparison against the proof's `htm`, and a table that drifted
+/// from the encoder would refuse every honest request with the method it got
+/// wrong. `METHOD_NONE` and anything unknown have no word to bind against,
+/// so the comparison fails and the request is refused.
+fn method_name(method: u8) -> &'static [u8] {
+    x::method_name(method)
 }
 
 /// The value of `name` in a CRLF header block, ASCII-case-insensitively.
@@ -825,7 +804,7 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// Emit one `HttpResponse` carrying `body` as `text/plain`.
+/// Answer one request: a response HEAD carrying `body` as `text/plain`.
 ///
 /// # Safety
 ///
@@ -838,7 +817,7 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
 unsafe fn claim_and_pend(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     subject: &[u8],
     proof_id: &[u8; 32],
@@ -966,13 +945,13 @@ unsafe fn drain_claims(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"text/plain";
-    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    let Some(total) = http_endpoint::write_response(id, status, CT, body, credit, &mut s.out)
     else {
         return;
     };

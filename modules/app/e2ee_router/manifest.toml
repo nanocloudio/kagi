@@ -5,68 +5,69 @@ entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712"]
 
-# One `HttpRequest` in, the same envelope out on one of three ports — and the
-# answers back the same way.
+# One exchange request in from the listener, its records forwarded verbatim on
+# one of three ports — and the answers back the same way. This router is a
+# PROVIDER toward the listener and the requester toward each endpoint.
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
+buffer_size = 16384
 
 # The endpoints' answers arrive here rather than going straight to the
 # listener.
 #
-# An application record states no length of its own: where one ends is the
-# record boundary the edge keeps, so it travels on an edge that carries whole
-# records (a `buffer_group`) and nowhere else. Several producers writing into
-# one input is a fan, the runtime inserts a byte merge to serve it, and a byte
-# merge cannot carry records that do not say how long they are — the kernel
-# strips the `buffer_group` it is incompatible with and the boundaries go with
-# it. So each endpoint gets its own edge and this module does the merging,
-# which it can do because it understands the record.
+# An exchange record states no length of its own: where one ends is the record
+# boundary the edge keeps, so it travels on a mailbox edge — which the build
+# makes of every exchange edge — and nowhere else. Several producers writing
+# into one input is a fan, the runtime inserts a byte merge to serve it, and a
+# byte merge cannot carry records that do not say how long they are. So each
+# endpoint gets its own edge and this module does the merging, which it can do
+# because it understands the record.
 #
 # No correlation table is needed and none exists: a response carries the
-# origin, connection and stream of the exchange it answers, so forwarding it
-# verbatim addresses it. There is nothing here to mis-address.
+# exchange id of the exchange it answers, so forwarding it verbatim addresses
+# it. There is nothing here to mis-address.
 [[ports]]
 name = "credential_resp_in"
 index = 1
 direction = "input"
-content_type = "HttpResponse"
-buffer_size = 8192
+content_type = "ExchangeResponse"
+buffer_size = 16384
 
 [[ports]]
 name = "keypkg_resp_in"
 index = 2
 direction = "input"
-content_type = "HttpResponse"
-buffer_size = 8192
+content_type = "ExchangeResponse"
+buffer_size = 16384
 
 [[ports]]
 name = "state_resp_in"
 index = 3
 direction = "input"
-content_type = "HttpResponse"
-buffer_size = 8192
+content_type = "ExchangeResponse"
+buffer_size = 16384
 
 [[ports]]
 name = "credential_out"
 direction = "output"
-content_type = "HttpRequest"
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
 
 [[ports]]
 name = "keypkg_out"
 index = 1
 direction = "output"
-content_type = "HttpRequest"
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
 
 [[ports]]
 name = "state_out"
 index = 2
 direction = "output"
-content_type = "HttpRequest"
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
 
 # Every answer this listener sends leaves here: the endpoints' responses
 # forwarded verbatim, and this router's own refusals. A path it does not
@@ -77,8 +78,8 @@ buffer_size = 8192
 name = "response_out"
 index = 3
 direction = "output"
-content_type = "HttpResponse"
-buffer_size = 4096
+content_type = "ExchangeResponse"
+buffer_size = 16384
 
 [observability]
 metrics = [

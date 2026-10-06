@@ -1,7 +1,16 @@
 //! Wire format for kagi inter-module channel messages.
 //!
-//! Every message uses Kagi's 3-byte envelope over Fluxor byte-stream ports:
+//! Every message uses Kagi's 3-byte envelope:
 //!   `[msg_type: u8] [len: u16 LE] [payload: len bytes]`
+//!
+//! Two carriers. Operator and module-private ports (key distribution, the
+//! ledger, the enrolment authorisations) are byte streams of envelopes, and a
+//! request on them carries its own `corr` to match its reply. The typed
+//! OPERATIONS another project composes — verify, admit, grant, authorize,
+//! code exchange, mint — are exchanges (`typed_exchange.rs`): the request
+//! body is one envelope, the answer body another, and the exchange id is the
+//! correlation, so those messages carry none of their own. Their byte layouts
+//! are in `docs/architecture/typed-operations.md`.
 //!
 //! ## Stability
 //!
@@ -441,9 +450,9 @@ pub mod request_type {
 /// [`MSG_ADMIT_REQ`].
 ///
 /// ```text
-/// [corr u32 LE]
 /// [method f8][uri f16]
 /// [credential f16][proof f16]
+/// [otp f8]
 /// ```
 ///
 /// `method` and `uri` are the request the DPoP proof must be bound to, and
@@ -455,7 +464,6 @@ pub mod request_type {
 /// a caller that could suggest them would be choosing what it is asking
 /// permission for.
 pub struct AdmitRequest<'a> {
-    pub corr: u32,
     pub method: &'a [u8],
     pub uri: &'a [u8],
     pub credential: &'a [u8],
@@ -476,7 +484,6 @@ impl<'a> AdmitRequest<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.field8(self.method)?;
         w.field16(self.uri)?;
         w.field16(self.credential)?;
@@ -488,7 +495,6 @@ impl<'a> AdmitRequest<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let method = r.field8()?;
         let uri = r.field16()?;
         let credential = r.field16()?;
@@ -503,7 +509,6 @@ impl<'a> AdmitRequest<'a> {
             return Err(WireError::FieldTooLong);
         }
         Ok(Self {
-            corr,
             method,
             uri,
             credential,
@@ -516,9 +521,10 @@ impl<'a> AdmitRequest<'a> {
 /// What admission decided: payload of [`MSG_ADMIT_RESP`].
 ///
 /// ```text
-/// [corr u32 LE]
 /// [status u8]            // admit_err::*
 /// [sub f16][device_id f16][thumbprint_alg u8][jkt f8]
+/// [evidence_methods u16][evidence_key_binding u8][evidence_flags u8]
+/// [evidence_auth_time u64]
 /// ```
 ///
 /// **A refusal carries none of them**, checked at decode. The fields say who
@@ -526,7 +532,6 @@ impl<'a> AdmitRequest<'a> {
 /// carrying a subject anyway would let a caller that ignored `status` mint
 /// for whoever it named.
 pub struct AdmitResponse<'a> {
-    pub corr: u32,
     pub status: u8,
     pub sub: &'a [u8],
     pub device_id: &'a [u8],
@@ -555,7 +560,6 @@ impl<'a> AdmitResponse<'a> {
         }
         let mut payload = [0u8; 1024];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.u8(self.status)?;
         w.field16(self.sub)?;
         w.field16(self.device_id)?;
@@ -571,7 +575,6 @@ impl<'a> AdmitResponse<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let status = r.u8()?;
         let sub = r.field16()?;
         let device_id = r.field16()?;
@@ -597,7 +600,6 @@ impl<'a> AdmitResponse<'a> {
             return Err(WireError::FieldTooLong);
         }
         Ok(Self {
-            corr,
             status,
             sub,
             device_id,
@@ -612,9 +614,9 @@ impl<'a> AdmitResponse<'a> {
 /// payload of [`MSG_GRANT_REQ`], the /oauth/token slice.
 ///
 /// ```text
-/// [corr u32 LE]
 /// [method f8][uri f16]
 /// [credential f16][proof f16]
+/// [otp f8]
 /// ```
 ///
 /// **This is `AdmitRequest` plus nothing.** It carries no subject, no
@@ -626,12 +628,11 @@ impl<'a> AdmitResponse<'a> {
 /// is how the widening `token_mint` would otherwise sign verbatim is closed
 /// at the source.
 ///
-/// Unlike [`AdmitRequest`], an empty credential DECODES (the correlation is
-/// intact and must be answered): a `GET /oauth/token`, a wrong path, or an
+/// Unlike [`AdmitRequest`], an empty credential DECODES, and its exchange is
+/// answered with a typed refusal: a `GET /oauth/token`, a wrong path, or an
 /// empty body has to receive a refusal, not vanish. The emptiness is refused
 /// in the handler, not at decode.
 pub struct GrantRequest<'a> {
-    pub corr: u32,
     pub method: &'a [u8],
     pub uri: &'a [u8],
     pub credential: &'a [u8],
@@ -645,7 +646,6 @@ impl<'a> GrantRequest<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.field8(self.method)?;
         w.field16(self.uri)?;
         w.field16(self.credential)?;
@@ -657,14 +657,12 @@ impl<'a> GrantRequest<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let method = r.field8()?;
         let uri = r.field16()?;
         let credential = r.field16()?;
         let proof = r.field16()?;
         let otp = r.field8()?;
         Ok(Self {
-            corr,
             method,
             uri,
             credential,
@@ -677,7 +675,6 @@ impl<'a> GrantRequest<'a> {
 /// The grant's answer: payload of [`MSG_GRANT_RESP`].
 ///
 /// ```text
-/// [corr u32 LE]
 /// [status u8]        // grant_err::* — OK carries the token, refusals nothing
 /// [token f16]
 /// ```
@@ -686,7 +683,6 @@ impl<'a> GrantRequest<'a> {
 /// reply on this wire enforces: a caller that ignored `status` must not end
 /// up holding something token-shaped.
 pub struct GrantResponse<'a> {
-    pub corr: u32,
     pub status: u8,
     pub token: &'a [u8],
 }
@@ -698,7 +694,6 @@ impl<'a> GrantResponse<'a> {
         }
         let mut payload = [0u8; MAX_INLINE_CREDENTIAL + 16];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.u8(self.status)?;
         w.field16(self.token)?;
         let n = w.len();
@@ -707,7 +702,6 @@ impl<'a> GrantResponse<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let status = r.u8()?;
         let token = r.field16()?;
         if status != grant_err::OK && !token.is_empty() {
@@ -716,11 +710,7 @@ impl<'a> GrantResponse<'a> {
         if status == grant_err::OK && token.is_empty() {
             return Err(WireError::Inconsistent);
         }
-        Ok(Self {
-            corr,
-            status,
-            token,
-        })
+        Ok(Self { status, token })
     }
 }
 
@@ -728,7 +718,7 @@ impl<'a> GrantResponse<'a> {
 /// presentation. Payload of [`MSG_AUTHORIZE_REQ`].
 ///
 /// ```text
-/// [corr u32][method f8][uri f16]
+/// [method f8][uri f16]
 /// [credential f16][proof f16]        // the subject's dc+jwt + DPoP
 /// [client_id f8][redirect_uri f16][scope f16][state f16]
 /// [code_challenge f8][nonce f16]     // PKCE S256; nonce may be empty
@@ -737,9 +727,8 @@ impl<'a> GrantResponse<'a> {
 /// The subject is established from the credential (kagi), never named. The
 /// client's `scope` is a REQUEST — authcode clamps it against the registered
 /// client before anything is signed, because `token_mint` signs scope
-/// verbatim. An empty credential decodes (its corr must be answered).
+/// verbatim. An empty credential decodes, and is answered with a refusal.
 pub struct AuthorizeRequest<'a> {
-    pub corr: u32,
     pub method: &'a [u8],
     pub uri: &'a [u8],
     pub credential: &'a [u8],
@@ -756,7 +745,6 @@ impl<'a> AuthorizeRequest<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.field8(self.method)?;
         w.field16(self.uri)?;
         w.field16(self.credential)?;
@@ -773,7 +761,6 @@ impl<'a> AuthorizeRequest<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let method = r.field8()?;
         let uri = r.field16()?;
         let credential = r.field16()?;
@@ -785,7 +772,6 @@ impl<'a> AuthorizeRequest<'a> {
         let code_challenge = r.field8()?;
         let nonce = r.field16()?;
         Ok(Self {
-            corr,
             method,
             uri,
             credential,
@@ -803,7 +789,7 @@ impl<'a> AuthorizeRequest<'a> {
 /// The /authorize answer: payload of [`MSG_AUTHORIZE_RESP`].
 ///
 /// ```text
-/// [corr u32][status u8]
+/// [status u8]
 /// [code f16][redirect_uri f16][state f16]
 /// ```
 ///
@@ -812,7 +798,6 @@ impl<'a> AuthorizeRequest<'a> {
 /// client's raw input), and the state to echo. A refusal carries none of the
 /// three, checked at decode.
 pub struct AuthorizeResponse<'a> {
-    pub corr: u32,
     pub status: u8,
     pub code: &'a [u8],
     pub redirect_uri: &'a [u8],
@@ -828,7 +813,6 @@ impl<'a> AuthorizeResponse<'a> {
         }
         let mut payload = [0u8; 1024];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.u8(self.status)?;
         w.field16(self.code)?;
         w.field16(self.redirect_uri)?;
@@ -839,7 +823,6 @@ impl<'a> AuthorizeResponse<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let status = r.u8()?;
         let code = r.field16()?;
         let redirect_uri = r.field16()?;
@@ -853,7 +836,6 @@ impl<'a> AuthorizeResponse<'a> {
             return Err(WireError::Inconsistent);
         }
         Ok(Self {
-            corr,
             status,
             code,
             redirect_uri,
@@ -865,7 +847,6 @@ impl<'a> AuthorizeResponse<'a> {
 /// Token code-exchange request: payload of [`MSG_CODE_EXCHANGE_REQ`].
 ///
 /// ```text
-/// [corr u32]
 /// [code f16][redirect_uri f16][client_id f8][code_verifier f16]
 /// ```
 ///
@@ -873,7 +854,6 @@ impl<'a> AuthorizeResponse<'a> {
 /// the proof, and the code carries the subject authcode established at
 /// /authorize.
 pub struct CodeExchangeRequest<'a> {
-    pub corr: u32,
     pub code: &'a [u8],
     pub redirect_uri: &'a [u8],
     pub client_id: &'a [u8],
@@ -884,7 +864,6 @@ impl<'a> CodeExchangeRequest<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; 2048];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.field16(self.code)?;
         w.field16(self.redirect_uri)?;
         w.field8(self.client_id)?;
@@ -895,13 +874,11 @@ impl<'a> CodeExchangeRequest<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let code = r.field16()?;
         let redirect_uri = r.field16()?;
         let client_id = r.field8()?;
         let code_verifier = r.field16()?;
         Ok(Self {
-            corr,
             code,
             redirect_uri,
             client_id,
@@ -913,12 +890,11 @@ impl<'a> CodeExchangeRequest<'a> {
 /// The exchange answer: payload of [`MSG_CODE_EXCHANGE_RESP`].
 ///
 /// ```text
-/// [corr u32][status u8][access_token f16][id_token f16]
+/// [status u8][access_token f16][id_token f16]
 /// ```
 ///
 /// OK carries both tokens; a refusal carries neither, checked at decode.
 pub struct CodeExchangeResponse<'a> {
-    pub corr: u32,
     pub status: u8,
     pub access_token: &'a [u8],
     pub id_token: &'a [u8],
@@ -933,7 +909,6 @@ impl<'a> CodeExchangeResponse<'a> {
         }
         let mut payload = [0u8; MAX_INLINE_CREDENTIAL + 16];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.corr)?;
         w.u8(self.status)?;
         w.field16(self.access_token)?;
         w.field16(self.id_token)?;
@@ -943,7 +918,6 @@ impl<'a> CodeExchangeResponse<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let corr = r.u32()?;
         let status = r.u8()?;
         let access_token = r.field16()?;
         let id_token = r.field16()?;
@@ -954,7 +928,6 @@ impl<'a> CodeExchangeResponse<'a> {
             return Err(WireError::Inconsistent);
         }
         Ok(Self {
-            corr,
             status,
             access_token,
             id_token,
@@ -1266,7 +1239,6 @@ impl<'a> Iterator for ExtraClaimsIter<'a> {
 
 /// `MSG_MINT_REQ` payload. This is the sole v1 layout:
 /// ```text
-/// [corr u32 LE]
 /// [request_type u8]          // request_type::*
 /// [suite u16 LE]             // suite::*
 /// [profile_id u16 LE]        // suite::profile::*
@@ -1294,7 +1266,6 @@ impl<'a> Iterator for ExtraClaimsIter<'a> {
 /// should not have to know which key is active, and pinning one would
 /// defeat rotation.
 pub struct MintRequest<'a> {
-    pub correlation: u32,
     pub request_type: u8,
     pub suite: u16,
     pub profile_id: u16,
@@ -1316,7 +1287,6 @@ impl<'a> MintRequest<'a> {
         }
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.correlation)?;
         w.u8(self.request_type)?;
         w.u16(self.suite)?;
         w.u16(self.profile_id)?;
@@ -1357,7 +1327,6 @@ impl<'a> MintRequest<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let correlation = r.u32()?;
         let request_type = r.u8()?;
         let suite = r.u16()?;
         let profile_id = r.u16()?;
@@ -1400,7 +1369,6 @@ impl<'a> MintRequest<'a> {
             bytes: &region[..consumed],
         };
         Ok(Self {
-            correlation,
             request_type,
             suite,
             profile_id,
@@ -1419,7 +1387,6 @@ impl<'a> MintRequest<'a> {
 
 /// `MSG_MINT_RESP` payload. This is the sole v1 layout:
 /// ```text
-/// [corr u32 LE]
 /// [status u8]          // mint_err::*
 /// [delivery u8]        // delivery::*
 /// [required_len u32 LE]
@@ -1435,7 +1402,6 @@ impl<'a> MintRequest<'a> {
 /// so a caller sizing a buffer never has to infer it from `body`. On
 /// `TOO_LARGE` it is the only thing that says how much was needed.
 pub struct MintResponse<'a> {
-    pub correlation: u32,
     pub status: u8,
     pub delivery: u8,
     pub required_len: u32,
@@ -1449,9 +1415,8 @@ pub struct MintResponse<'a> {
 impl<'a> MintResponse<'a> {
     /// A successful inline reply.
     #[must_use]
-    pub fn inline(correlation: u32, body: &'a [u8]) -> Self {
+    pub fn inline(body: &'a [u8]) -> Self {
         Self {
-            correlation,
             status: mint_err::OK,
             delivery: delivery::INLINE,
             #[expect(
@@ -1465,9 +1430,8 @@ impl<'a> MintResponse<'a> {
 
     /// A successful reply handing over an object key.
     #[must_use]
-    pub fn handle(correlation: u32, key: &'a [u8], required_len: u32) -> Self {
+    pub fn handle(key: &'a [u8], required_len: u32) -> Self {
         Self {
-            correlation,
             status: mint_err::OK,
             delivery: delivery::OBJECT_HANDLE,
             required_len,
@@ -1478,9 +1442,8 @@ impl<'a> MintResponse<'a> {
     /// A refusal. `required_len` is meaningful only for
     /// [`mint_err::TOO_LARGE`]; it is zero otherwise.
     #[must_use]
-    pub fn refused(correlation: u32, status: u8, required_len: u32) -> Self {
+    pub fn refused(status: u8, required_len: u32) -> Self {
         Self {
-            correlation,
             status,
             delivery: delivery::INLINE,
             required_len,
@@ -1491,7 +1454,6 @@ impl<'a> MintResponse<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; MAX_INLINE_CREDENTIAL + 64];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.correlation)?;
         w.u8(self.status)?;
         w.u8(self.delivery)?;
         w.u32(self.required_len)?;
@@ -1502,7 +1464,6 @@ impl<'a> MintResponse<'a> {
 
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
-        let correlation = r.u32()?;
         let status = r.u8()?;
         let delivery = r.u8()?;
         let required_len = r.u32()?;
@@ -1513,7 +1474,6 @@ impl<'a> MintResponse<'a> {
             return Err(WireError::FieldTooLong);
         }
         Ok(Self {
-            correlation,
             status,
             delivery,
             required_len,
@@ -1864,7 +1824,6 @@ impl<'a> EnrolAuthResponse<'a> {
 /// `expected_*` means "no rule for this", which is a deliberate statement a
 /// caller makes — not an accident, because the caller had to write it.
 pub struct VerifyRequest<'a> {
-    pub correlation: u32,
     /// The compact JWS to check.
     pub credential: &'a [u8],
     /// Required profile, or `profile::NONE` for no rule.
@@ -1902,7 +1861,6 @@ impl<'a> VerifyRequest<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; 8192];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.correlation)?;
         w.field16(self.credential)?;
         w.u16(self.expected_profile)?;
         w.field16(self.expected_issuer)?;
@@ -1920,7 +1878,6 @@ impl<'a> VerifyRequest<'a> {
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
         Ok(Self {
-            correlation: r.u32()?,
             credential: r.field16()?,
             expected_profile: r.u16()?,
             expected_issuer: r.field16()?,
@@ -1975,7 +1932,6 @@ pub mod verify_err {
 /// in it is an authorization input, and a consumer treating it as one has
 /// stepped back outside the property this type exists to hold.
 pub struct VerifiedIdentity<'a> {
-    pub correlation: u32,
     pub status: u8,
     pub profile_id: u16,
     pub issuer: &'a [u8],
@@ -2018,9 +1974,8 @@ impl<'a> VerifiedIdentity<'a> {
     /// authorize on is empty, so one that ignored the status has nothing
     /// to act on.
     #[must_use]
-    pub fn refused(correlation: u32, status: u8) -> Self {
+    pub fn refused(status: u8) -> Self {
         Self {
-            correlation,
             status,
             profile_id: 0,
             issuer: &[],
@@ -2049,7 +2004,6 @@ impl<'a> VerifiedIdentity<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, WireError> {
         let mut payload = [0u8; 8192];
         let mut w = PayloadWriter::new(&mut payload);
-        w.u32(self.correlation)?;
         w.u8(self.status)?;
         w.u16(self.profile_id)?;
         w.field16(self.issuer)?;
@@ -2077,7 +2031,6 @@ impl<'a> VerifiedIdentity<'a> {
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
         let me = Self {
-            correlation: r.u32()?,
             status: r.u8()?,
             profile_id: r.u16()?,
             issuer: r.field16()?,

@@ -7,7 +7,7 @@ endpoint state that keeps a ratchet from going backwards. It never sees a
 group secret.
 
 One listener carries the family. `e2ee_router` owns `/e2ee/` and fans to the
-three endpoints behind it, because wave's `http` has a single `req_out` and
+three endpoints behind it, because wave's `http` has a single `request_out` and
 an application behind it is one module.
 
 ## Credentials

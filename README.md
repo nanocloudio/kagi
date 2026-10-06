@@ -109,7 +109,7 @@ CA deployment.
   8032), so no runtime entropy is needed. See
   [docs/guides/embedding-token-mint.md](docs/guides/embedding-token-mint.md).
 - **token_verify** — stateless verification with validity-window checks,
-  returning the decoded claims to the calling graph stage. The module
+  answering the calling graph stage with a typed identity. The module
   verifies; the caller decides.
 - **resource_gate** — the middleware a resource server runs: admit a
   DPoP-bound request, or say why not.
@@ -127,6 +127,13 @@ CA deployment.
   a restore or a failover cannot reuse a generation.
 - **certificate_endpoint** — an X.509 leaf for a subject key, in the PKI
   deployment.
+
+`token_mint`, `token_verify`, `mint_admission`, `authcode` and `storage_key`
+are typed operations: providers of the workspace exchange contract that
+another project's pipeline drives with one request and reads one typed
+answer from. Their exchange rules and every byte of their request and
+answer bodies are in
+[docs/architecture/typed-operations.md](docs/architecture/typed-operations.md).
 
 ## Status
 

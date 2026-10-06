@@ -43,17 +43,23 @@ avoids a separate Cargo dependency.
 
 ## 3. Wire it into a graph
 
-`token_mint` has three ports (see `docs/architecture/modules.md` for the
-full wire protocol):
+`token_mint` is a typed operation: the PROVIDER of an exchange of the
+workspace exchange contract. Its ports (see
+`docs/architecture/typed-operations.md` for the exchange rules and every byte
+of both bodies):
 
 | port | dir | carries |
 |---|---|---|
-| `mint_requests` | in | `MSG_MINT_REQ` — a `MintRequest`: correlation, suite, profile, `kid`, TTL, the claims, and an optional `jkt` |
+| `request_in` | in | `ExchangeRequest`: one `POST` per token, its body a `MSG_MINT_REQ` envelope — a `MintRequest`: suite, profile, `kid`, TTL, the claims, and an optional `jkt` |
+| `response_out` | out | `ExchangeResponse`: a 200 whose body is the `MSG_MINT_RESP` envelope, `[status u8][delivery u8][required_len u32][body f16]`, whatever the verdict |
 | `key_material` | in | `MSG_KEY_ADD` — a `KeyRecord`, whose `key_ref` is a **vault label** for a signing key |
-| `tokens` | out | `MSG_MINT_RESP` = `[corr u32][status u8][token f16]` |
+| `key_announce` | out | the public half of each signing key, as a VERIFY `MSG_KEY_ADD` |
 
+The exchange id is the correlation; neither body carries one.
 `modules/common/auth_wire.rs` is the encoder and the only definition of
-either layout; a consumer builds them through it rather than by hand.
+either layout, and `modules/common/typed_exchange.rs` writes and reads the
+exchange around it; a consumer builds them through these rather than by
+hand.
 
 A signing record carries a label and never key material. The private half
 is generated inside the vault on first open, leaves it only as signatures,
@@ -61,11 +67,12 @@ and cannot be supplied or observed on the control plane — so a consumer
 graph feeding `key_material` is asking that a key EXIST under a name, not
 handing one over.
 
-Egress-proxy shape: the pipeline stage that needs an outbound credential
-sends a `MINT_REQ` to `mint_requests`; the deployment's key source (a key
-manager module, or kagi's `secret_store`) feeds `key_material`; the stage
-treats each `MINT_RESP` with `status == ST_OK` as a bearer token for the
-egress leg.
+Egress-proxy shape: the pipeline stage that needs an outbound credential is
+the requester — it sends a `MINT_REQ` exchange to `request_in` and reads the
+answer from `response_out`; the deployment's key source (a key manager
+module, or kagi's `secret_store`) feeds `key_material`; the stage treats each
+`MINT_RESP` with `status == mint_err::OK` as a bearer token for the egress
+leg.
 
 ```yaml
 # consumer graph excerpt
@@ -77,10 +84,10 @@ modules:
 wiring:
   - from: keysrc.replies
     to:   token_mint.key_material
-  - from: egress.mint_out
-    to:   token_mint.mint_requests
-  - from: token_mint.tokens
-    to:   egress.token_in
+  - from: egress.request_out
+    to:   token_mint.request_in
+  - from: token_mint.response_out
+    to:   egress.response_in
 ```
 
 ## 4. Signing suites
@@ -91,7 +98,7 @@ The `suite` in a `MintRequest` names what the credential is signed with;
 of them is deterministic and needs no runtime entropy: RFC 6979 ECDSA, RFC
 8032 EdDSA, and FIPS 204 ML-DSA in its deterministic variant.
 
-The suite must match the loaded key's, else the module replies `ST_NO_KEY`
+The suite must match the loaded key's, else the module answers `NO_KEY`
 (the right key may still arrive on `key_material`). A suite this build
 cannot sign in is refused when the key is loaded rather than at the first
 request. Tokens are byte-identical to what the issuer graph mints

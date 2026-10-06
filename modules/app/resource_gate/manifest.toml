@@ -8,13 +8,13 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 buffer_size = 16384
 
 [[ports]]
 name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 buffer_size = 8192
 
 # The issuer's public key, in the same MSG_KEY_ADD shape `token_verify`

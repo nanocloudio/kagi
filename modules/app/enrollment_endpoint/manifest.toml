@@ -8,13 +8,13 @@ hardware_targets = ["bcm2712"]
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 buffer_size = 16384
 
 [[ports]]
 name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 buffer_size = 16384
 
 # The seed this endpoint signs challenges and certificates with, in the same
@@ -52,14 +52,16 @@ buffer_size = 4096
 
 # The mail path. `/start` submits a message carrying the enrolment code to
 # the address the request named; the result comes back so a submission the
-# relay refused can burn its transaction rather than leave a code nobody
-# will ever receive waiting to be guessed.
+# relay refused is counted. This endpoint is the REQUESTER of wave's `smtp`
+# exchange: `POST`, the recipient as the target, a `mail-from` header, the
+# message as the body; the answer's body is the relay's `SmtpResult`.
 [[ports]]
 name = "mail_out"
 index = 2
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 buffer_size = 16384
+max_record = 8192
 
 # Operator requests for enrolment AUTHORISATIONS, from the control plane.
 #
@@ -88,8 +90,9 @@ content_type = "OctetStream"
 name = "mail_in"
 index = 3
 direction = "input"
-content_type = "OctetStream"
-buffer_size = 4096
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 [observability]
 metrics = [

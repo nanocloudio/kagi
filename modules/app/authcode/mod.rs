@@ -25,6 +25,14 @@
 //!                stored jkt — the DPoP sender-constraint survives the code)
 //!                → mint the ID token (aud=client_id, nonce, auth_time) →
 //!                return both.
+//!
+//! A typed operation: a PROVIDER of the workspace exchange contract on
+//! `request_in` / `response_out` (`typed_exchange.rs`; byte layouts in
+//! `docs/architecture/typed-operations.md`). A request body is one
+//! `MSG_AUTHORIZE_REQ` or `MSG_CODE_EXCHANGE_REQ` envelope and its answer
+//! body one `MSG_AUTHORIZE_RESP` or `MSG_CODE_EXCHANGE_RESP`; every verdict,
+//! refusals included, is a 200 exchange. Toward `token_mint`, on `mint_out` /
+//! `mint_in`, this module is the REQUESTER.
 
 #![no_std]
 #![allow(
@@ -75,8 +83,23 @@ mod jwk;
 mod state_wire;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
 #[path = "../../common/verify_keyset.rs"]
 mod verify_keyset;
+
+use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use typed_exchange::Answer;
+
+/// Exchanges collected at once.
+const MAX_EXCHANGES: usize = 4;
+/// Longest target and header block held. Neither is read; they are bounded
+/// so the module can sit behind an HTTP route as well as a pipeline.
+const MAX_TARGET: usize = 256;
+const MAX_HEADERS: usize = 1024;
+/// Longest request body: one `MSG_AUTHORIZE_REQ` envelope, which carries two
+/// compact JWSs and the client's parameters.
+const MAX_REQUEST: usize = 4096 + auth_wire::ENVELOPE;
 
 const STEP_DID_WORK: i32 = 2;
 const MAX_IN_FLIGHT: usize = 8;
@@ -135,9 +158,11 @@ enum Flow {
 struct Pending {
     live: bool,
     flow: Flow,
-    caller_corr: u32,
+    /// The caller's exchange, which the answer is written on.
+    caller: ExchangeId,
     state_corr: u32,
-    mint_corr: u32,
+    /// The exchange open with the mint, while a mint stage waits.
+    mint: ExchangeId,
     sub: [u8; MAX_FIELD],
     sub_len: u16,
     device_id: [u8; MAX_FIELD],
@@ -170,9 +195,9 @@ impl Pending {
         Self {
             live: false,
             flow: Flow::AuthzClient,
-            caller_corr: 0,
+            caller: ExchangeId::NONE,
             state_corr: 0,
-            mint_corr: 0,
+            mint: ExchangeId::NONE,
             sub: [0; MAX_FIELD],
             sub_len: 0,
             device_id: [0; MAX_FIELD],
@@ -211,7 +236,13 @@ struct ModuleState {
     in_state: i32,
     out_mint: i32,
     in_mint: i32,
+    /// Monotonic; the correlation the ledger answers with.
     next_corr: u32,
+    /// Monotonic; numbers the exchanges this module opens with the mint.
+    next_mint: u64,
+    /// The mint reported its link DOWN and has not reported it UP: every
+    /// exchange stage waiting on it is answered MINT_FAILED.
+    mint_down: bool,
     keyset: verify_keyset::Keyset,
     replay: dpop::ReplayWindow<128>,
     pending: [Pending; MAX_IN_FLIGHT],
@@ -227,7 +258,18 @@ struct ModuleState {
     authz_refused: u32,
     xchg_ok: u32,
     xchg_refused: u32,
-    buf: [u8; abi::CHANNEL_BUFFER_SIZE],
+    /// Requests being collected until their body is whole.
+    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    /// The one answer, credit or refusal owed to `response_out`.
+    outbox: ExchangeOutbox,
+    /// The one mint call owed to `mint_out`.
+    mint_outbox: ExchangeOutbox,
+    /// The record being read.
+    buf: [u8; x::RECORD_MAX],
+    /// The record being written to `response_out`.
+    out: [u8; x::RECORD_MAX],
+    /// The record being written to `mint_out`.
+    mint_buf: [u8; x::RECORD_MAX],
 }
 
 define_params! {
@@ -316,6 +358,11 @@ pub extern "C" fn module_new(
         s.in_mint = dev_channel_port(sys, 0, 3);
 
         s.next_corr = 1;
+        s.next_mint = 1;
+        s.mint_down = false;
+        s.requests = Collector::new();
+        s.outbox = ExchangeOutbox::new();
+        s.mint_outbox = ExchangeOutbox::new();
         s.keyset = verify_keyset::Keyset::new();
         s.replay = dpop::ReplayWindow::new();
         s.pending = [Pending::zero(); MAX_IN_FLIGHT];
@@ -354,6 +401,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys = &*s.syscalls;
         let mut worked = drain_keys(s, sys);
+        // What is owed goes out before anything new is read: every record
+        // read below ends in at most one answer or mint call, and one placed
+        // on a full edge must be held rather than lost.
+        if !clear(s, sys) {
+            return 0;
+        }
+        if s.mint_down {
+            fail_open_mints(s, sys);
+        }
         worked |= drain_state(s, sys);
         worked |= drain_mint(s, sys);
         worked |= drain_requests(s, sys);
@@ -388,45 +444,79 @@ fn free_slot(s: &ModuleState) -> Option<usize> {
     s.pending.iter().position(|p| !p.live)
 }
 
+/// Place what is owed on both exchange ports. True when nothing is held.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let answers = s.outbox.flush(sys, s.out_replies, &s.out);
+    let calls = s.mint_outbox.flush(sys, s.out_mint, &s.mint_buf);
+    answers && calls
+}
+
+/// Answer `id` with the envelope `encode` writes. An answer that does not
+/// encode — two tokens too large for one record — is a failure of this
+/// module, answered as one.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn answer(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    id: &ExchangeId,
+    encode: impl FnOnce(&mut [u8]) -> Result<usize, auth_wire::WireError>,
+) -> bool {
+    let Ok(len) = encode(&mut s.out[typed_exchange::ANSWER_AT..]) else {
+        answer_status(s, sys, id, x::status::FAILED);
+        return false;
+    };
+    if let Some(n) = typed_exchange::seal_answer(id, len, &mut s.out) {
+        s.outbox.send(sys, s.out_replies, &s.out, n);
+    }
+    true
+}
+
+/// Answer `id` with a status alone: a request this operation did not read.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn answer_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u16) {
+    if let Some(n) = typed_exchange::write_status(id, status, &mut s.out) {
+        s.outbox.send(sys, s.out_replies, &s.out, n);
+    }
+}
+
 /// Refuse an /authorize caller (no code, no redirect, no state).
 ///
 /// # Safety
 /// As `drain_keys`.
-unsafe fn refuse_authz(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
+unsafe fn refuse_authz(s: &mut ModuleState, sys: &SyscallTable, caller: &ExchangeId, status: u8) {
     s.authz_refused = s.authz_refused.saturating_add(1);
-    let resp = auth_wire::AuthorizeResponse {
-        corr,
-        status,
-        code: b"",
-        redirect_uri: b"",
-        state: b"",
-    };
-    let mut framed = [0u8; 512];
-    if let Ok(n) = resp.encode(&mut framed) {
-        if let Ok((t, p)) = auth_wire::read_envelope(&framed[..n]) {
-            chan::channel_write_msg(sys, s.out_replies, t, p);
+    answer(s, sys, caller, |out| {
+        auth_wire::AuthorizeResponse {
+            status,
+            code: b"",
+            redirect_uri: b"",
+            state: b"",
         }
-    }
+        .encode(out)
+    });
 }
 
 /// Refuse an exchange caller (no tokens).
 ///
 /// # Safety
 /// As `drain_keys`.
-unsafe fn refuse_xchg(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
+unsafe fn refuse_xchg(s: &mut ModuleState, sys: &SyscallTable, caller: &ExchangeId, status: u8) {
     s.xchg_refused = s.xchg_refused.saturating_add(1);
-    let resp = auth_wire::CodeExchangeResponse {
-        corr,
-        status,
-        access_token: b"",
-        id_token: b"",
-    };
-    let mut framed = [0u8; 512];
-    if let Ok(n) = resp.encode(&mut framed) {
-        if let Ok((t, p)) = auth_wire::read_envelope(&framed[..n]) {
-            chan::channel_write_msg(sys, s.out_replies, t, p);
+    answer(s, sys, caller, |out| {
+        auth_wire::CodeExchangeResponse {
+            status,
+            access_token: b"",
+            id_token: b"",
         }
-    }
+        .encode(out)
+    });
 }
 
 /// # Safety
@@ -435,33 +525,72 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_requests < 0 {
         return false;
     }
+    // Nothing is taken off an input while an answer or a call is held: every
+    // record here ends in at most one record on `response_out` (a credit
+    // grant, a refusal or a verdict) or one ledger request.
     let mut worked = false;
-    while chan::can_read(sys, s.in_requests) {
-        let buf_ptr = s.buf.as_mut_ptr();
-        let (msg_type, plen) = {
-            let buf = core::slice::from_raw_parts_mut(buf_ptr, abi::CHANNEL_BUFFER_SIZE);
-            chan::channel_read_msg(sys, s.in_requests, buf)
-        };
-        if msg_type == 0 {
+    while clear(s, sys) && chan::can_read(sys, s.in_requests) {
+        let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
+        if n <= 0 {
             break;
         }
         worked = true;
-        let payload = core::slice::from_raw_parts(buf_ptr, plen as usize);
-        if msg_type == auth_wire::MSG_AUTHORIZE_REQ {
-            if let Ok(req) = auth_wire::AuthorizeRequest::decode(payload) {
-                handle_authorize(s, sys, &req);
-            } else {
-                dev_log(sys, 1, b"[authcode] authorize decode failed".as_ptr(), 33);
+        let outcome = {
+            let ModuleState { requests, buf, .. } = &mut *s;
+            requests.accept(buf.get(..n as usize).unwrap_or(&[]))
+        };
+        if let Some((id, bytes)) = s.requests.take_grant() {
+            if let Some(len) = x::write_credit(&id, bytes, &mut s.out) {
+                s.outbox.send(sys, s.out_replies, &s.out, len);
             }
-        } else if msg_type == auth_wire::MSG_CODE_EXCHANGE_REQ {
-            if let Ok(req) = auth_wire::CodeExchangeRequest::decode(payload) {
-                handle_exchange(s, sys, &req);
-            } else {
-                dev_log(sys, 1, b"[authcode] exchange decode failed".as_ptr(), 32);
-            }
+        }
+        if let Some((id, why)) = s.requests.take_refusal() {
+            answer_status(s, sys, &id, why.status());
+        }
+        if let Ok(Some(at)) = outcome {
+            take_request(s, sys, at);
         }
     }
     worked
+}
+
+/// Take the request the collector completed in slot `at`.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(request) = s.requests.request(at) else {
+        return;
+    };
+    let id = request.id;
+    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    // Copied out of the collector so its slot is free, and the module
+    // borrowable, before anything is answered.
+    let body_len = request.body.len();
+    let mut body = [0u8; MAX_REQUEST];
+    body[..body_len].copy_from_slice(request.body);
+    s.requests.release(at);
+    if let Some(status) = refused {
+        answer_status(s, sys, &id, status);
+        return;
+    }
+    let Some((msg_type, payload)) = typed_exchange::message(&body[..body_len]) else {
+        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        return;
+    };
+    // A payload that does not decode is still a request of its type, and is
+    // answered with the flow's MALFORMED verdict.
+    match msg_type {
+        auth_wire::MSG_AUTHORIZE_REQ => match auth_wire::AuthorizeRequest::decode(payload) {
+            Ok(req) => handle_authorize(s, sys, &id, &req),
+            Err(_) => refuse_authz(s, sys, &id, auth_wire::authz_err::MALFORMED),
+        },
+        auth_wire::MSG_CODE_EXCHANGE_REQ => match auth_wire::CodeExchangeRequest::decode(payload) {
+            Ok(req) => handle_exchange(s, sys, &id, &req),
+            Err(_) => refuse_xchg(s, sys, &id, auth_wire::authz_err::MALFORMED),
+        },
+        _ => answer_status(s, sys, &id, x::status::BAD_REQUEST),
+    }
 }
 
 /// /authorize fact 1: authenticate the subject, then start the client lookup.
@@ -471,21 +600,21 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 unsafe fn handle_authorize(
     s: &mut ModuleState,
     sys: &SyscallTable,
+    caller: &ExchangeId,
     req: &auth_wire::AuthorizeRequest<'_>,
 ) {
-    let corr = req.corr;
     if s.keyset.is_empty() {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::NO_KEY);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::NO_KEY);
         return;
     }
     if req.credential.is_empty() || req.proof.is_empty() {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::UNAUTHENTICATED);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::UNAUTHENTICATED);
         return;
     }
     // PKCE S256 is mandatory: a code with no challenge is a code with no
     // client binding.
     if req.code_challenge.len() != PKCE_CHALLENGE_LEN {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::NO_PKCE);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::NO_PKCE);
         return;
     }
     // Everything the code record will carry from the client is refused here
@@ -495,12 +624,12 @@ unsafe fn handle_authorize(
         || !json_safe(req.nonce)
         || !json_safe(req.code_challenge)
     {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::MALFORMED);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::MALFORMED);
         return;
     }
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::NO_CLOCK);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::NO_CLOCK);
         return;
     };
 
@@ -564,19 +693,19 @@ unsafe fn handle_authorize(
         } else {
             auth_wire::authz_err::UNAUTHENTICATED
         };
-        refuse_authz(s, sys, corr, why);
+        refuse_authz(s, sys, caller, why);
         return;
     };
     let (Some(sub), Some(device_id)) = (
         jose::claim_str(admitted.claims, b"sub"),
         jose::claim_str(admitted.claims, b"device_id"),
     ) else {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::UNAUTHENTICATED);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::UNAUTHENTICATED);
         return;
     };
 
     let Some(index) = free_slot(s) else {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     };
     // Stash everything the code will bind. redirect_uri, nonce, state and the
@@ -585,7 +714,7 @@ unsafe fn handle_authorize(
     // it is CLAMPED.
     let mut e = Pending::zero();
     e.flow = Flow::AuthzClaim;
-    e.caller_corr = corr;
+    e.caller = *caller;
     e.auth_time = now;
     copy_field(&mut e.sub, &mut e.sub_len, sub);
     copy_field(&mut e.device_id, &mut e.device_id_len, device_id);
@@ -605,7 +734,7 @@ unsafe fn handle_authorize(
     // The proof's replay identifier, in the keyspace's alphabet — the digest
     // rather than the client's own `jti`, which is whatever the client wrote.
     let Some(key_len) = b64::encode(&proof_id, &mut e.replay_key) else {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     };
     #[expect(
@@ -624,7 +753,7 @@ unsafe fn handle_authorize(
     s.next_corr = s.next_corr.wrapping_add(1).max(1);
     e.state_corr = sc;
     if !claim_proof(s, sys, sc, &e) {
-        refuse_authz(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
+        refuse_authz(s, sys, caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     e.live = true;
@@ -656,24 +785,24 @@ unsafe fn claim_proof(s: &ModuleState, sys: &SyscallTable, corr: u32, e: &Pendin
 unsafe fn handle_exchange(
     s: &mut ModuleState,
     sys: &SyscallTable,
+    caller: &ExchangeId,
     req: &auth_wire::CodeExchangeRequest<'_>,
 ) {
-    let corr = req.corr;
     if s.keyset.is_empty() {
-        refuse_xchg(s, sys, corr, auth_wire::authz_err::NO_KEY);
+        refuse_xchg(s, sys, caller, auth_wire::authz_err::NO_KEY);
         return;
     }
     if req.code.is_empty() || req.code_verifier.is_empty() {
-        refuse_xchg(s, sys, corr, auth_wire::authz_err::MALFORMED);
+        refuse_xchg(s, sys, caller, auth_wire::authz_err::MALFORMED);
         return;
     }
     let Some(index) = free_slot(s) else {
-        refuse_xchg(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
+        refuse_xchg(s, sys, caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     };
     let mut e = Pending::zero();
     e.flow = Flow::XchgCode;
-    e.caller_corr = corr;
+    e.caller = *caller;
     copy_field(&mut e.code, &mut e.code_len, req.code);
     copy_field(&mut e.client_id, &mut e.client_id_len, req.client_id);
     copy_field(
@@ -688,7 +817,7 @@ unsafe fn handle_exchange(
     s.next_corr = s.next_corr.wrapping_add(1).max(1);
     e.state_corr = sc;
     if !state_get(s, sys, sc, state_wire::NS_OAUTH_CODE, req.code) {
-        refuse_xchg(s, sys, corr, auth_wire::authz_err::STATE_UNAVAILABLE);
+        refuse_xchg(s, sys, caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     e.live = true;
@@ -843,7 +972,9 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    while chan::can_read(sys, s.in_state) {
+    // Nothing is taken off the ledger while an answer or a mint call is
+    // held: each reply ends in at most one of them.
+    while clear(s, sys) && chan::can_read(sys, s.in_state) {
         let mut buf = [0u8; 2048];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_state, &mut buf);
         if msg_type == 0 {
@@ -892,19 +1023,14 @@ unsafe fn authz_on_claim(
         state_wire::ReplayClaim::Fresh => {}
         state_wire::ReplayClaim::Replayed => {
             s.pending[index] = Pending::zero();
-            refuse_authz(s, sys, e.caller_corr, auth_wire::authz_err::REPLAY);
+            refuse_authz(s, sys, &e.caller, auth_wire::authz_err::REPLAY);
             return;
         }
         state_wire::ReplayClaim::Unavailable => {
             // A claim that could not be made is a proof whose freshness
             // nothing established.
             s.pending[index] = Pending::zero();
-            refuse_authz(
-                s,
-                sys,
-                e.caller_corr,
-                auth_wire::authz_err::STATE_UNAVAILABLE,
-            );
+            refuse_authz(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
             return;
         }
     }
@@ -922,12 +1048,7 @@ unsafe fn authz_on_claim(
         &next.client_id[..usize::from(next.client_id_len)],
     ) {
         s.pending[index] = Pending::zero();
-        refuse_authz(
-            s,
-            sys,
-            e.caller_corr,
-            auth_wire::authz_err::STATE_UNAVAILABLE,
-        );
+        refuse_authz(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     s.pending[index] = next;
@@ -947,7 +1068,7 @@ unsafe fn authz_on_client(
 ) {
     if rep.status != auth_wire::ST_OK {
         s.pending[index] = Pending::zero();
-        refuse_authz(s, sys, e.caller_corr, auth_wire::authz_err::UNKNOWN_CLIENT);
+        refuse_authz(s, sys, &e.caller, auth_wire::authz_err::UNKNOWN_CLIENT);
         return;
     }
     let reg_ruri = jose::claim_str(rep.value, b"redirect_uri").unwrap_or(b"");
@@ -955,7 +1076,7 @@ unsafe fn authz_on_client(
     // Exact match — no wildcard, no normalisation, byte-for-byte.
     if reg_ruri.is_empty() || reg_ruri != &e.redirect_uri[..usize::from(e.redirect_uri_len)] {
         s.pending[index] = Pending::zero();
-        refuse_authz(s, sys, e.caller_corr, auth_wire::authz_err::BAD_REDIRECT);
+        refuse_authz(s, sys, &e.caller, auth_wire::authz_err::BAD_REDIRECT);
         return;
     }
     // The code_challenge was parked in `scope`; capture it before scope is
@@ -967,12 +1088,7 @@ unsafe fn authz_on_client(
     let mut draw = [0u8; CODE_ID_CHARS];
     if !draw_code(sys, &mut draw) {
         s.pending[index] = Pending::zero();
-        refuse_authz(
-            s,
-            sys,
-            e.caller_corr,
-            auth_wire::authz_err::STATE_UNAVAILABLE,
-        );
+        refuse_authz(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
 
@@ -987,12 +1103,7 @@ unsafe fn authz_on_client(
     let mut record = [0u8; 1024];
     let Some(rn) = build_code_record(&ne, &cc[..cclen], &mut record) else {
         s.pending[index] = Pending::zero();
-        refuse_authz(
-            s,
-            sys,
-            e.caller_corr,
-            auth_wire::authz_err::STATE_UNAVAILABLE,
-        );
+        refuse_authz(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     };
 
@@ -1015,12 +1126,7 @@ unsafe fn authz_on_client(
         .unwrap_or(false);
     if !ok {
         s.pending[index] = Pending::zero();
-        refuse_authz(
-            s,
-            sys,
-            e.caller_corr,
-            auth_wire::authz_err::STATE_UNAVAILABLE,
-        );
+        refuse_authz(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     // The PUT ack is not awaited on a stage: put_if_absent is create-only, and
@@ -1029,18 +1135,13 @@ unsafe fn authz_on_client(
     // the caller immediately.
     s.pending[index] = Pending::zero();
     let resp = auth_wire::AuthorizeResponse {
-        corr: e.caller_corr,
         status: auth_wire::authz_err::OK,
         code: &draw,
         redirect_uri: reg_ruri,
         state: &e.state[..usize::from(e.state_len)],
     };
-    let mut framed = [0u8; 512];
-    if let Ok(n) = resp.encode(&mut framed) {
-        if let Ok((t, p)) = auth_wire::read_envelope(&framed[..n]) {
-            chan::channel_write_msg(sys, s.out_replies, t, p);
-            s.authz_ok = s.authz_ok.saturating_add(1);
-        }
+    if answer(s, sys, &e.caller, |out| resp.encode(out)) {
+        s.authz_ok = s.authz_ok.saturating_add(1);
     }
 }
 
@@ -1061,7 +1162,7 @@ unsafe fn xchg_on_code(
     // Unknown / expired code (the store answers NOT_FOUND once the TTL lapses).
     if rep.status != auth_wire::ST_OK {
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::INVALID_GRANT);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::INVALID_GRANT);
         return;
     }
     let rec = rep.value;
@@ -1073,7 +1174,7 @@ unsafe fn xchg_on_code(
     // an authorization code MUST NOT be used more than once.
     if matches!(jose::claim_str(rec, b"status"), Some(b"consumed")) {
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::INVALID_GRANT);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::INVALID_GRANT);
         return;
     }
     let cid = jose::claim_str(rec, b"cid").unwrap_or(b"");
@@ -1085,7 +1186,7 @@ unsafe fn xchg_on_code(
         || ruri != &e.redirect_uri[..usize::from(e.redirect_uri_len)]
     {
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::MISMATCH);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MISMATCH);
         return;
     }
     // PKCE S256: base64url(SHA256(verifier)) == the stored challenge. The
@@ -1095,7 +1196,7 @@ unsafe fn xchg_on_code(
     let computed = b64::encode_digest32(&digest);
     if cc.len() != computed.len() || cc != &computed[..] {
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::PKCE_FAILED);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::PKCE_FAILED);
         return;
     }
 
@@ -1141,12 +1242,7 @@ unsafe fn xchg_on_code(
         &ne.device_id[..usize::from(ne.device_id_len)],
     ) {
         s.pending[index] = Pending::zero();
-        refuse_xchg(
-            s,
-            sys,
-            e.caller_corr,
-            auth_wire::authz_err::STATE_UNAVAILABLE,
-        );
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     s.pending[index] = ne;
@@ -1193,23 +1289,18 @@ unsafe fn xchg_on_device(
             // Certificate valid, but the device is not (or no longer) in the
             // ledger — the same refusal grant gives.
             s.pending[index] = Pending::zero();
-            refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::INVALID_GRANT);
+            refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::INVALID_GRANT);
             return;
         }
         _ => {
             s.pending[index] = Pending::zero();
-            refuse_xchg(
-                s,
-                sys,
-                e.caller_corr,
-                auth_wire::authz_err::STATE_UNAVAILABLE,
-            );
+            refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
             return;
         }
     }
     if matches!(jose::claim_str(rep.value, b"status"), Some(b"revoked")) {
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::INVALID_GRANT);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::INVALID_GRANT);
         return;
     }
 
@@ -1234,12 +1325,7 @@ unsafe fn xchg_on_device(
         .unwrap_or(false);
     if !ok {
         s.pending[index] = Pending::zero();
-        refuse_xchg(
-            s,
-            sys,
-            e.caller_corr,
-            auth_wire::authz_err::STATE_UNAVAILABLE,
-        );
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::STATE_UNAVAILABLE);
         return;
     }
     let mut ne = *e;
@@ -1263,29 +1349,30 @@ unsafe fn xchg_on_consume(
     if rep.status != auth_wire::ST_OK {
         // Lost the single-use race, or the code changed under us.
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::INVALID_GRANT);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::INVALID_GRANT);
         return;
     }
     // Mint the access token: aud = the deployment RS, scope = the CLAMPED
     // scope from the code, cnf.jkt = the device's key. Profile ACCESS_TOKEN.
-    let mc = s.next_corr;
-    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    // Copied out so the spec does not hold the module borrowed across the
+    // call that places it.
+    let aud = s.aud;
     let spec = MintSpec {
         profile: auth_wire::suite::profile::ACCESS_TOKEN,
-        aud: &s.aud[..usize::from(s.aud_len)],
+        aud: &aud[..usize::from(s.aud_len)],
         scope: &e.scope[..usize::from(e.scope_len)],
         ttl: s.ttl_seconds,
         sub: &e.sub[..usize::from(e.sub_len)],
         jkt: Some(&e.jkt),
         extra: &[],
     };
-    if !emit_mint(s, sys, mc, &spec) {
+    let Some(mint) = emit_mint(s, sys, &spec) else {
         s.pending[index] = Pending::zero();
-        refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::MINT_FAILED);
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MINT_FAILED);
         return;
-    }
+    };
     let mut ne = *e;
-    ne.mint_corr = mc;
+    ne.mint = mint;
     ne.flow = Flow::XchgMintAt;
     s.pending[index] = ne;
 }
@@ -1303,7 +1390,9 @@ struct MintSpec<'a> {
     extra: &'a [auth_wire::MintClaim<'a>],
 }
 
-/// Build and send a MintRequest to token_mint. Shared by both token mints.
+/// Call token_mint with a MintRequest: one exchange, whose id is returned.
+/// Shared by both token mints. `None` when no call could be made — no mint
+/// wired, its link down, or a request that does not encode.
 ///
 /// The request shape (policy params + jkt) is the one `mint_admission`
 /// builds for the grant path; the two are held in step by the harness, which
@@ -1313,9 +1402,17 @@ struct MintSpec<'a> {
 /// As `drain_keys`. `spec`'s slices (including the `extra` claims —
 /// nonce/auth_time for the ID token) borrow caller memory that must outlive
 /// the call.
-unsafe fn emit_mint(s: &ModuleState, sys: &SyscallTable, corr: u32, spec: &MintSpec<'_>) -> bool {
+unsafe fn emit_mint(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    spec: &MintSpec<'_>,
+) -> Option<ExchangeId> {
+    if s.out_mint < 0 || s.mint_down {
+        return None;
+    }
+    let mint = typed_exchange::call_id(s.next_mint, s.out_mint);
+    s.next_mint = s.next_mint.wrapping_add(1);
     let req = auth_wire::MintRequest {
-        correlation: corr,
         request_type: auth_wire::request_type::MINT,
         suite: s.token_suite,
         profile_id: spec.profile,
@@ -1333,12 +1430,40 @@ unsafe fn emit_mint(s: &ModuleState, sys: &SyscallTable, corr: u32, spec: &MintS
         jkt: spec.jkt,
         extra: auth_wire::ExtraClaims::Slice(spec.extra),
     };
-    let mut framed = [0u8; 4096];
-    req.encode(&mut framed)
-        .ok()
-        .and_then(|n| auth_wire::read_envelope(&framed[..n]).ok())
-        .map(|(t, p)| chan::channel_write_msg(sys, s.out_mint, t, p) > 0)
-        .unwrap_or(false)
+    let mut envelope = [0u8; typed_exchange::CALL_MAX];
+    let n = req.encode(&mut envelope).ok()?;
+    let len = typed_exchange::write_call(&mint, &envelope[..n], &mut s.mint_buf)?;
+    // Placed now or held for the next step: either way the call is owed and
+    // the stage waits on its answer.
+    s.mint_outbox.send(sys, s.out_mint, &s.mint_buf, len);
+    Some(mint)
+}
+
+/// The pending exchange stage waiting on mint exchange `id`.
+fn awaiting(s: &ModuleState, id: &ExchangeId) -> Option<usize> {
+    s.pending.iter().position(|p| {
+        p.live && p.mint == *id && matches!(p.flow, Flow::XchgMintAt | Flow::XchgMintId)
+    })
+}
+
+/// Answer every exchange stage waiting on the mint with MINT_FAILED, one at
+/// a time: the rest stay pending and `module_step` fails them on a later
+/// step while `mint_down` holds.
+///
+/// # Safety
+/// As `drain_keys`.
+unsafe fn fail_open_mints(s: &mut ModuleState, sys: &SyscallTable) {
+    for index in 0..MAX_IN_FLIGHT {
+        let e = s.pending[index];
+        if !e.live || !matches!(e.flow, Flow::XchgMintAt | Flow::XchgMintId) {
+            continue;
+        }
+        if !clear(s, sys) {
+            return;
+        }
+        s.pending[index] = Pending::zero();
+        refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MINT_FAILED);
+    }
 }
 
 /// A token mint answered. Two stages: the access token, then the ID token.
@@ -1350,50 +1475,74 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    while chan::can_read(sys, s.in_mint) {
-        let mut buf = [0u8; 8192];
-        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_mint, &mut buf);
-        if msg_type == 0 {
+    while clear(s, sys) && chan::can_read(sys, s.in_mint) {
+        let n = (sys.channel_read)(s.in_mint, s.buf.as_mut_ptr(), s.buf.len());
+        if n <= 0 {
             break;
         }
-        if msg_type != auth_wire::MSG_MINT_RESP {
-            continue;
-        }
-        let Ok(rep) = auth_wire::MintResponse::decode(&buf[..plen as usize]) else {
-            continue;
+        let record = s.buf;
+        let (id, minted) = match typed_exchange::read_answer(&record[..n as usize]) {
+            Answer::Message {
+                id,
+                msg_type,
+                payload,
+            } => (
+                id,
+                if msg_type == auth_wire::MSG_MINT_RESP {
+                    auth_wire::MintResponse::decode(payload).ok()
+                } else {
+                    None
+                },
+            ),
+            // The mint refused the exchange itself, or it ended without an
+            // answer.
+            Answer::Failed { id, .. } => (id, None),
+            Answer::Link { state } => {
+                if state == x::link::DOWN {
+                    s.mint_down = true;
+                    fail_open_mints(s, sys);
+                } else if state == x::link::UP {
+                    s.mint_down = false;
+                }
+                continue;
+            }
+            Answer::Ignored => continue,
         };
-        let Some(index) = s.pending.iter().position(|p| {
-            p.live
-                && p.mint_corr == rep.correlation
-                && matches!(p.flow, Flow::XchgMintAt | Flow::XchgMintId)
-        }) else {
+        let Some(index) = awaiting(s, &id) else {
             continue;
         };
         worked = true;
         let e = s.pending[index];
-        let minted_ok =
-            rep.status == auth_wire::mint_err::OK && rep.delivery == auth_wire::delivery::INLINE;
+        let token = match minted {
+            Some(rep)
+                if rep.status == auth_wire::mint_err::OK
+                    && rep.delivery == auth_wire::delivery::INLINE =>
+            {
+                Some(rep.body)
+            }
+            _ => None,
+        };
         match e.flow {
             Flow::XchgMintAt => {
-                if !minted_ok {
+                let Some(token) = token else {
                     s.pending[index] = Pending::zero();
-                    refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::MINT_FAILED);
+                    refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MINT_FAILED);
                     continue;
-                }
+                };
                 // Hold the access token, then mint the ID token: aud=client_id,
                 // profile ID_TOKEN, with nonce + auth_time as claims (omitted
                 // when absent, per OIDC).
                 let mut ne = e;
-                if rep.body.len() > ne.access_token.len() {
+                if token.len() > ne.access_token.len() {
                     // Truncating here would hand the client a token-shaped
                     // string that verifies as nothing. The mint produced
                     // something this module cannot carry: a 5xx.
                     s.pending[index] = Pending::zero();
-                    refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::MINT_FAILED);
+                    refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MINT_FAILED);
                     continue;
                 }
-                let n = rep.body.len();
-                ne.access_token[..n].copy_from_slice(&rep.body[..n]);
+                let n = token.len();
+                ne.access_token[..n].copy_from_slice(token);
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "n bounded by access_token.len() (4096)"
@@ -1422,8 +1571,6 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                     };
                     ex += 1;
                 }
-                let mc = s.next_corr;
-                s.next_corr = s.next_corr.wrapping_add(1).max(1);
                 let spec = MintSpec {
                     profile: auth_wire::suite::profile::ID_TOKEN,
                     aud: &ne.client_id[..usize::from(ne.client_id_len)], // aud = client
@@ -1433,34 +1580,28 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                     jkt: None, // ID token is not sender-constrained
                     extra: &extra[..ex],
                 };
-                let ok = emit_mint(s, sys, mc, &spec);
-                if !ok {
+                let Some(mint) = emit_mint(s, sys, &spec) else {
                     s.pending[index] = Pending::zero();
-                    refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::MINT_FAILED);
+                    refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MINT_FAILED);
                     continue;
-                }
-                ne.mint_corr = mc;
+                };
+                ne.mint = mint;
                 ne.flow = Flow::XchgMintId;
                 s.pending[index] = ne;
             }
             Flow::XchgMintId => {
                 s.pending[index] = Pending::zero();
-                if !minted_ok {
-                    refuse_xchg(s, sys, e.caller_corr, auth_wire::authz_err::MINT_FAILED);
+                let Some(id_token) = token else {
+                    refuse_xchg(s, sys, &e.caller, auth_wire::authz_err::MINT_FAILED);
                     continue;
-                }
+                };
                 let resp = auth_wire::CodeExchangeResponse {
-                    corr: e.caller_corr,
                     status: auth_wire::authz_err::OK,
                     access_token: &e.access_token[..usize::from(e.access_len)],
-                    id_token: rep.body,
+                    id_token,
                 };
-                let mut framed = [0u8; 8192];
-                if let Ok(n) = resp.encode(&mut framed) {
-                    if let Ok((t, p)) = auth_wire::read_envelope(&framed[..n]) {
-                        chan::channel_write_msg(sys, s.out_replies, t, p);
-                        s.xchg_ok = s.xchg_ok.saturating_add(1);
-                    }
+                if answer(s, sys, &e.caller, |out| resp.encode(out)) {
+                    s.xchg_ok = s.xchg_ok.saturating_add(1);
                 }
             }
             _ => {}

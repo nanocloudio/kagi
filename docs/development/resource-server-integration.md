@@ -23,8 +23,9 @@ following hold:
 ## `resource_gate`
 
 `resource_gate` is those five checks as a module. It sits behind wave's
-`foundation/http` as an application: an `HttpRequest` arrives on
-`request_in` and exactly one `HttpResponse` goes back on `response_out`.
+`foundation/http` as an application — a provider of the workspace exchange
+contract: a request arrives on `request_in` and exactly one response goes
+back on `response_out`.
 Each check is decided by the fragment that owns it — `jose` for the
 signature and window, `dpop` for the proof, `jwk` for the thumbprint —
 so the gate and the issuer cannot drift apart.

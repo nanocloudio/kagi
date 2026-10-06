@@ -74,7 +74,7 @@ port simply never accepts, with nothing in the log to say why.
 
 The way to fit is a module owning a path family. `wellknown_endpoint` owns
 both public documents; `e2ee_router` owns `/e2ee/` and fans to the three
-endpoints behind it, because wave's `http` has exactly one `req_out` and an
+endpoints behind it, because wave's `http` has exactly one `request_out` and an
 application behind it is one module. Static documents — `/healthz`,
 `/.well-known/ca.pem` — are routes on `http` itself and cost nothing.
 

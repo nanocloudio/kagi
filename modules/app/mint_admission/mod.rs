@@ -1,10 +1,16 @@
 //! Admission: may this presenter mint, and for whom?
 //!
-//! One question, answered once, for whoever asks. A caller sends
+//! One question, answered once, for whoever asks. A typed operation: a
+//! PROVIDER of the workspace exchange contract on `request_in` /
+//! `response_out` (`typed_exchange.rs`; byte layouts in
+//! `docs/architecture/typed-operations.md`). A caller's request body is a
 //! `MSG_ADMIT_REQ` with the credential and DPoP proof it received and the
-//! request they are bound to; this answers `MSG_ADMIT_RESP` with either a
-//! typed refusal or the subject, device and key binding the credential
-//! ESTABLISHED.
+//! request they are bound to; the answer body is a `MSG_ADMIT_RESP` with
+//! either a typed refusal or the subject, device and key binding the
+//! credential ESTABLISHED. A `MSG_GRANT_REQ` admits and then mints, through
+//! `token_mint` on `mint_out` / `mint_in` (this module is that exchange's
+//! REQUESTER), and is answered `MSG_GRANT_RESP`. Every verdict, refusals
+//! included, is a 200 exchange.
 //!
 //! Admission is three facts, in this order:
 //!
@@ -97,8 +103,13 @@ mod state_wire;
 mod time_policy;
 #[path = "../../common/totp.rs"]
 mod totp;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
 #[path = "../../common/verify_keyset.rs"]
 mod verify_keyset;
+
+use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use typed_exchange::Answer;
 
 /// `module_step` return code for "did work, step me again".
 const STEP_DID_WORK: i32 = 2;
@@ -112,6 +123,16 @@ const MAX_IN_FLIGHT: usize = 8;
 
 /// Longest subject or device id carried back.
 const MAX_FIELD: usize = 256;
+
+/// Exchanges collected at once.
+const MAX_EXCHANGES: usize = 4;
+/// Longest target and header block held. Neither is read; they are bounded
+/// so the module can sit behind an HTTP route as well as a pipeline.
+const MAX_TARGET: usize = 256;
+const MAX_HEADERS: usize = 1024;
+/// Longest request body: one `MSG_ADMIT_REQ` or `MSG_GRANT_REQ` envelope,
+/// which carries two compact JWSs.
+const MAX_REQUEST: usize = 4096 + auth_wire::ENVELOPE;
 
 /// This module's client id on the ledger's shared reply port.
 const STATE_CLIENT: u8 = 6;
@@ -150,20 +171,20 @@ const POLICY: device_auth::Policy = device_auth::Policy {
 #[derive(Clone, Copy)]
 struct Pending {
     live: bool,
-    /// The CALLER's correlation, echoed back on the reply. Distinct from the
-    /// ledger correlation below — conflating them is how a reply gets
+    /// The CALLER's exchange, which the answer is written on. Distinct from
+    /// the ledger correlation below — conflating them is how a reply gets
     /// matched to the wrong request.
-    caller_corr: u32,
+    caller: ExchangeId,
     /// The correlation the ledger will answer with.
     state_corr: u32,
     /// True for a GRANT (admit-and-mint); false for a bare admit. Decides
     /// whether a success mints or answers, and whether refusals frame as
     /// GrantResponse or AdmitResponse.
     grant: bool,
-    /// The correlation the MINT will answer with — a THIRD correlation space
+    /// The exchange this module opened with the MINT — a THIRD id space
     /// (caller / ledger / mint), matched only while `awaiting_mint`, because
     /// conflating any two is how a reply lands on the wrong request.
-    mint_corr: u32,
+    mint: ExchangeId,
     /// Set once the MintRequest is out; the entry now awaits `in_mint`.
     awaiting_mint: bool,
     sub: [u8; MAX_FIELD],
@@ -197,10 +218,10 @@ impl Pending {
     const fn zero() -> Self {
         Self {
             live: false,
-            caller_corr: 0,
+            caller: ExchangeId::NONE,
             state_corr: 0,
             grant: false,
-            mint_corr: 0,
+            mint: ExchangeId::NONE,
             awaiting_mint: false,
             sub: [0; MAX_FIELD],
             sub_len: 0,
@@ -226,17 +247,23 @@ impl Pending {
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32,   // in[0]:  MSG_ADMIT_REQ
-    out_replies: i32,   // out[0]: MSG_ADMIT_RESP
+    in_requests: i32,   // in[0]:  ExchangeRequest: MSG_ADMIT_REQ / MSG_GRANT_REQ
+    out_replies: i32,   // out[0]: ExchangeResponse: MSG_ADMIT_RESP / MSG_GRANT_RESP
     in_verify_key: i32, // in[1]:  MSG_KEY_ADD
     out_state: i32,     // out[1]: state requests
     in_state: i32,      // in[2]:  state replies
-    out_mint: i32,      // out[2]: MSG_MINT_REQ (grant mode)
-    in_mint: i32,       // in[3]:  MSG_MINT_RESP (grant mode)
+    out_mint: i32,      // out[2]: ExchangeRequest to token_mint (grant mode)
+    in_mint: i32,       // in[3]:  ExchangeResponse from token_mint (grant mode)
 
-    /// Monotonic; the correlation the ledger — and, in grant mode, the mint
-    /// — answer with. Distinct ports, so one counter is safe.
+    /// Monotonic; the correlation the ledger answers with.
     next_corr: u32,
+    /// Monotonic; numbers the exchanges this module opens with the mint.
+    next_mint: u64,
+    /// The mint reported its link DOWN and has not reported it UP. Every
+    /// call open at DOWN is unknowable and answered MINT_FAILED; a grant
+    /// arriving before UP is refused the same way rather than sent to be
+    /// dropped.
+    mint_down: bool,
 
     /// Grant-mode policy, all deployment params never client-supplied — a
     /// client presents only its credential, so it can widen nothing.
@@ -275,7 +302,18 @@ struct ModuleState {
     grant_ok: u32,
     grant_mint_failed: u32,
 
-    buf: [u8; abi::CHANNEL_BUFFER_SIZE],
+    /// Requests being collected until their body is whole.
+    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    /// The one answer, credit or refusal owed to `response_out`.
+    outbox: ExchangeOutbox,
+    /// The one mint call owed to `mint_out`.
+    mint_outbox: ExchangeOutbox,
+    /// The record being read.
+    buf: [u8; x::RECORD_MAX],
+    /// The record being written to `response_out`.
+    out: [u8; x::RECORD_MAX],
+    /// The record being written to `mint_out`.
+    mint_buf: [u8; x::RECORD_MAX],
 }
 
 define_params! {
@@ -377,6 +415,11 @@ pub extern "C" fn module_new(
         s.in_mint = dev_channel_port(sys, 0, 3);
 
         s.next_corr = 1;
+        s.next_mint = 1;
+        s.mint_down = false;
+        s.requests = Collector::new();
+        s.outbox = ExchangeOutbox::new();
+        s.mint_outbox = ExchangeOutbox::new();
         s.grant_ok = 0;
         s.grant_mint_failed = 0;
         s.keyset = verify_keyset::Keyset::new();
@@ -425,6 +468,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
 
         let mut worked = drain_keys(s, sys);
+        // What is owed goes out before anything new is read: every record
+        // read below ends in an answer or a mint call, and one placed on a
+        // full edge must be held rather than lost.
+        if !clear(s, sys) {
+            return 0;
+        }
+        if s.mint_down {
+            fail_open_mints(s, sys);
+        }
         worked |= drain_state(s, sys);
         worked |= drain_mint(s, sys);
         worked |= drain_requests(s, sys);
@@ -458,12 +510,62 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     worked
 }
 
+/// Place what is owed on both exchange ports. True when nothing is held.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let answers = s.outbox.flush(sys, s.out_replies, &s.out);
+    let calls = s.mint_outbox.flush(sys, s.out_mint, &s.mint_buf);
+    answers && calls
+}
+
+/// Answer `id` with the envelope `encode` writes. An answer that does not
+/// encode is a failure of this module, answered as one.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn answer(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    id: &ExchangeId,
+    encode: impl FnOnce(&mut [u8]) -> Result<usize, auth_wire::WireError>,
+) -> bool {
+    let Ok(len) = encode(&mut s.out[typed_exchange::ANSWER_AT..]) else {
+        answer_status(s, sys, id, x::status::FAILED);
+        return false;
+    };
+    if let Some(n) = typed_exchange::seal_answer(id, len, &mut s.out) {
+        s.outbox.send(sys, s.out_replies, &s.out, n);
+    }
+    true
+}
+
+/// Answer `id` with a status alone: a request this operation did not read.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn answer_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u16) {
+    if let Some(n) = typed_exchange::write_status(id, status, &mut s.out) {
+        s.outbox.send(sys, s.out_replies, &s.out, n);
+    }
+}
+
 /// Answer one caller with a refusal.
 ///
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
-unsafe fn reply(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8, grant: bool) {
+unsafe fn reply(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    caller: &ExchangeId,
+    status: u8,
+    grant: bool,
+) {
     // Every refusal says which one it was. The counters aggregate; this is
     // for the operator holding one failing request, who otherwise sees a
     // status their caller mapped and has no way back to the reason.
@@ -485,40 +587,32 @@ unsafe fn reply(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8, 
         _ => b"[admit] refused: malformed",
     };
     dev_log(sys, 2, why.as_ptr(), why.len());
-    let mut framed = [0u8; 1024];
     // A grant caller reads MSG_GRANT_RESP; an admit caller reads
     // MSG_ADMIT_RESP. Both refusals carry no identity and no token — the
     // rule each reply type enforces at decode.
-    let encoded = if grant {
-        auth_wire::GrantResponse {
-            corr,
-            status,
-            token: b"",
-        }
-        .encode(&mut framed)
+    if grant {
+        answer(s, sys, caller, |out| {
+            auth_wire::GrantResponse { status, token: b"" }.encode(out)
+        });
     } else {
-        auth_wire::AdmitResponse {
-            corr,
-            status,
-            sub: b"",
-            device_id: b"",
-            thumbprint_alg: auth_wire::suite::thumbprint::NONE,
-            jkt: b"",
-            // A refusal establishes nothing, so it carries no evidence — the
-            // same rule as the identity fields beside it.
-            evidence: auth_wire::assurance::EvidenceWire {
-                methods: 0,
-                key_binding: 0,
-                flags: 0,
-                auth_time: 0,
-            },
-        }
-        .encode(&mut framed)
-    };
-    if let Ok(n) = encoded {
-        if let Ok((wire_type, payload)) = auth_wire::read_envelope(&framed[..n]) {
-            chan::channel_write_msg(sys, s.out_replies, wire_type, payload);
-        }
+        answer(s, sys, caller, |out| {
+            auth_wire::AdmitResponse {
+                status,
+                sub: b"",
+                device_id: b"",
+                thumbprint_alg: auth_wire::suite::thumbprint::NONE,
+                jkt: b"",
+                // A refusal establishes nothing, so it carries no evidence —
+                // the same rule as the identity fields beside it.
+                evidence: auth_wire::assurance::EvidenceWire {
+                    methods: 0,
+                    key_binding: 0,
+                    flags: 0,
+                    auth_time: 0,
+                },
+            }
+            .encode(out)
+        });
     }
 }
 
@@ -529,7 +623,6 @@ unsafe fn reply(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8, 
 /// As `reply`.
 unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending) {
     let resp = auth_wire::AdmitResponse {
-        corr: entry.caller_corr,
         status: auth_wire::admit_err::OK,
         sub: &entry.sub[..usize::from(entry.sub_len)],
         device_id: &entry.device_id[..usize::from(entry.device_id_len)],
@@ -537,12 +630,8 @@ unsafe fn admit(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending) {
         jkt: &entry.jkt,
         evidence: entry.evidence,
     };
-    let mut framed = [0u8; 1024];
-    if let Ok(n) = resp.encode(&mut framed) {
-        if let Ok((wire_type, payload)) = auth_wire::read_envelope(&framed[..n]) {
-            chan::channel_write_msg(sys, s.out_replies, wire_type, payload);
-            s.admit_ok = s.admit_ok.saturating_add(1);
-        }
+    if answer(s, sys, &entry.caller, |out| resp.encode(out)) {
+        s.admit_ok = s.admit_ok.saturating_add(1);
     }
 }
 
@@ -559,49 +648,87 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_requests < 0 {
         return false;
     }
-    // Nothing is taken off an input while the answer to it has nowhere to go.
-    // Every record here ends in a reply on `out_replies`, and a reply lost to
-    // a full edge is a caller left waiting on a request this module already
-    // consumed — which surfaces as an HTTP request that never completes, not
-    // as an error anybody can see.
+    // Nothing is taken off an input while an answer is still held: every
+    // record here ends in at most one record on `response_out` (a credit
+    // grant, a refusal or a verdict) or one ledger request, and a held
+    // answer would be overwritten by the next.
     let mut worked = false;
-    while chan::can_write(sys, s.out_replies) && chan::can_read(sys, s.in_requests) {
-        let buf_ptr = s.buf.as_mut_ptr();
-        let (msg_type, plen) = {
-            let buf = core::slice::from_raw_parts_mut(buf_ptr, abi::CHANNEL_BUFFER_SIZE);
-            chan::channel_read_msg(sys, s.in_requests, buf)
-        };
-        if msg_type == 0 {
+    while clear(s, sys) && chan::can_read(sys, s.in_requests) {
+        let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
+        if n <= 0 {
             break;
         }
         worked = true;
-        let payload = core::slice::from_raw_parts(buf_ptr, plen as usize);
-        // A GrantRequest is admit-and-mint; an AdmitRequest is admit only.
-        // A GrantRequest decodes even with an empty credential (its corr must
-        // be answered), and is refused in `handle`; an AdmitRequest that
-        // fails to decode is dropped, because it carries no trustworthy corr.
-        if msg_type == auth_wire::MSG_GRANT_REQ {
-            if let Ok(g) = auth_wire::GrantRequest::decode(payload) {
-                handle(
-                    s,
-                    sys,
-                    &Ask {
-                        corr: g.corr,
-                        method: g.method,
-                        uri: g.uri,
-                        credential: g.credential,
-                        proof: g.proof,
-                        otp: g.otp,
-                        grant: true,
-                    },
-                );
+        let outcome = {
+            let ModuleState { requests, buf, .. } = &mut *s;
+            requests.accept(buf.get(..n as usize).unwrap_or(&[]))
+        };
+        if let Some((id, bytes)) = s.requests.take_grant() {
+            if let Some(len) = x::write_credit(&id, bytes, &mut s.out) {
+                s.outbox.send(sys, s.out_replies, &s.out, len);
             }
-        } else if let Ok(req) = auth_wire::AdmitRequest::decode(payload) {
-            handle(
+        }
+        if let Some((id, why)) = s.requests.take_refusal() {
+            answer_status(s, sys, &id, why.status());
+        }
+        if let Ok(Some(at)) = outcome {
+            take_request(s, sys, at);
+        }
+    }
+    worked
+}
+
+/// Take the request the collector completed in slot `at`.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(request) = s.requests.request(at) else {
+        return;
+    };
+    let id = request.id;
+    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    // Copied out of the collector so its slot is free, and the module
+    // borrowable, before anything is answered.
+    let body_len = request.body.len();
+    let mut body = [0u8; MAX_REQUEST];
+    body[..body_len].copy_from_slice(request.body);
+    s.requests.release(at);
+    if let Some(status) = refused {
+        answer_status(s, sys, &id, status);
+        return;
+    }
+    let Some((msg_type, payload)) = typed_exchange::message(&body[..body_len]) else {
+        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        return;
+    };
+    // A GrantRequest is admit-and-mint; an AdmitRequest is admit only. A
+    // payload that does not decode is still a request of its type, and is
+    // answered with that type's MALFORMED verdict.
+    match msg_type {
+        auth_wire::MSG_GRANT_REQ => match auth_wire::GrantRequest::decode(payload) {
+            Ok(g) => handle(
                 s,
                 sys,
                 &Ask {
-                    corr: req.corr,
+                    caller: id,
+                    method: g.method,
+                    uri: g.uri,
+                    credential: g.credential,
+                    proof: g.proof,
+                    otp: g.otp,
+                    grant: true,
+                },
+            ),
+            Err(_) => reply(s, sys, &id, auth_wire::grant_err::MALFORMED, true),
+        },
+        auth_wire::MSG_ADMIT_REQ => match auth_wire::AdmitRequest::decode(payload) {
+            Ok(req) => handle(
+                s,
+                sys,
+                &Ask {
+                    caller: id,
                     method: req.method,
                     uri: req.uri,
                     credential: req.credential,
@@ -609,20 +736,11 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                     otp: req.otp,
                     grant: false,
                 },
-            );
-        } else {
-            // No correlation to answer under. Dropped rather than answered
-            // at a guessed correlation, which would resolve some other
-            // caller's request. Logged, because the caller sees nothing.
-            dev_log(
-                sys,
-                1,
-                b"[admit] dropped: request did not decode".as_ptr(),
-                39,
-            );
-        }
+            ),
+            Err(_) => reply(s, sys, &id, auth_wire::admit_err::MALFORMED, false),
+        },
+        _ => answer_status(s, sys, &id, x::status::BAD_REQUEST),
     }
-    worked
 }
 
 /// Claiming the proof's replay identifier, so one proof admits once across
@@ -639,7 +757,7 @@ const MAX_OTP: usize = 8;
 /// The two differ in what they ask for and not in what they present, so the
 /// admission path takes this and neither of them.
 struct Ask<'a> {
-    corr: u32,
+    caller: ExchangeId,
     method: &'a [u8],
     uri: &'a [u8],
     credential: &'a [u8],
@@ -655,7 +773,7 @@ struct Ask<'a> {
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
 unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     let Ask {
-        corr,
+        caller,
         method,
         uri,
         credential,
@@ -663,18 +781,24 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
         otp,
         grant,
     } = *ask;
-    // A GrantRequest decodes with an empty credential so its corr survives to
-    // be answered here — a GET /oauth/token, a wrong path, or an empty body
-    // must get a refusal, not vanish. (An AdmitRequest never reaches this
+    // A GrantRequest decodes with an empty credential so it is answered
+    // here — a GET /oauth/token, a wrong path, or an empty body must get a
+    // refusal, not vanish. (An AdmitRequest never reaches this
     // with an empty credential: its decode rejects one.)
     if credential.is_empty() || proof.is_empty() {
         s.admit_unauthenticated = s.admit_unauthenticated.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::UNAUTHENTICATED, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::UNAUTHENTICATED,
+            grant,
+        );
         return;
     }
     if s.keyset.is_empty() {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::NO_KEY, grant);
+        reply(s, sys, &caller, auth_wire::admit_err::NO_KEY, grant);
         return;
     }
 
@@ -684,7 +808,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::NO_CLOCK, grant);
+        reply(s, sys, &caller, auth_wire::admit_err::NO_CLOCK, grant);
         return;
     };
 
@@ -744,10 +868,16 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     let Ok(admitted) = admitted else {
         if replayed {
             s.admit_replay = s.admit_replay.saturating_add(1);
-            reply(s, sys, corr, auth_wire::admit_err::REPLAY, grant);
+            reply(s, sys, &caller, auth_wire::admit_err::REPLAY, grant);
         } else {
             s.admit_unauthenticated = s.admit_unauthenticated.saturating_add(1);
-            reply(s, sys, corr, auth_wire::admit_err::UNAUTHENTICATED, grant);
+            reply(
+                s,
+                sys,
+                &caller,
+                auth_wire::admit_err::UNAUTHENTICATED,
+                grant,
+            );
         }
         return;
     };
@@ -761,18 +891,30 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
         jose::claim_str(admitted.claims, b"device_id"),
     ) else {
         s.admit_unauthenticated = s.admit_unauthenticated.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::UNAUTHENTICATED, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::UNAUTHENTICATED,
+            grant,
+        );
         return;
     };
 
     let Some(index) = free_slot(s) else {
         s.admit_in_flight_full = s.admit_in_flight_full.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::STATE_UNAVAILABLE,
+            grant,
+        );
         return;
     };
 
     let mut entry = Pending::zero();
-    entry.caller_corr = corr;
+    entry.caller = caller;
     entry.grant = grant;
     let sub_len = cert_sub.len().min(MAX_FIELD);
     entry.sub[..sub_len].copy_from_slice(&cert_sub[..sub_len]);
@@ -798,7 +940,13 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     let mut replay_key = [0u8; 43];
     let Some(replay_key_len) = b64::encode(&proof_id, &mut replay_key) else {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::STATE_UNAVAILABLE,
+            grant,
+        );
         return;
     };
     entry.replay_key = replay_key;
@@ -829,17 +977,35 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)
     else {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::STATE_UNAVAILABLE,
+            grant,
+        );
         return;
     };
     let Ok((wire_type, payload)) = auth_wire::read_envelope(&frame[..n]) else {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::STATE_UNAVAILABLE,
+            grant,
+        );
         return;
     };
     if chan::channel_write_msg(sys, s.out_state, wire_type, payload) <= 0 {
         s.admit_unavailable = s.admit_unavailable.saturating_add(1);
-        reply(s, sys, corr, auth_wire::admit_err::STATE_UNAVAILABLE, grant);
+        reply(
+            s,
+            sys,
+            &caller,
+            auth_wire::admit_err::STATE_UNAVAILABLE,
+            grant,
+        );
         return;
     }
     entry.live = true;
@@ -856,12 +1022,12 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    // Nothing is taken off an input while the answer to it has nowhere to go.
-    // Every record here ends in a reply on `out_replies`, and a reply lost to
-    // a full edge is a caller left waiting on a request this module already
-    // consumed — which surfaces as an HTTP request that never completes, not
-    // as an error anybody can see.
-    while chan::can_write(sys, s.out_replies) && chan::can_read(sys, s.in_state) {
+    // Nothing is taken off an input while an answer or a mint call is held.
+    // Every record here ends in at most one of them, and one lost to a full
+    // edge is a caller left waiting on a request this module already
+    // consumed — which surfaces as a request that never completes, not as an
+    // error anybody can see.
+    while clear(s, sys) && chan::can_read(sys, s.in_state) {
         let mut buf = [0u8; 1024];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_state, &mut buf);
         if msg_type == 0 {
@@ -898,7 +1064,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                     reply(
                         s,
                         sys,
-                        entry.caller_corr,
+                        &entry.caller,
                         auth_wire::admit_err::REPLAY,
                         entry.grant,
                     );
@@ -912,7 +1078,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                     reply(
                         s,
                         sys,
-                        entry.caller_corr,
+                        &entry.caller,
                         auth_wire::admit_err::STATE_UNAVAILABLE,
                         entry.grant,
                     );
@@ -924,7 +1090,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 reply(
                     s,
                     sys,
-                    entry.caller_corr,
+                    &entry.caller,
                     auth_wire::admit_err::STATE_UNAVAILABLE,
                     entry.grant,
                 );
@@ -942,7 +1108,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 reply(
                     s,
                     sys,
-                    entry.caller_corr,
+                    &entry.caller,
                     auth_wire::admit_err::UNKNOWN_DEVICE,
                     entry.grant,
                 );
@@ -953,7 +1119,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 reply(
                     s,
                     sys,
-                    entry.caller_corr,
+                    &entry.caller,
                     auth_wire::admit_err::STATE_UNAVAILABLE,
                     entry.grant,
                 );
@@ -970,7 +1136,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             reply(
                 s,
                 sys,
-                entry.caller_corr,
+                &entry.caller,
                 auth_wire::admit_err::REVOKED,
                 entry.grant,
             );
@@ -991,7 +1157,7 @@ unsafe fn drain_state(s: &mut ModuleState, sys: &SyscallTable) -> bool {
                 reply(
                     s,
                     sys,
-                    entry.caller_corr,
+                    &entry.caller,
                     auth_wire::admit_err::UNAUTHENTICATED,
                     entry.grant,
                 );
@@ -1181,7 +1347,7 @@ unsafe fn stage_device_read(
 /// verbatim, so this is the only place they can be bounded.
 ///
 /// The Pending entry is REUSED (not freed) and re-staged to await the mint
-/// reply on a THIRD correlation. Every failure frees it and answers
+/// answer on a THIRD id. Every failure frees it and answers
 /// MINT_FAILED — a leaked STAGE_GRANT_MINT slot would eventually refuse
 /// every admit-only caller too.
 ///
@@ -1189,21 +1355,21 @@ unsafe fn stage_device_read(
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
 unsafe fn emit_mint(s: &mut ModuleState, sys: &SyscallTable, index: usize, entry: &Pending) {
-    if s.out_mint < 0 {
-        // Grant mode was asked of a graph that wired no mint. Fail closed,
-        // as a refusal the caller can see.
+    if s.out_mint < 0 || s.in_mint < 0 || s.mint_down {
+        // Grant mode was asked of a graph that wired no mint, or of a mint
+        // whose link is down. Fail closed, as a refusal the caller can see.
         s.grant_mint_failed = s.grant_mint_failed.saturating_add(1);
         reply(
             s,
             sys,
-            entry.caller_corr,
+            &entry.caller,
             auth_wire::grant_err::MINT_FAILED,
             true,
         );
         return;
     }
-    let mint_corr = s.next_corr;
-    s.next_corr = s.next_corr.wrapping_add(1).max(1);
+    let mint = typed_exchange::call_id(s.next_mint, s.out_mint);
+    s.next_mint = s.next_mint.wrapping_add(1);
 
     // What the presenter proved, as the three claims a relying party reads.
     // Rendered by the shared fragment: the level in `acr` and the methods in
@@ -1228,7 +1394,6 @@ unsafe fn emit_mint(s: &mut ModuleState, sys: &SyscallTable, index: usize, entry
     ];
 
     let req = auth_wire::MintRequest {
-        correlation: mint_corr,
         request_type: auth_wire::request_type::MINT,
         suite: s.grant_suite,
         profile_id: auth_wire::suite::profile::ACCESS_TOKEN,
@@ -1242,30 +1407,30 @@ unsafe fn emit_mint(s: &mut ModuleState, sys: &SyscallTable, index: usize, entry
         jkt: Some(&entry.jkt),
         extra: auth_wire::ExtraClaims::Slice(&extra),
     };
-    let mut framed = [0u8; 4096];
-    let ok = req
-        .encode(&mut framed)
+    let sealed = req
+        .encode(&mut s.mint_buf[typed_exchange::CALL_AT..])
         .ok()
-        .and_then(|n| auth_wire::read_envelope(&framed[..n]).ok())
-        .map(|(t, p)| chan::channel_write_msg(sys, s.out_mint, t, p) > 0)
-        .unwrap_or(false);
-    if !ok {
+        .and_then(|n| typed_exchange::seal_call(&mint, n, &mut s.mint_buf));
+    let Some(n) = sealed else {
         s.grant_mint_failed = s.grant_mint_failed.saturating_add(1);
         reply(
             s,
             sys,
-            entry.caller_corr,
+            &entry.caller,
             auth_wire::grant_err::MINT_FAILED,
             true,
         );
         return;
-    }
-    // Re-stage the SAME entry to await the mint reply. sub/jkt are no longer
-    // needed (the request is out) but the caller_corr is, to answer with.
+    };
+    // Placed now or held for the next step: either way the call is owed and
+    // the entry waits on its answer.
+    s.mint_outbox.send(sys, s.out_mint, &s.mint_buf, n);
+    // Re-stage the SAME entry to await the mint's answer. sub/jkt are no
+    // longer needed (the request is out) but the caller is, to answer on.
     let mut staged = *entry;
     staged.live = true;
     staged.awaiting_mint = true;
-    staged.mint_corr = mint_corr;
+    staged.mint = mint;
     s.pending[index] = staged;
 }
 
@@ -1279,56 +1444,120 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    // Nothing is taken off an input while the answer to it has nowhere to go.
-    // Every record here ends in a reply on `out_replies`, and a reply lost to
-    // a full edge is a caller left waiting on a request this module already
-    // consumed — which surfaces as an HTTP request that never completes, not
-    // as an error anybody can see.
-    while chan::can_write(sys, s.out_replies) && chan::can_read(sys, s.in_mint) {
-        // A token-bearing MintResponse can approach TOKEN_BUF_LEN; size for
-        // the whole envelope so a real JWT is never truncated.
-        let mut buf = [0u8; 8192];
-        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_mint, &mut buf);
-        if msg_type == 0 {
+    // Nothing is taken off an input while an answer is held: every record
+    // here ends in at most one answer on `response_out`.
+    while clear(s, sys) && chan::can_read(sys, s.in_mint) {
+        let n = (sys.channel_read)(s.in_mint, s.buf.as_mut_ptr(), s.buf.len());
+        if n <= 0 {
             break;
         }
-        if msg_type != auth_wire::MSG_MINT_RESP {
-            continue;
-        }
-        let Ok(rep) = auth_wire::MintResponse::decode(&buf[..plen as usize]) else {
-            continue;
-        };
-        let Some(index) = s
-            .pending
-            .iter()
-            .position(|p| p.live && p.awaiting_mint && p.mint_corr == rep.correlation)
-        else {
-            s.admit_unmatched_reply = s.admit_unmatched_reply.saturating_add(1);
-            continue;
-        };
         worked = true;
-        let entry = s.pending[index];
-        s.pending[index] = Pending::zero();
-
-        // A non-OK mint, or one delivered as an object handle rather than an
-        // inline token, is a 5xx: the presenter was fine, the SIGNING was
-        // not. An object handle would mean the token was too large to inline
-        // — for an access token that is a misconfiguration, not something to
-        // hand a client half of.
-        if rep.status != auth_wire::mint_err::OK || rep.delivery != auth_wire::delivery::INLINE {
-            s.grant_mint_failed = s.grant_mint_failed.saturating_add(1);
-            reply(
-                s,
-                sys,
-                entry.caller_corr,
-                auth_wire::grant_err::MINT_FAILED,
-                true,
-            );
-            continue;
+        let record = s.buf;
+        match typed_exchange::read_answer(&record[..n as usize]) {
+            Answer::Message {
+                id,
+                msg_type,
+                payload,
+            } => {
+                let Some(index) = awaiting(s, &id) else {
+                    s.admit_unmatched_reply = s.admit_unmatched_reply.saturating_add(1);
+                    continue;
+                };
+                let entry = s.pending[index];
+                s.pending[index] = Pending::zero();
+                let minted = if msg_type == auth_wire::MSG_MINT_RESP {
+                    auth_wire::MintResponse::decode(payload).ok()
+                } else {
+                    None
+                };
+                // A non-OK mint, or one delivered as an object handle rather
+                // than an inline token, is a 5xx: the presenter was fine, the
+                // SIGNING was not. An object handle would mean the token was
+                // too large to inline — for an access token that is a
+                // misconfiguration, not something to hand a client half of.
+                match minted {
+                    Some(rep)
+                        if rep.status == auth_wire::mint_err::OK
+                            && rep.delivery == auth_wire::delivery::INLINE =>
+                    {
+                        grant_ok(s, sys, &entry.caller, rep.body);
+                    }
+                    _ => {
+                        s.grant_mint_failed = s.grant_mint_failed.saturating_add(1);
+                        reply(
+                            s,
+                            sys,
+                            &entry.caller,
+                            auth_wire::grant_err::MINT_FAILED,
+                            true,
+                        );
+                    }
+                }
+            }
+            // The mint refused the exchange itself, or it ended without an
+            // answer: the presenter was admitted and the signing did not
+            // happen.
+            Answer::Failed { id, .. } => {
+                let Some(index) = awaiting(s, &id) else {
+                    continue;
+                };
+                let entry = s.pending[index];
+                s.pending[index] = Pending::zero();
+                s.grant_mint_failed = s.grant_mint_failed.saturating_add(1);
+                reply(
+                    s,
+                    sys,
+                    &entry.caller,
+                    auth_wire::grant_err::MINT_FAILED,
+                    true,
+                );
+            }
+            // Every call open at LINK DOWN is unknowable. Each is answered
+            // MINT_FAILED, one at a time, so no answer overwrites another.
+            Answer::Link { state } if state == x::link::DOWN => {
+                s.mint_down = true;
+                fail_open_mints(s, sys);
+            }
+            Answer::Link { state } if state == x::link::UP => s.mint_down = false,
+            Answer::Link { .. } | Answer::Ignored => {}
         }
-        grant_ok(s, sys, entry.caller_corr, rep.body);
     }
     worked
+}
+
+/// The pending grant waiting on mint exchange `id`.
+fn awaiting(s: &ModuleState, id: &ExchangeId) -> Option<usize> {
+    s.pending
+        .iter()
+        .position(|p| p.live && p.awaiting_mint && p.mint == *id)
+}
+
+/// Answer every grant waiting on the mint with MINT_FAILED.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn fail_open_mints(s: &mut ModuleState, sys: &SyscallTable) {
+    for index in 0..MAX_IN_FLIGHT {
+        if !s.pending[index].live || !s.pending[index].awaiting_mint {
+            continue;
+        }
+        // One answer is placed or held at a time; the rest stay pending and
+        // `module_step` fails them on a later step while `mint_down` holds.
+        if !clear(s, sys) {
+            return;
+        }
+        let entry = s.pending[index];
+        s.pending[index] = Pending::zero();
+        s.grant_mint_failed = s.grant_mint_failed.saturating_add(1);
+        reply(
+            s,
+            sys,
+            &entry.caller,
+            auth_wire::grant_err::MINT_FAILED,
+            true,
+        );
+    }
 }
 
 /// Answer a grant caller with the minted token.
@@ -1336,17 +1565,12 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 /// # Safety
 ///
 /// As `drain_mint`.
-unsafe fn grant_ok(s: &mut ModuleState, sys: &SyscallTable, corr: u32, token: &[u8]) {
+unsafe fn grant_ok(s: &mut ModuleState, sys: &SyscallTable, caller: &ExchangeId, token: &[u8]) {
     let resp = auth_wire::GrantResponse {
-        corr,
         status: auth_wire::grant_err::OK,
         token,
     };
-    let mut framed = [0u8; 8192];
-    if let Ok(n) = resp.encode(&mut framed) {
-        if let Ok((wire_type, payload)) = auth_wire::read_envelope(&framed[..n]) {
-            chan::channel_write_msg(sys, s.out_replies, wire_type, payload);
-            s.grant_ok = s.grant_ok.saturating_add(1);
-        }
+    if answer(s, sys, caller, |out| resp.encode(out)) {
+        s.grant_ok = s.grant_ok.saturating_add(1);
     }
 }

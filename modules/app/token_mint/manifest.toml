@@ -5,21 +5,24 @@ entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712"]
 
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one MSG_MINT_REQ envelope and each answer body one
+# MSG_MINT_RESP envelope; the exchange id is the correlation. Layouts:
+# docs/architecture/typed-operations.md. An answer carries a compact JWS of
+# up to 4096 bytes (TOKEN_BUF_LEN in mod.rs) in one record.
 [[ports]]
-name = "mint_requests"
+name = "request_in"
 direction = "input"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
-name = "tokens"
+name = "response_out"
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
 buffer_size = 16384
-# Envelope (3) + MINT_RESP header (corr 4 + status 1) + token f16 (2 +
-# compact JWS). The fixed reserved-claim set is ~800B, but a request may
-# carry custom claims on top of it, so the token buffer is sized to 4096
-# and max_record matches to admit a realistically claim-laden token.
-max_record = 4096
+max_record = 8192
 
 [[ports]]
 name = "key_material"

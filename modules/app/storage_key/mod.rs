@@ -6,10 +6,15 @@
 //! machine that does no I/O of its own; this module is its host. It moves
 //! frames between the service and four parties:
 //!
-//! - **requesters** on `requests` / `replies`: the control plane asking to
-//!   create, grant, revoke, rotate, retire, erase or authorise recovery,
+//! - **requesters** on `request_in` / `response_out`, where this module is
+//!   a PROVIDER of the workspace exchange contract: the control plane asking
+//!   to create, grant, revoke, rotate, retire, erase or authorise recovery,
 //!   and attaching nodes asking for a challenge and then for a bundle, or
-//!   for a renewal of an attachment they hold;
+//!   for a renewal of an attachment they hold. A request body is one
+//!   `msg::REQUEST` envelope and its answer body one `msg::REPLY` envelope
+//!   (`typed_exchange.rs`; byte layouts in
+//!   `docs/architecture/typed-operations.md`); the exchange id is the
+//!   correlation;
 //! - **the ledger** (`security_state`) on `ledger_out` / `ledger_in`, which
 //!   holds every grant, recovery set, ticket, anti-replay claim and audit
 //!   entry;
@@ -24,7 +29,7 @@
 //!   `verify_key`. Only this module can: a vault label is this module's
 //!   own, and nothing else opens the key to read its public half.
 //!
-//! The control verbs on `requests` carry no authentication of their own:
+//! The control verbs on `request_in` carry no authentication of their own:
 //! the port is a control-plane port and belongs behind the same admission
 //! as the rest of the control surface. Attach, recover and renew requests
 //! authenticate themselves, with a proof by the enrolled device key.
@@ -78,6 +83,10 @@ mod storage_key;
 mod storage_key_service;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
+
+use abi::contracts::exchange::{self as x, Collector, ExchangeId};
 
 use auth_wire::assurance::{AssuranceLevel, AuthMethod, Evidence};
 use storage_key as sk;
@@ -96,12 +105,20 @@ const MAX_CUSTODIAN_PER_STEP: usize = 2;
 /// Longest message this module reads: a request, a ledger value carrying a
 /// record, or a custodian result.
 const MSG_BUF: usize = 4096;
+/// Exchanges collected at once.
+const MAX_EXCHANGES: usize = 4;
+/// Longest target and header block held. Neither is read; they are bounded
+/// so the module can sit behind an HTTP route as well as a requester.
+const MAX_TARGET: usize = 256;
+const MAX_HEADERS: usize = 1024;
+/// Longest request body: one `msg::REQUEST` envelope.
+const MAX_REQUEST: usize = auth_wire::ENVELOPE + 1 + svc::MAX_REQUEST;
 
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32,
-    out_replies: i32,
+    in_requests: i32,   // in[0]:  ExchangeRequest, msg::REQUEST bodies
+    out_responses: i32, // out[0]: ExchangeResponse, msg::REPLY bodies
     in_key: i32,
     out_ledger: i32,
     in_ledger: i32,
@@ -121,6 +138,16 @@ struct ModuleState {
 
     buf: [u8; MSG_BUF],
     service: svc::Service,
+
+    /// Requests being collected until their body is whole.
+    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    /// The one answer, credit or refusal owed to `response_out`. Nothing new
+    /// is read while it is held.
+    outbox: ExchangeOutbox,
+    /// The record being read from `request_in`.
+    record: [u8; x::RECORD_MAX],
+    /// The record being written to `response_out`.
+    out: [u8; x::RECORD_MAX],
 }
 
 define_params! {
@@ -148,7 +175,9 @@ struct ModuleHost<'a> {
     sys: &'a SyscallTable,
     key: &'a issuer_key::IssuerKey,
     scratch: &'a mut [u8],
-    out_replies: i32,
+    out_responses: i32,
+    outbox: &'a mut ExchangeOutbox,
+    out: &'a mut [u8; x::RECORD_MAX],
     out_ledger: i32,
     out_custodian: i32,
 }
@@ -230,11 +259,39 @@ impl svc::Host for ModuleHost<'_> {
         }
     }
 
+    fn answer(&mut self, caller: &svc::Caller, frame: &[u8]) -> bool {
+        // One answer is placed or held at a time. An answer that finds one
+        // still held, after a last attempt to place it, is not written over
+        // it: the service counts it unanswered rather than this losing two.
+        // SAFETY: `sys` is the live syscall table this host was built with.
+        if self.out_responses < 0
+            || !unsafe {
+                self.outbox
+                    .flush(self.sys, self.out_responses, &self.out[..])
+            }
+        {
+            return false;
+        }
+        let id = ExchangeId(*caller);
+        // An answer that does not fit one record is this module's failure,
+        // answered as one rather than left unanswered.
+        let Some(n) = typed_exchange::write_answer(&id, frame, &mut self.out[..])
+            .or_else(|| typed_exchange::write_status(&id, x::status::FAILED, &mut self.out[..]))
+        else {
+            return false;
+        };
+        // SAFETY: as above; `out` holds the record until it is placed.
+        unsafe {
+            self.outbox
+                .send(self.sys, self.out_responses, &self.out[..], n)
+        };
+        true
+    }
+
     fn send(&mut self, port: Port, frame: &[u8]) -> bool {
         let chan = match port {
             Port::Ledger => self.out_ledger,
             Port::Custodian => self.out_custodian,
-            Port::Reply => self.out_replies,
         };
         if chan < 0 || frame.len() > i32::MAX as usize {
             return false;
@@ -252,6 +309,18 @@ impl svc::Host for ModuleHost<'_> {
             let want = frame.len() as i32;
             (self.sys.channel_write)(chan, frame.as_ptr(), frame.len()) == want
         }
+    }
+}
+
+/// Answer `id` with a status alone: a request this service did not read.
+///
+/// # Safety
+///
+/// `host.sys` is the live syscall table.
+unsafe fn answer_status(host: &mut ModuleHost<'_>, id: &ExchangeId, status: u16) {
+    if let Some(n) = typed_exchange::write_status(id, status, &mut host.out[..]) {
+        host.outbox
+            .send(host.sys, host.out_responses, &host.out[..], n);
     }
 }
 
@@ -364,7 +433,9 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
 
         s.in_requests = in_chan;
-        s.out_replies = out_chan;
+        s.out_responses = out_chan;
+        s.requests = Collector::new();
+        s.outbox = ExchangeOutbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_ledger = dev_channel_port(sys, 1, 1);
         s.in_ledger = dev_channel_port(sys, 0, 2);
@@ -400,9 +471,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_key(s, sys);
         announce_key(s, sys);
 
+        // What is owed goes out first, and nothing new is read until it has:
+        // a record taken and then answered into a full channel would be
+        // answered with silence.
+        if !s.outbox.flush(sys, s.out_responses, &s.out) {
+            return 0;
+        }
+
         let ModuleState {
             in_requests,
-            out_replies,
+            out_responses,
             in_ledger,
             out_ledger,
             in_custodian,
@@ -411,13 +489,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             sign_scratch,
             buf,
             service,
+            requests,
+            outbox,
+            record,
+            out,
             ..
         } = s;
         let mut host = ModuleHost {
             sys,
             key,
             scratch: sign_scratch,
-            out_replies: *out_replies,
+            out_responses: *out_responses,
+            outbox,
+            out,
             out_ledger: *out_ledger,
             out_custodian: *out_custodian,
         };
@@ -425,8 +509,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Answers first: each frees or advances an operation, so a request
         // in the same step may take the slot it vacated.
+        // Every record read below ends in at most one answer, and one is
+        // placed or held at a time: nothing is read while one is held.
         for _ in 0..MAX_LEDGER_PER_STEP {
-            if !chan::can_read(sys, *in_ledger) {
+            if host.outbox.holding() || !chan::can_read(sys, *in_ledger) {
                 break;
             }
             let (t, n) = chan::channel_read_msg(sys, *in_ledger, buf);
@@ -437,7 +523,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             service.on_ledger(&mut host, t, buf.get(..usize::from(n)).unwrap_or(&[]));
         }
         for _ in 0..MAX_CUSTODIAN_PER_STEP {
-            if !chan::can_read(sys, *in_custodian) {
+            if host.outbox.holding() || !chan::can_read(sys, *in_custodian) {
                 break;
             }
             let (t, n) = chan::channel_read_msg(sys, *in_custodian, buf);
@@ -450,19 +536,48 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         for _ in 0..MAX_REQUESTS_PER_STEP {
-            if !chan::can_read(sys, *in_requests) || !chan::can_write(sys, *out_replies) {
+            if host.outbox.holding() || !chan::can_read(sys, *in_requests) {
                 break;
             }
-            let (t, n) = chan::channel_read_msg(sys, *in_requests, buf);
-            if t == 0 {
+            let n = (sys.channel_read)(*in_requests, record.as_mut_ptr(), record.len());
+            if n <= 0 {
                 break;
             }
             worked = true;
-            if t == svc::msg::REQUEST {
-                service.on_request(&mut host, buf.get(..usize::from(n)).unwrap_or(&[]));
+            let outcome = requests.accept(record.get(..n as usize).unwrap_or(&[]));
+            // One record owes at most one thing: a body grant, a refusal, or
+            // (once whole) an answer.
+            if let Some((id, bytes)) = requests.take_grant() {
+                if let Some(len) = x::write_credit(&id, bytes, &mut host.out[..]) {
+                    host.outbox.send(sys, *out_responses, &host.out[..], len);
+                }
+            }
+            if let Some((id, why)) = requests.take_refusal() {
+                answer_status(&mut host, &id, why.status());
+            }
+            let Ok(Some(at)) = outcome else {
+                continue;
+            };
+            let Some(request) = requests.request(at) else {
+                continue;
+            };
+            let id = request.id;
+            let refused = typed_exchange::admissible(request.method, request.resp_credit);
+            let body_len = request.body.len();
+            buf[..body_len].copy_from_slice(request.body);
+            requests.release(at);
+            if let Some(status) = refused {
+                answer_status(&mut host, &id, status);
+                continue;
+            }
+            match typed_exchange::message(&buf[..body_len]) {
+                Some((svc::msg::REQUEST, payload)) => service.on_request(&mut host, &id.0, payload),
+                _ => answer_status(&mut host, &id, x::status::BAD_REQUEST),
             }
         }
-        service.tick(&mut host);
+        if !host.outbox.holding() {
+            service.tick(&mut host);
+        }
 
         if worked {
             STEP_DID_WORK

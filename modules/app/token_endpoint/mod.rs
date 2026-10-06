@@ -1,22 +1,26 @@
 //! Token endpoint — the HTTP shape of a token request.
 //!
 //! Sits behind wave's `foundation/http` as an application, in front of
-//! `token_mint`. An `HttpRequest` arrives on `request_in`; the endpoint reads
-//! the form-encoded body, sends a `MSG_MINT_REQ` on `mint_out`, and when the
-//! matching `MSG_MINT_RESP` comes back on `mint_in` it answers the connection
-//! that asked with the OAuth token response.
+//! `mint_admission` and `token_mint`. It is a PROVIDER of the workspace
+//! exchange contract toward the server — a request arrives on `request_in`,
+//! its answer leaves on `response_out` — and a REQUESTER of the two typed
+//! operations it drives: the presentation goes to admission on `admit_out`
+//! (`MSG_ADMIT_REQ`, answered on `admit_in`), and an admitted request goes to
+//! the mint on `mint_out` (`MSG_MINT_REQ`, answered on `mint_in`). When the
+//! token comes back the endpoint answers the connection that asked with the
+//! OAuth token response.
 //!
 //! **It does not mint.** The claims, the signing key and the algorithm stay in
 //! `token_mint`, which is the module that already owns them. What is here is
 //! only the translation: form fields in, JSON out, and the bookkeeping that
 //! remembers which HTTP connection a mint reply belongs to.
 //!
-//! That bookkeeping is the whole substance of the module. A mint reply
-//! carries a correlation id and nothing else about its origin, so the pending
-//! table is what turns it back into a response on the right connection. The
-//! table is fixed-size and a request that arrives with it full is refused with
-//! 503 rather than queued: a queue with no bound is a queue that answers the
-//! wrong connection once the ids wrap.
+//! That bookkeeping is the whole substance of the module. An answer from
+//! admission or the mint names only the exchange this endpoint opened for it,
+//! so the pending table is what turns it back into a response on the right
+//! connection. The table is fixed-size and a request that arrives with it
+//! full is refused with 503 rather than queued: a queue with no bound is a
+//! queue that answers the wrong connection once the ids wrap.
 //!
 //! Requests are `application/x-www-form-urlencoded`, as RFC 6749 requires:
 //!
@@ -76,13 +80,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, ExchangeId};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -98,14 +99,18 @@ mod jose;
 mod jwk;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
+
+use typed_exchange::Answer;
 
 use auth_wire::{ExtraClaims, MintRequest, PayloadReader};
 
 /// `module_step` return code for "did work, step me again".
 const STEP_DID_WORK: i32 = 2;
 
-/// wave's `wire::method::METHOD_POST`.
-const METHOD_POST: u8 = 3;
+/// The exchange contract's method byte for `POST`.
+const METHOD_POST: u8 = x::METHOD_POST;
 
 /// Requests awaiting a mint reply.
 ///
@@ -142,8 +147,11 @@ const MAX_OTP: usize = 8;
 /// One request waiting for its token.
 #[derive(Clone, Copy)]
 struct Pending {
-    corr: u32,
-    id: http_app::AppId,
+    /// The exchange this endpoint opened with admission or the mint, which
+    /// the answer names.
+    call: ExchangeId,
+    /// The server's exchange, which the response is written on.
+    id: ExchangeId,
     credit: u32,
     /// `STAGE_ADMIT` while admission is deciding, `STAGE_MINT` once the
     /// mint has the request.
@@ -167,21 +175,16 @@ struct Pending {
     ttl: u32,
     device_id: [u8; MAX_FIELD],
     device_id_len: u16,
-    /// `false` marks the slot free. A generation counter would be better
-    /// against reuse, but the correlation id already is one: it only
-    /// increments, so a stale reply finds no slot rather than the wrong one.
+    /// `false` marks the slot free. The call id is the generation: it only
+    /// increments, so a stale answer finds no slot rather than the wrong one.
     live: bool,
 }
 
 impl Pending {
     const fn zero() -> Self {
         Self {
-            corr: 0,
-            id: http_app::AppId {
-                origin: 0,
-                conn: 0,
-                stream: 0,
-            },
+            call: ExchangeId::NONE,
+            id: ExchangeId::NONE,
             credit: 0,
             stage: STAGE_ADMIT,
             sub: [0u8; MAX_FIELD],
@@ -214,15 +217,21 @@ const STAGE_MINT: u8 = 1;
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32,   // in[0]:  HttpRequest
-    out_responses: i32, // out[0]: HttpResponse
-    out_mint: i32,      // out[1]: MSG_MINT_REQ
-    in_mint: i32,       // in[1]:  MSG_MINT_RESP
+    in_requests: i32,   // in[0]:  ExchangeRequest from the server
+    out_responses: i32, // out[0]: ExchangeResponse to the server
+    out_mint: i32,      // out[1]: ExchangeRequest to token_mint
+    in_mint: i32,       // in[1]:  ExchangeResponse from token_mint
 
-    /// Monotonic; the correlation id a mint reply is matched by.
-    next_corr: u32,
-    out_admit: i32,
-    in_admit: i32,
+    /// Monotonic; numbers the exchanges this endpoint opens with admission
+    /// and the mint.
+    next_call: u64,
+    out_admit: i32, // out[2]: ExchangeRequest to mint_admission
+    in_admit: i32,  // in[3]:  ExchangeResponse from mint_admission
+    /// Admission or the mint reported its link DOWN and has not reported it
+    /// UP. Every request waiting on it is answered 503, and new ones are
+    /// refused until UP.
+    admit_down: bool,
+    mint_down: bool,
 
     pending: [Pending; MAX_IN_FLIGHT],
 
@@ -246,19 +255,23 @@ struct ModuleState {
     token_caller_authority: u32,
     token_unmatched_reply: u32,
 
-    /// Requests being collected: wave's exchanges are streamed, so a
-
+    /// Requests being collected: an exchange's body may be streamed, so a
     /// request is answered once its body is whole.
-    exch: http_exchange::Table,
+    exch: http_endpoint::Requests,
     /// One response or body-credit record owed to `out_responses`.
     ///
     /// The step loop places what is owed before it reads anything new, so a
     /// refused write holds the answer instead of losing it. See
-    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
-    outbox: http_exchange::Outbox,
+    /// [`ExchangeOutbox`] for why silence is the worst way to fail.
+    outbox: ExchangeOutbox,
+    /// The one call owed to admission, and the one owed to the mint.
+    admit_outbox: ExchangeOutbox,
+    mint_outbox: ExchangeOutbox,
 
-    buf: [u8; abi::CHANNEL_BUFFER_SIZE],
-    out: [u8; abi::CHANNEL_BUFFER_SIZE],
+    buf: [u8; x::RECORD_MAX],
+    out: [u8; x::RECORD_MAX],
+    admit_buf: [u8; x::RECORD_MAX],
+    mint_buf: [u8; x::RECORD_MAX],
 }
 
 define_params! {
@@ -336,12 +349,16 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
-        s.exch = http_exchange::Table::new();
-        s.outbox = http_exchange::Outbox::new();
+        s.exch = http_endpoint::Requests::new();
+        s.outbox = ExchangeOutbox::new();
         s.out_mint = dev_channel_port(sys, 1, 1);
         s.in_mint = dev_channel_port(sys, 0, 1);
 
-        s.next_corr = 1;
+        s.next_call = 1;
+        s.admit_down = false;
+        s.mint_down = false;
+        s.admit_outbox = ExchangeOutbox::new();
+        s.mint_outbox = ExchangeOutbox::new();
         s.pending = [Pending::zero(); MAX_IN_FLIGHT];
         s.out_admit = dev_channel_port(sys, 1, 2);
         s.in_admit = dev_channel_port(sys, 0, 3);
@@ -373,28 +390,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
-        // Replies first: they free a pending slot, so a request arriving in
+        // What is already owed goes out first, and nothing new is read until
+        // it has gone: every record read below ends in at most one answer or
+        // one call, and one dropped on a refused write answers its request
+        // with silence.
+        if !clear(s, sys) {
+            return 0;
+        }
+        fail_downed(s, sys);
+
+        // Answers first: they free a pending slot, so a request arriving in
         // the same step may take it rather than being refused for a seat
-        // that was about to be vacated.
-        // Ledger replies before mint replies before new requests, so a
-        // request that can advance a stage this step does.
+        // that was about to be vacated. Admission before the mint before new
+        // requests, so a request that can advance a stage this step does.
         let mut worked = drain_admit(s, sys);
         worked |= drain_mint_replies(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
-            // What is already owed goes out first, and nothing new is read
-            // until it has gone: a record read and then dropped on a refused
-            // write answers its request with silence.
-            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+            if !clear(s, sys) {
                 break;
             }
             if !chan::can_read(sys, s.in_requests) {
                 break;
             }
-            // A raw envelope, not a typed message: wave's `http` writes the
-            // HttpRequest with `channel_write`.
+            // One exchange record per read: the edge is a mailbox.
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             worked = true;
@@ -407,23 +428,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Request-body credit the collector owes: the server forwards a
             // body only up to what this endpoint has granted.
             if let Some((gid, bytes)) = s.exch.take_grant() {
-                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                if let Some(n) = http_endpoint::write_grant(&gid, bytes, &mut s.out) {
                     s.outbox.send(sys, s.out_responses, &s.out, n);
                 }
             }
             // A refusal is still a decision, and the caller is owed it: an
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
-            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
-                respond(
-                    s,
-                    sys,
-                    &rid,
-                    rcredit,
-                    why.status(),
-                    b"application/json",
-                    why.body(),
-                );
+            if let Some((rid, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, 0, why.status(), b"", &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -438,7 +451,49 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Render every mint reply that has arrived. Returns whether any did.
+/// Place what is owed on all three exchange ports. True when nothing is held.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let answers = s.outbox.flush(sys, s.out_responses, &s.out);
+    let admits = s.admit_outbox.flush(sys, s.out_admit, &s.admit_buf);
+    let mints = s.mint_outbox.flush(sys, s.out_mint, &s.mint_buf);
+    answers && admits && mints
+}
+
+/// Open a call: the next id on `port`.
+fn next_call(s: &mut ModuleState, port: i32) -> ExchangeId {
+    let id = typed_exchange::call_id(s.next_call, port);
+    s.next_call = s.next_call.wrapping_add(1);
+    id
+}
+
+/// Answer 503 to every request waiting on a provider whose link went DOWN,
+/// one at a time: the rest stay pending until a later step.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
+unsafe fn fail_downed(s: &mut ModuleState, sys: &SyscallTable) {
+    for index in 0..MAX_IN_FLIGHT {
+        let slot = s.pending[index];
+        let downed = (slot.stage == STAGE_ADMIT && s.admit_down)
+            || (slot.stage == STAGE_MINT && s.mint_down);
+        if !slot.live || !downed {
+            continue;
+        }
+        if !clear(s, sys) {
+            return;
+        }
+        s.pending[index] = Pending::zero();
+        s.token_refused = s.token_refused.saturating_add(1);
+        refuse(s, sys, &slot.id, slot.credit, 503, UNAVAILABLE_BODY);
+    }
+}
+
+/// Render every mint answer that has arrived. Returns whether any did.
 ///
 /// # Safety
 ///
@@ -450,24 +505,54 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return worked;
     }
     for _ in 0..MAX_REPLIES_PER_STEP {
-        if !s.outbox.flush(sys, s.out_responses, &s.out) {
+        if !clear(s, sys) {
             break;
         }
         if !chan::can_read(sys, s.in_mint) {
             break;
         }
-        let mut buf = [0u8; MAX_TOKEN + 64];
-        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_mint, &mut buf);
-        if msg_type != auth_wire::MSG_MINT_RESP {
-            continue;
+        let n = (sys.channel_read)(s.in_mint, s.buf.as_mut_ptr(), s.buf.len());
+        if n <= 0 {
+            break;
         }
         worked = true;
-
-        let Ok(resp) = auth_wire::MintResponse::decode(&buf[..plen as usize]) else {
-            s.token_malformed = s.token_malformed.saturating_add(1);
+        let record = s.buf;
+        let (call, minted) = match typed_exchange::read_answer(&record[..n as usize]) {
+            Answer::Message {
+                id,
+                msg_type: auth_wire::MSG_MINT_RESP,
+                payload,
+            } => (id, auth_wire::MintResponse::decode(payload).ok()),
+            Answer::Message { id, .. } => (id, None),
+            Answer::Failed { id, .. } => {
+                // The mint ended the exchange without a verdict: nothing was
+                // decided about the caller, so this is the deployment's 503.
+                if let Some(slot) = take_pending(s, &id) {
+                    s.token_refused = s.token_refused.saturating_add(1);
+                    refuse(s, sys, &slot.id, slot.credit, 503, UNAVAILABLE_BODY);
+                }
+                continue;
+            }
+            Answer::Link { state } => {
+                s.mint_down = state == x::link::DOWN;
+                continue;
+            }
+            Answer::Ignored => continue,
+        };
+        let Some(slot) = take_pending(s, &call) else {
+            // An answer for a request nobody is waiting on: a duplicate, or
+            // one whose connection went away. Dropping it is right —
+            // answering a reused connection with somebody else's token would
+            // be worse than answering nothing.
+            s.token_unmatched_reply = s.token_unmatched_reply.saturating_add(1);
             continue;
         };
-        let (corr, status, token) = (resp.correlation, resp.status, resp.body);
+        let Some(resp) = minted else {
+            s.token_malformed = s.token_malformed.saturating_add(1);
+            refuse(s, sys, &slot.id, slot.credit, 503, UNAVAILABLE_BODY);
+            continue;
+        };
+        let (status, token) = (resp.status, resp.body);
         // Only an inline credential is a token this endpoint can hand back.
         // A handle would need a fetch, which this endpoint has no store port
         // for — so it refuses rather than returning an object key to a
@@ -478,15 +563,6 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             } else {
                 status
             };
-
-        let Some(slot) = take_pending(s, corr) else {
-            // A reply for a request nobody is waiting on: a duplicate, or one
-            // whose connection went away. Dropping it is right — answering a
-            // reused connection with somebody else's token would be worse
-            // than answering nothing.
-            s.token_unmatched_reply = s.token_unmatched_reply.saturating_add(1);
-            continue;
-        };
 
         if status == auth_wire::mint_err::OK && !token.is_empty() && token.len() <= MAX_TOKEN {
             s.token_issued = s.token_issued.saturating_add(1);
@@ -517,7 +593,7 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     worked
 }
 
-/// Translate one `HttpRequest` into a `MSG_MINT_REQ`.
+/// Take one collected request and send its presentation to admission.
 ///
 /// # Safety
 ///
@@ -529,13 +605,13 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let (id, credit, method) = (req.id, req.resp_credit, req.method);
     // Copied out of the collector so the handler can still take `&mut s`:
     // the request borrows the table, and answering borrows the module.
-    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len().min(target_buf.len());
     target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
-    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let mut header_buf = [0u8; http_endpoint::MAX_HEADERS];
     let hdr_len = req.headers.len().min(header_buf.len());
     header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
-    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let mut body_buf = [0u8; http_endpoint::MAX_BODY];
     let body_len = req.body.len().min(body_buf.len());
     body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
     s.exch.release(at);
@@ -623,7 +699,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
 
-    if s.out_admit < 0 {
+    if s.out_admit < 0 || s.in_admit < 0 || s.admit_down {
         // No admission, no mint. Issuing here would mean issuing without
         // anyone having decided who the caller is.
         refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
@@ -647,45 +723,35 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         entry.scope_len = scope_len as u16;
     }
 
-    let corr = s.next_corr;
-    s.next_corr = s.next_corr.wrapping_add(1).max(1);
-    entry.corr = corr;
+    let Some(index) = free_slot(s) else {
+        s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
+        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
+        return;
+    };
+    let call = next_call(s, s.out_admit);
+    entry.call = call;
 
     let ask = auth_wire::AdmitRequest {
-        corr,
         method: b"POST",
         uri: &uri[..uri_len],
         credential: &credential[..credential_len],
         proof: &proof[..proof_len],
         otp: &otp[..otp_len],
     };
-    let mut framed = [0u8; 4096];
-    let Ok(n) = ask.encode(&mut framed) else {
+    let sealed = ask
+        .encode(&mut s.admit_buf[typed_exchange::CALL_AT..])
+        .ok()
+        .and_then(|n| typed_exchange::seal_call(&call, n, &mut s.admit_buf));
+    let Some(n) = sealed else {
         refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
         return;
     };
-    let Ok((wire_type, payload)) = auth_wire::read_envelope(&framed[..n]) else {
-        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
-        return;
-    };
-    let Some(index) = free_slot(s) else {
-        s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
-        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
-        return;
-    };
-    if chan::channel_write_msg(sys, s.out_admit, wire_type, payload) <= 0 {
-        refuse(s, sys, &id, credit, 503, UNAVAILABLE_BODY);
-        return;
-    }
+    // Placed now or held for the next step: the call is owed either way.
+    s.admit_outbox.send(sys, s.out_admit, &s.admit_buf, n);
     entry.live = true;
     s.pending[index] = entry;
 }
 
-/// Drain ledger replies: decide whether the device may still be minted for,
-/// and if so send the mint request.
-///
-/// # Safety
-///
 /// Take admission's verdicts and either mint or answer.
 ///
 /// **The status mapping lives here and not in `mint_admission`**, and that
@@ -703,22 +769,29 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_admit < 0 {
         return worked;
     }
-    while chan::can_read(sys, s.in_admit) {
-        let mut buf = [0u8; 1024];
-        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_admit, &mut buf);
-        if msg_type == 0 {
+    while clear(s, sys) && chan::can_read(sys, s.in_admit) {
+        let n = (sys.channel_read)(s.in_admit, s.buf.as_mut_ptr(), s.buf.len());
+        if n <= 0 {
             break;
         }
-        if msg_type != auth_wire::MSG_ADMIT_RESP {
-            continue;
-        }
-        let Ok(verdict) = auth_wire::AdmitResponse::decode(&buf[..plen as usize]) else {
-            continue;
+        let record = s.buf;
+        let (call, verdict) = match typed_exchange::read_answer(&record[..n as usize]) {
+            Answer::Message {
+                id,
+                msg_type: auth_wire::MSG_ADMIT_RESP,
+                payload,
+            } => (id, auth_wire::AdmitResponse::decode(payload).ok()),
+            Answer::Message { id, .. } | Answer::Failed { id, .. } => (id, None),
+            Answer::Link { state } => {
+                s.admit_down = state == x::link::DOWN;
+                continue;
+            }
+            Answer::Ignored => continue,
         };
         let Some(index) = s
             .pending
             .iter()
-            .position(|p| p.live && p.stage == STAGE_ADMIT && p.corr == verdict.corr)
+            .position(|p| p.live && p.stage == STAGE_ADMIT && p.call == call)
         else {
             s.token_unmatched_reply = s.token_unmatched_reply.saturating_add(1);
             continue;
@@ -726,6 +799,14 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         worked = true;
         let mut entry = s.pending[index];
         s.pending[index] = Pending::zero();
+
+        // Admission ended the exchange without a verdict: nothing decided
+        // anything about the presenter, so this is the deployment's 503.
+        let Some(verdict) = verdict else {
+            s.token_refused = s.token_refused.saturating_add(1);
+            refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
+            continue;
+        };
 
         if verdict.status != auth_wire::admit_err::OK {
             let (status, body) = match verdict.status {
@@ -792,18 +873,11 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
 unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending) {
-    if !chan::can_write(sys, s.out_mint) {
+    if s.out_mint < 0 || s.in_mint < 0 || s.mint_down {
         s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
         refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     }
-    let corr = s.next_corr;
-    s.next_corr = s.next_corr.wrapping_add(1).max(1);
-
-    // `MintRequest::encode` writes the whole envelope, so this goes out with
-    // the raw channel write: handing it to `channel_write_msg` would wrap an
-    // envelope in a second one and the mint would read its correlation id out
-    // of the framing.
     // The assurance claims, rendered by the shared fragment so this path and
     // the grant path emit the same three claims from the same scoring.
     let evidence = auth_wire::assurance::Evidence::decode(entry.evidence);
@@ -824,9 +898,8 @@ unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending
         },
     ];
 
-    let mut framed = [0u8; 4096];
+    let iss = s.iss;
     let request = MintRequest {
-        correlation: corr,
         request_type: auth_wire::request_type::MINT,
         suite: s.suite,
         profile_id: auth_wire::suite::profile::ACCESS_TOKEN,
@@ -834,7 +907,7 @@ unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending
         // would defeat rotation for every token this endpoint issues.
         kid: b"",
         ttl_seconds: entry.ttl,
-        iss: &s.iss[..usize::from(s.iss_len)],
+        iss: &iss[..usize::from(s.iss_len)],
         sub: &entry.sub[..usize::from(entry.sub_len)],
         aud: &entry.aud[..usize::from(entry.aud_len)],
         scope: &entry.scope[..usize::from(entry.scope_len)],
@@ -844,23 +917,25 @@ unsafe fn dispatch_mint(s: &mut ModuleState, sys: &SyscallTable, entry: &Pending
         jkt: Some(&entry.jkt),
         extra: ExtraClaims::Slice(&extra),
     };
-    let Ok(n) = request.encode(&mut framed) else {
-        refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
-        return;
-    };
     let Some(index) = free_slot(s) else {
         s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
         refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
     };
-    if (sys.channel_write)(s.out_mint, framed.as_ptr(), n) < n as i32 {
-        s.token_in_flight_full = s.token_in_flight_full.saturating_add(1);
+    let call = next_call(s, s.out_mint);
+    let sealed = request
+        .encode(&mut s.mint_buf[typed_exchange::CALL_AT..])
+        .ok()
+        .and_then(|n| typed_exchange::seal_call(&call, n, &mut s.mint_buf));
+    let Some(n) = sealed else {
         refuse(s, sys, &entry.id, entry.credit, 503, UNAVAILABLE_BODY);
         return;
-    }
+    };
+    // Placed now or held for the next step: the call is owed either way.
+    s.mint_outbox.send(sys, s.out_mint, &s.mint_buf, n);
     let mut next = *entry;
     next.stage = STAGE_MINT;
-    next.corr = corr;
+    next.call = call;
     next.live = true;
     s.pending[index] = next;
 }
@@ -942,15 +1017,15 @@ fn free_slot(s: &ModuleState) -> Option<usize> {
     s.pending.iter().position(|slot| !slot.live)
 }
 
-/// Take the slot waiting on `corr`, freeing it.
-fn take_pending(s: &mut ModuleState, corr: u32) -> Option<Pending> {
+/// Take the slot waiting on mint call `call`, freeing it.
+fn take_pending(s: &mut ModuleState, call: &ExchangeId) -> Option<Pending> {
     let index = s
         .pending
         .iter()
-        // Stage-matched: a ledger round trip and a mint round trip draw from
-        // the same correlation counter, and matching on the id alone would let
-        // a mint reply claim a slot that is still waiting on the ledger.
-        .position(|slot| slot.live && slot.stage == STAGE_MINT && slot.corr == corr)?;
+        // Stage-matched: an admission call and a mint call draw from the same
+        // counter, and matching on the id alone would let a mint answer claim
+        // a slot that is still waiting on admission.
+        .position(|slot| slot.live && slot.stage == STAGE_MINT && slot.call == *call)?;
     let slot = s.pending[index];
     s.pending[index].live = false;
     Some(slot)
@@ -1094,7 +1169,7 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 unsafe fn refuse(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     body: &[u8],
@@ -1102,7 +1177,7 @@ unsafe fn refuse(
     respond(s, sys, id, credit, status, b"application/json", body);
 }
 
-/// Emit one `HttpResponse`.
+/// Answer one request: a single response HEAD carrying the whole body.
 ///
 /// # Safety
 ///
@@ -1110,14 +1185,14 @@ unsafe fn refuse(
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     content_type: &[u8],
     body: &[u8],
 ) {
     let Some(total) =
-        http_exchange::write_response(id, status, content_type, body, credit, &mut s.out)
+        http_endpoint::write_response(id, status, content_type, body, credit, &mut s.out)
     else {
         return;
     };

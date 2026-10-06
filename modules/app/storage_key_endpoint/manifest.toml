@@ -11,37 +11,43 @@ hardware_targets = ["bcm2712"]
 # that carry a node's own proof; every control verb is refused 403 and reaches
 # the service only on an edge inside the control plane's graph.
 #
-# The service's `replies` fan out to every party on them. This endpoint gives
-# the service correlations in its own space (high bit set) and answers only
-# those; a party feeding the service directly keeps its correlations below.
+# The service's answers fan out to every requester wired to it. Each answer
+# names the exchange its requester opened, and this endpoint answers only the
+# ones it opened.
 
-# Requests from `http.req_out`.
+# Requests from `http.request_out`: this endpoint is a PROVIDER of the
+# workspace exchange contract.
 [[ports]]
 name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
+buffer_size = 16384
 
-# Answers to `http.resp_in`.
+# Answers to `http.response_in`.
 [[ports]]
 name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
+buffer_size = 16384
 
-# Requests to `storage_key.requests`.
+# Calls to `storage_key.request_in`: this endpoint is the REQUESTER of the
+# service's exchange, one exchange per admitted request.
 [[ports]]
 name = "service_out"
 direction = "output"
 index = 1
-content_type = "OctetStream"
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
-# Replies from `storage_key.replies`.
+# Answers from `storage_key.response_out`.
 [[ports]]
 name = "service_in"
 direction = "input"
 index = 1
-content_type = "OctetStream"
-buffer_size = 8192
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 [observability]
 exempt = "edge — every decision it carries is the service's, audited in its ledger"

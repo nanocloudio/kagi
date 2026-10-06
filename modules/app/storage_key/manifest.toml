@@ -7,21 +7,27 @@ edition = "2021"
 # is bcm2712 only.
 hardware_targets = ["bcm2712"]
 
-# Control and attach requests, `storage_key_service::msg::REQUEST`. The
-# control verbs are unauthenticated here; the edge feeding this port is the
-# control plane's and belongs behind its admission.
+# Control and attach requests. This module is a PROVIDER of the workspace
+# exchange contract: each request body is one
+# `storage_key_service::msg::REQUEST` envelope and each answer body one
+# `msg::REPLY` envelope (the record decided, and on a release the FXSB
+# bundle); the exchange id is the correlation. Layouts:
+# docs/architecture/typed-operations.md. The control verbs are
+# unauthenticated here; the edge feeding this port is the control plane's
+# and belongs behind its admission.
 [[ports]]
-name = "requests"
+name = "request_in"
 direction = "input"
-content_type = "OctetStream"
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
-# Replies: the record decided, and on a release the FXSB bundle.
 [[ports]]
-name = "replies"
+name = "response_out"
 direction = "output"
-content_type = "OctetStream"
-buffer_size = 8192
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 # The storage-grant signing key, in the MSG_KEY_ADD shape every kagi module
 # takes: a vault label, never key material.

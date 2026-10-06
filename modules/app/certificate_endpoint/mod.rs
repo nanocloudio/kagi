@@ -53,13 +53,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
 
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, ExchangeId};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -83,7 +80,8 @@ mod time_policy;
 use auth_wire::PayloadReader;
 
 const STEP_DID_WORK: i32 = 2;
-const METHOD_POST: u8 = 3;
+/// The exchange contract's method byte for `POST`.
+const METHOD_POST: u8 = x::METHOD_POST;
 
 /// How long an issued certificate is valid, in seconds.
 const CERTIFICATE_TTL_SECS: u64 = 30 * 24 * 3600;
@@ -149,16 +147,15 @@ struct ModuleState {
     certificate_no_key: u32,
     certificate_malformed: u32,
 
-    /// Requests being collected: wave's exchanges are streamed, so a
-
+    /// Requests being collected: an exchange's body may be streamed, so a
     /// request is answered once its body is whole.
-    exch: http_exchange::Table,
+    exch: http_endpoint::Requests,
     /// One response or body-credit record owed to `out_responses`.
     ///
     /// The step loop places what is owed before it reads anything new, so a
     /// refused write holds the answer instead of losing it. See
-    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
-    outbox: http_exchange::Outbox,
+    /// [`ExchangeOutbox`] for why silence is the worst way to fail.
+    outbox: ExchangeOutbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -266,8 +263,8 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.in_requests = in_chan;
         s.out_responses = out_chan;
-        s.exch = http_exchange::Table::new();
-        s.outbox = http_exchange::Outbox::new();
+        s.exch = http_endpoint::Requests::new();
+        s.outbox = ExchangeOutbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_key_announce = dev_channel_port(sys, 1, 1);
         s.key = issuer_key::IssuerKey::empty();
@@ -316,7 +313,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             worked = true;
@@ -329,23 +326,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Request-body credit the collector owes: the server forwards a
             // body only up to what this endpoint has granted.
             if let Some((gid, bytes)) = s.exch.take_grant() {
-                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                if let Some(n) = http_endpoint::write_grant(&gid, bytes, &mut s.out) {
                     s.outbox.send(sys, s.out_responses, &s.out, n);
                 }
             }
             // A refusal is still a decision, and the caller is owed it: an
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
-            if let Some((rid, rcredit, why)) = s.exch.take_refusal() {
-                respond(
-                    s,
-                    sys,
-                    &rid,
-                    rcredit,
-                    why.status(),
-                    b"application/json",
-                    why.body(),
-                );
+            if let Some((rid, why)) = s.exch.take_refusal() {
+                respond(s, sys, &rid, 0, why.status(), b"", &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -452,10 +441,10 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let (id, credit, method) = (req.id, req.resp_credit, req.method);
     // Copied out of the collector so the handler can still take `&mut s`:
     // the request borrows the table, and answering borrows the module.
-    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len().min(target_buf.len());
     target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
-    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let mut body_buf = [0u8; http_endpoint::MAX_BODY];
     let body_len = req.body.len().min(body_buf.len());
     body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
     s.exch.release(at);
@@ -815,7 +804,7 @@ fn ca_certificate(
 /// # Safety
 ///
 /// As `drain_key`.
-unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, id: &http_app::AppId, credit: u32) {
+unsafe fn serve_ca(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, credit: u32) {
     if !s.key.is_open() {
         s.certificate_no_key = s.certificate_no_key.saturating_add(1);
         respond(
@@ -1064,14 +1053,14 @@ fn put(out: &mut [u8], at: &mut usize, bytes: &[u8]) -> Option<()> {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     content_type: &[u8],
     body: &[u8],
 ) {
     let Some(total) =
-        http_exchange::write_response(id, status, content_type, body, credit, &mut s.out)
+        http_endpoint::write_response(id, status, content_type, body, credit, &mut s.out)
     else {
         return;
     };

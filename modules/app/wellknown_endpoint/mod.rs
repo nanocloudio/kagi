@@ -65,13 +65,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, ExchangeId};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -89,10 +86,9 @@ use auth_wire::PayloadReader;
 /// `module_step` return code for "did work, step me again".
 const STEP_DID_WORK: i32 = 2;
 
-/// wave's `wire::method::METHOD_GET`.
-const METHOD_GET: u8 = 1;
-/// wave's `wire::method::METHOD_HEAD`.
-const METHOD_HEAD: u8 = 4;
+/// The exchange contract's method bytes for `GET` and `HEAD`.
+const METHOD_GET: u8 = x::METHOD_GET;
+const METHOD_HEAD: u8 = x::METHOD_HEAD;
 
 /// Longest published key, from the registry: the widest key this build
 /// can verify under, since a key it cannot verify is not published.
@@ -169,8 +165,8 @@ const STATE_CLIENT: u8 = 4;
 /// Bitmap size in bits: 2 KiB of bitmap.
 ///
 /// Bounded by what one response can carry, not by what the filter would like.
-/// The document must fit a single `HttpResponse` envelope — a larger body
-/// needs `MORE_BODY` chunking, and a document that arrives in pieces needs a
+/// The document must fit a single response record — a larger body needs
+/// `MORE` streaming, and a document that arrives in pieces needs a
 /// resumption story for the client that fetches it. Base64 of 2 KiB is 2 731
 /// characters and the JSON around it a couple of hundred more, which clears
 /// the gateway's send buffer with room to spare.
@@ -300,8 +296,8 @@ unsafe fn store_url(s: &mut ModuleState, slot: usize, d: *const u8, len: usize) 
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32,   // in[0]:  HttpRequest
-    out_responses: i32, // out[0]: HttpResponse
+    in_requests: i32,   // in[0]:  ExchangeRequest
+    out_responses: i32, // out[0]: ExchangeResponse
     in_key: i32,        // in[1]:  MSG_KEY_ADD
     out_state: i32,     // out[1]: ledger requests
     in_state: i32,      // in[2]:  ledger replies
@@ -353,15 +349,15 @@ struct ModuleState {
     revocation_uncommitted: u32,
     revocation_saturated: u32,
 
-    /// Requests being collected: wave's exchanges are streamed, so a
+    /// Requests being collected: an exchange's body may be streamed, so a
     /// request is answered once its body is whole.
-    exch: http_exchange::Table,
+    exch: http_endpoint::Requests,
     /// One response or body-credit record owed to `out_responses`.
     ///
     /// The step loop places what is owed before it reads anything new, so a
     /// refused write holds the answer instead of losing it. See
-    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
-    outbox: http_exchange::Outbox,
+    /// [`ExchangeOutbox`] for why silence is the worst way to fail.
+    outbox: ExchangeOutbox,
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
 }
@@ -410,8 +406,8 @@ pub extern "C" fn module_new(
 
         s.in_requests = in_chan;
         s.out_responses = out_chan;
-        s.exch = http_exchange::Table::new();
-        s.outbox = http_exchange::Outbox::new();
+        s.exch = http_endpoint::Requests::new();
+        s.outbox = ExchangeOutbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
 
         s.keys = [PublishedKey::empty(); MAX_KEYS];
@@ -471,10 +467,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if !chan::can_read(sys, s.in_requests) {
                 break;
             }
-            // A raw record, not a typed message: wave's `http` writes the
-            // exchange records with `channel_write`.
+            // One exchange record per read: the edge is a mailbox.
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             worked = true;
@@ -487,7 +482,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Request-body credit the collector owes: the server forwards a
             // body only up to what this endpoint has granted.
             if let Some((gid, bytes)) = s.exch.take_grant() {
-                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                if let Some(n) = http_endpoint::write_grant(&gid, bytes, &mut s.out) {
                     s.outbox.send(sys, s.out_responses, &s.out, n);
                 }
             }
@@ -499,16 +494,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // collector kept the exchange it belongs to, unless the record
                 // named none this could answer.
                 Err(why) => {
-                    if let Some((rid, rcredit, _)) = s.exch.take_refusal() {
-                        respond(
-                            s,
-                            sys,
-                            &rid,
-                            rcredit,
-                            why.status(),
-                            b"application/json",
-                            why.body(),
-                        );
+                    if let Some((rid, _)) = s.exch.take_refusal() {
+                        respond(s, sys, &rid, 0, why.status(), b"", &[]);
                     }
                 }
             }
@@ -916,11 +903,11 @@ fn positions(salt: &[u8; 8], id: &[u8]) -> [usize; HASH_FUNCTIONS as usize] {
 unsafe fn serve_document(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
 ) -> bool {
     const CT: &[u8] = b"application/json";
-    let body_at = http_exchange::response_body_at(CT.len());
+    let body_at = http_endpoint::response_body_at(CT.len());
     // The bitmap is read while the envelope around it is written, so it is
     // copied out first: one borrow of `s` at a time.
     let bitmap = s.bitmap;
@@ -933,7 +920,7 @@ unsafe fn serve_document(
     else {
         return false;
     };
-    let Some(total) = http_exchange::seal_response(id, 200, CT, body_len, credit, &mut s.out)
+    let Some(total) = http_endpoint::seal_response(id, 200, CT, body_len, credit, &mut s.out)
     else {
         return false;
     };
@@ -971,7 +958,7 @@ fn write_document(
     Some(at)
 }
 
-/// Answer one `HttpRequest`.
+/// Answer one collected request.
 ///
 /// # Safety
 ///
@@ -1148,7 +1135,7 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Option<()> {
     put(out, at, &ordered[..n])
 }
 
-/// Emit one `HttpResponse`.
+/// Answer one request: a single response HEAD carrying the whole body.
 ///
 /// # Safety
 ///
@@ -1168,12 +1155,7 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Option<()> {
 /// # Safety
 ///
 /// As `handle_request`.
-unsafe fn serve_discovery(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    id: &http_app::AppId,
-    credit: u32,
-) {
+unsafe fn serve_discovery(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, credit: u32) {
     if s.discovery_len.contains(&0) {
         s.discovery_incomplete = s.discovery_incomplete.saturating_add(1);
         respond(s, sys, id, credit, 404, b"application/json", b"{}");
@@ -1251,14 +1233,14 @@ fn url(s: &ModuleState, slot: usize) -> &[u8] {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     content_type: &[u8],
     body: &[u8],
 ) {
     let Some(total) =
-        http_exchange::write_response(id, status, content_type, body, credit, &mut s.out)
+        http_endpoint::write_response(id, status, content_type, body, credit, &mut s.out)
     else {
         return;
     };

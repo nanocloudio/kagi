@@ -54,13 +54,10 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
 include!("../../common/sdk_bridge.rs");
 
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, ExchangeId};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -78,7 +75,7 @@ mod device_auth;
 /// keeps the two honest: a wider credential here refuses to build until the
 /// collector that has to hold it is widened too.
 const _: () = assert!(
-    http_exchange::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
+    http_endpoint::MAX_CREDENTIAL >= device_auth::MAX_SEGMENT,
     "a presented credential must fit the request collector's header block"
 );
 #[path = "../../common/dpop.rs"]
@@ -95,7 +92,8 @@ mod verify_keyset;
 use credential::Ciphersuite;
 
 const STEP_DID_WORK: i32 = 2;
-const METHOD_POST: u8 = 3;
+/// The exchange contract's method byte for `POST`.
+const METHOD_POST: u8 = x::METHOD_POST;
 
 /// Devices whose pools this module holds.
 ///
@@ -223,16 +221,15 @@ struct ModuleState {
     package_pool_full: u32,
     package_malformed: u32,
 
-    /// Requests being collected: wave's exchanges are streamed, so a
-
+    /// Requests being collected: an exchange's body may be streamed, so a
     /// request is answered once its body is whole.
-    exch: http_exchange::Table,
+    exch: http_endpoint::Requests,
     /// One response or body-credit record owed to `out_responses`.
     ///
     /// The step loop places what is owed before it reads anything new, so a
     /// refused write holds the answer instead of losing it. See
-    /// [`http_exchange::Outbox`] for why silence is the worst way to fail.
-    outbox: http_exchange::Outbox,
+    /// [`ExchangeOutbox`] for why silence is the worst way to fail.
+    outbox: ExchangeOutbox,
 
     buf: [u8; abi::CHANNEL_BUFFER_SIZE],
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
@@ -280,8 +277,8 @@ pub extern "C" fn module_new(
         s.keypkg_unauthenticated = 0;
         s.keypkg_wrong_device = 0;
         s.out_responses = out_chan;
-        s.exch = http_exchange::Table::new();
-        s.outbox = http_exchange::Outbox::new();
+        s.exch = http_endpoint::Requests::new();
+        s.outbox = ExchangeOutbox::new();
         s.pools = [Pool::empty(); MAX_DEVICES];
         s.package_published = 0;
         s.package_claimed_exclusive = 0;
@@ -317,7 +314,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             worked = true;
@@ -330,7 +327,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // Request-body credit the collector owes: the server forwards a
             // body only up to what this endpoint has granted.
             if let Some((gid, bytes)) = s.exch.take_grant() {
-                if let Some(n) = http_exchange::write_grant(&gid, bytes, &mut s.out) {
+                if let Some(n) = http_endpoint::write_grant(&gid, bytes, &mut s.out) {
                     s.outbox.send(sys, s.out_responses, &s.out, n);
                 }
             }
@@ -342,8 +339,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // collector kept the exchange it belongs to, unless the record
                 // named none this could answer.
                 Err(why) => {
-                    if let Some((rid, rcredit, _)) = s.exch.take_refusal() {
-                        respond(s, sys, &rid, rcredit, why.status(), why.body());
+                    if let Some((rid, _)) = s.exch.take_refusal() {
+                        respond(s, sys, &rid, 0, why.status(), &[]);
                     }
                 }
             }
@@ -367,13 +364,13 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let (id, credit, method) = (req.id, req.resp_credit, req.method);
     // Copied out of the collector so the handler can still take `&mut s`:
     // the request borrows the table, and answering borrows the module.
-    let mut target_buf = [0u8; http_exchange::MAX_TARGET];
+    let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len().min(target_buf.len());
     target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
-    let mut header_buf = [0u8; http_exchange::MAX_HEADERS];
+    let mut header_buf = [0u8; http_endpoint::MAX_HEADERS];
     let hdr_len = req.headers.len().min(header_buf.len());
     header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
-    let mut body_buf = [0u8; http_exchange::MAX_BODY];
+    let mut body_buf = [0u8; http_endpoint::MAX_BODY];
     let body_len = req.body.len().min(body_buf.len());
     body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
     s.exch.release(at);
@@ -427,7 +424,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
 unsafe fn authenticate(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     path: &[u8],
     headers: &[u8],
@@ -574,7 +571,7 @@ impl AuthenticatedDevice {
 unsafe fn publish(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     body: &[u8],
     authenticated: &AuthenticatedDevice,
@@ -687,7 +684,7 @@ unsafe fn publish(
 unsafe fn claim(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     body: &[u8],
     _authenticated: &AuthenticatedDevice,
@@ -876,13 +873,13 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Option<()> {
 unsafe fn respond(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     body: &[u8],
 ) {
     const CT: &[u8] = b"application/json";
-    let Some(total) = http_exchange::write_response(id, status, CT, body, credit, &mut s.out)
+    let Some(total) = http_endpoint::write_response(id, status, CT, body, credit, &mut s.out)
     else {
         return;
     };

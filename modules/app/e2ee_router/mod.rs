@@ -1,6 +1,6 @@
 //! E2EE path router — one listener for the whole `/e2ee/` family.
 //!
-//! wave's `http` has exactly one `req_out`, so two application modules cannot
+//! wave's `http` has exactly one `request_out`, so two application modules cannot
 //! share a listener without something in between. That is normally a reason
 //! to give each endpoint its own listener, and it is why the issuer graph had
 //! three for the E2EE family. It cannot keep them.
@@ -13,9 +13,12 @@
 //! therefore requires giving a lane back first, and collapsing three
 //! listeners that serve one path family into one is where the slack is.
 //!
-//! Requests fan out by path prefix. Responses do **not** come back through
-//! here: `HttpResponse` carries its own connection and stream ids, so each
-//! endpoint answers the listener directly and this module needs no
+//! Toward the listener this module is a PROVIDER of the workspace exchange
+//! contract (`request_in` / `response_out`); toward each endpoint it is the
+//! requester, forwarding the listener's records verbatim. Requests fan out by
+//! path prefix, and the endpoints' answers come back through here on one lane
+//! each and are forwarded verbatim too. Every record carries the exchange id
+//! the listener chose, and an endpoint echoes it, so this module needs no
 //! correlation table — which is the difference between a router and a proxy,
 //! and the reason this one cannot lose a reply or mis-address one.
 
@@ -40,17 +43,14 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// wave's application-exchange contract, mounted from the materialised
-// `wave-common` tree: the record layout and its accessors belong to the
-// server that defines them, not to a copy here.
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
 #[path = "../../common/chan.rs"]
 mod chan;
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[path = "../../common/http_exchange.rs"]
-mod http_exchange;
+#[path = "../../common/http_endpoint.rs"]
+mod http_endpoint;
+
+use abi::contracts::exchange::{self as x, parse_request, ExchangeId, Record, RequestRecord};
 
 /// The path families, longest-first so `/e2ee/state/` is tested before any
 /// shorter prefix could swallow it.
@@ -61,7 +61,7 @@ const PATH_CREDENTIAL: &[u8] = b"/e2ee/credential";
 /// Exchanges routed at once.
 const MAX_ROUTES: usize = 16;
 
-const BUF_LEN: usize = 8192;
+const BUF_LEN: usize = x::RECORD_MAX;
 const MAX_REQS_PER_STEP: usize = 8;
 
 /// Endpoints whose answers this router forwards: credential, key packages,
@@ -86,7 +86,7 @@ struct ModuleState {
     /// once, on the HEAD, and every later record of that exchange follows it
     /// — a router that re-decided per record could split one request across
     /// two endpoints.
-    routes: [(http_app::AppId, i32); MAX_ROUTES],
+    routes: [(ExchangeId, i32); MAX_ROUTES],
     routes_live: u8,
     buf: [u8; BUF_LEN],
     /// `buf[..held_len]` is a record taken off the input and not yet placed,
@@ -159,14 +159,7 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
         s.in_requests = in_chan;
         s.out_credential = out_chan;
-        s.routes = [(
-            http_app::AppId {
-                origin: 0,
-                conn: 0,
-                stream: 0,
-            },
-            -1,
-        ); MAX_ROUTES];
+        s.routes = [(ExchangeId::NONE, -1); MAX_ROUTES];
         s.routes_live = 0;
         s.held_len = 0;
         s.held_out = -1;
@@ -223,7 +216,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
-            if n < http_app::APP_HDR as i32 {
+            if n < x::HDR as i32 {
                 break;
             }
             route(s, sys, n as usize);
@@ -234,9 +227,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
 /// Pass the endpoints' answers on to the listener, verbatim.
 ///
-/// The record addresses itself — origin, connection and stream — so this is a
-/// copy and not a decision, and there is nothing here that can send an answer
-/// to the wrong exchange.
+/// The record addresses itself — the exchange id the listener chose and the
+/// endpoint echoed — so this is a copy and not a decision, and there is
+/// nothing here that can send an answer to the wrong exchange.
 ///
 /// One answer is held at a time and placed before the next is read, for the
 /// same reason the request side holds: a record taken off a lane and then lost
@@ -269,7 +262,7 @@ unsafe fn forward_answers(s: &mut ModuleState, sys: &SyscallTable) {
         };
         s.answer_lane = (lane + 1) % ANSWER_LANES;
         let n = (sys.channel_read)(chan, s.answer.as_mut_ptr(), BUF_LEN);
-        if n < http_app::APP_HDR as i32 {
+        if n < x::HDR as i32 {
             return;
         }
         s.answer_len = n as usize;
@@ -283,11 +276,11 @@ unsafe fn forward_answers(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
 unsafe fn route(s: &mut ModuleState, sys: &SyscallTable, len: usize) {
     let record = s.buf.get(..len).unwrap_or(&[]);
-    let Some(parsed) = http_app::app_parse_request(record) else {
+    let Some(parsed) = parse_request(record) else {
         return;
     };
     let out = match parsed {
-        http_app::AppRecord::Head(head) => {
+        Record::Head(head) => {
             let path = head.target;
             // Longest prefix first. `/e2ee/state` and `/e2ee/keypackages`
             // share no prefix today, but ordering by length is what keeps
@@ -324,7 +317,7 @@ unsafe fn route(s: &mut ModuleState, sys: &SyscallTable, len: usize) {
             let Some(known) = route_of(s, &id) else {
                 return;
             };
-            if matches!(other, http_app::AppRecord::Abort { .. }) {
+            if matches!(other, Record::Abort { .. }) {
                 forget_route(s, &id);
             }
             known
@@ -339,22 +332,23 @@ unsafe fn route(s: &mut ModuleState, sys: &SyscallTable, len: usize) {
 }
 
 /// The exchange a non-HEAD record belongs to.
-fn record_id(rec: &http_app::AppRecord<'_, http_app::AppRequestHead<'_>>) -> http_app::AppId {
+fn record_id(rec: &RequestRecord<'_>) -> ExchangeId {
     match rec {
-        http_app::AppRecord::Head(h) => h.id,
-        http_app::AppRecord::Body { id, .. }
-        | http_app::AppRecord::Abort { id, .. }
-        | http_app::AppRecord::Credit { id, .. }
-        | http_app::AppRecord::Datagram { id, .. } => *id,
+        Record::Head(h) => h.id,
+        Record::Body { id, .. }
+        | Record::Abort { id, .. }
+        | Record::Credit { id, .. }
+        | Record::Datagram { id, .. } => *id,
+        Record::Link { .. } => ExchangeId::NONE,
     }
 }
 
-fn same(a: &http_app::AppId, b: &http_app::AppId) -> bool {
-    a.origin == b.origin && a.conn == b.conn && a.stream == b.stream
+fn same(a: &ExchangeId, b: &ExchangeId) -> bool {
+    a == b
 }
 
 /// Record where an exchange was routed, replacing any stale entry for it.
-fn remember_route(s: &mut ModuleState, id: &http_app::AppId, out: i32) {
+fn remember_route(s: &mut ModuleState, id: &ExchangeId, out: i32) {
     if let Some(slot) = s.routes.iter_mut().find(|(known, _)| same(known, id)) {
         slot.1 = out;
         return;
@@ -374,7 +368,7 @@ fn remember_route(s: &mut ModuleState, id: &http_app::AppId, out: i32) {
     }
 }
 
-fn route_of(s: &ModuleState, id: &http_app::AppId) -> Option<i32> {
+fn route_of(s: &ModuleState, id: &ExchangeId) -> Option<i32> {
     s.routes
         .iter()
         .take(usize::from(s.routes_live))
@@ -382,7 +376,7 @@ fn route_of(s: &ModuleState, id: &http_app::AppId) -> Option<i32> {
         .map(|(_, out)| *out)
 }
 
-fn forget_route(s: &mut ModuleState, id: &http_app::AppId) {
+fn forget_route(s: &mut ModuleState, id: &ExchangeId) {
     if let Some(at) = s.routes.iter().position(|(known, _)| same(known, id)) {
         let live = usize::from(s.routes_live);
         if live > 0 {
@@ -401,12 +395,7 @@ fn starts_with(path: &[u8], prefix: &[u8]) -> bool {
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
-unsafe fn respond_not_found(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    id: &http_app::AppId,
-    credit: u32,
-) {
+unsafe fn respond_not_found(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, credit: u32) {
     reply(s, sys, id, credit, 404, b"{\"error\":\"not_found\"}");
 }
 
@@ -418,7 +407,7 @@ unsafe fn respond_not_found(
 unsafe fn respond_unavailable(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
 ) {
     reply(
@@ -431,7 +420,7 @@ unsafe fn respond_unavailable(
     );
 }
 
-/// Compose an `HttpResponse` addressed to the request's own connection.
+/// Compose a response addressed to the request's own exchange.
 ///
 /// # Safety
 ///
@@ -439,7 +428,7 @@ unsafe fn respond_unavailable(
 unsafe fn reply(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    id: &http_app::AppId,
+    id: &ExchangeId,
     credit: u32,
     status: u16,
     body: &[u8],
@@ -447,13 +436,11 @@ unsafe fn reply(
     if s.out_response < 0 || !chan::can_write(sys, s.out_response) {
         return;
     }
-    // The `HttpResponse` layout every kagi endpoint writes:
-    // `[conn u16][stream u16][status u16][_][ct_len u8][_ u16][body_len u16]`
-    // then the content type and the body. `conn` and `stream` are copied
-    // straight from the request's own header, which is what addresses the
-    // answer to the client that asked.
+    // One response HEAD carrying the whole body, on the request's own
+    // exchange id — which is what addresses the answer to the client that
+    // asked.
     const CTYPE: &[u8] = b"application/json";
-    let Some(total) = http_exchange::write_response(id, status, CTYPE, body, credit, &mut s.out)
+    let Some(total) = http_endpoint::write_response(id, status, CTYPE, body, credit, &mut s.out)
     else {
         return;
     };

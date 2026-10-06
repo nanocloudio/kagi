@@ -15,21 +15,26 @@ hardware_targets = ["bcm2712"]
 # opaque credentials and never names a subject, an audience, a scope or a
 # lifetime (C14) — those are deployment params or issuer-owned.
 
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one MSG_AUTHORIZE_REQ or MSG_CODE_EXCHANGE_REQ
+# envelope and each answer body one MSG_AUTHORIZE_RESP or
+# MSG_CODE_EXCHANGE_RESP envelope; the exchange id is the correlation.
+# Layouts: docs/architecture/typed-operations.md.
 [[ports]]
-name = "requests"
+name = "request_in"
 index = 0
 direction = "input"
-content_type = "OctetStream"
-max_record = 4096
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
-name = "replies"
+name = "response_out"
 index = 0
 direction = "output"
-content_type = "OctetStream"
-max_record = 8192
+content_type = "ExchangeResponse"
 buffer_size = 16384
+max_record = 8192
 
 # The issuer keyset, as `MSG_KEY_ADD`. A device certificate is verified
 # against the key its own header names, so this module holds the same keyset
@@ -66,21 +71,24 @@ buffer_size = 4096
 
 # The mint. REQUIRED: the exchange drives token_mint itself so both the
 # access token and the ID token are signed inside kagi over a subject the
-# pipeline never handled.
+# pipeline never handled. This module is the REQUESTER of token_mint's
+# exchange: one POST per token, body a MSG_MINT_REQ envelope, answer a
+# MSG_MINT_RESP.
 [[ports]]
 name = "mint_out"
 index = 2
 direction = "output"
-content_type = "OctetStream"
-max_record = 4096
-buffer_size = 8192
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
 
 [[ports]]
 name = "mint_in"
 index = 3
 direction = "input"
-content_type = "OctetStream"
-buffer_size = 8192
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
 
 [observability]
 metrics = ["authz_ok", "authz_refused", "xchg_ok", "xchg_refused"]

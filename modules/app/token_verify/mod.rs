@@ -1,15 +1,20 @@
 //! Token Verify — JWS access-token verification in every implemented
 //! credential suite.
 //!
-//! The on-target counterpart to `token_mint`: consumes MSG_VERIFY_REQ on
-//! `verify_requests` and replies MSG_VERIFY_RESP on `results`. Verifying
-//! keys arrive on `verify_key` as `MSG_KEY_ADD` records, whose `key_ref`
-//! is the public key itself — a SEC1 point for ES256, the RFC 8032 public
-//! key for Ed25519, the FIPS 204 encoding for ML-DSA; until one lands
-//! every request replies ST_NO_KEY. Tokens are split with the
-//! shared `jose` fragment and checked with the SDK's deterministic
-//! verifiers, so no runtime entropy is needed. A valid signature is then
-//! range-checked against its `iat`/`exp` claims (60s skew) before ST_OK.
+//! The on-target counterpart to `token_mint`, and a typed operation: a
+//! PROVIDER of the workspace exchange contract on `request_in` /
+//! `response_out`. Each request body is one `MSG_VERIFY_REQ` envelope and
+//! each answer body one `MSG_VERIFY_RESP` envelope (`typed_exchange.rs`;
+//! byte layouts in `docs/architecture/typed-operations.md`). Every verdict,
+//! refusals included, is a 200 exchange — the verdict is the body's to say.
+//!
+//! Verifying keys arrive on `verify_key` as `MSG_KEY_ADD` records, whose
+//! `key_ref` is the public key itself — a SEC1 point for ES256, the RFC 8032
+//! public key for Ed25519, the FIPS 204 encoding for ML-DSA; until one lands
+//! every request is answered `NO_KEY`. Tokens are split with the shared
+//! `jose` fragment and checked with the SDK's deterministic verifiers, so no
+//! runtime entropy is needed. A valid signature is then range-checked
+//! against its `iat`/`exp` claims (60s skew) before `OK`.
 
 #![no_std]
 #![allow(
@@ -56,8 +61,12 @@ mod chan;
 mod jose;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
 
-use auth_wire::{PayloadReader, PayloadWriter};
+use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+
+use auth_wire::PayloadReader;
 
 /// Longest verification key held, from the registry: the widest key this
 /// build can verify under.
@@ -68,8 +77,17 @@ const CLOCK_SKEW_SECS: u64 = 60;
 /// port record (manifest `max_record`); a larger token payload fails
 /// closed (`ST_EXPIRED`).
 const MAX_CLAIMS_BYTES: usize = 1024;
-/// WCET bound: verify requests handled per step (one signature each).
+/// WCET bound: request records taken per step (at most one signature each).
 const MAX_REQS_PER_STEP: usize = 4;
+/// Exchanges collected at once.
+const MAX_EXCHANGES: usize = 4;
+/// Longest target and header block held. Neither is read; they are bounded
+/// so the module can sit behind an HTTP route as well as a pipeline.
+const MAX_TARGET: usize = 256;
+const MAX_HEADERS: usize = 1024;
+/// Longest request body: one `MSG_VERIFY_REQ` envelope, whose credential is
+/// the bulk of it.
+const MAX_REQUEST: usize = x::PAYLOAD_MAX;
 
 const MAX_KID_LEN: usize = 64;
 const MAX_ISSUER_LEN: usize = 64;
@@ -166,9 +184,9 @@ fn fill_key(slot: &mut VerifyKey, rec: &auth_wire::KeyRecord<'_>) -> bool {
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_requests: i32, // in[0]: MSG_VERIFY_REQ
-    out_results: i32, // out[0]: MSG_VERIFY_RESP
-    in_key: i32,      // in[1]: MSG_KEY_ADD
+    in_requests: i32,   // in[0]:  ExchangeRequest, MSG_VERIFY_REQ bodies
+    out_responses: i32, // out[0]: ExchangeResponse, MSG_VERIFY_RESP bodies
+    in_key: i32,        // in[1]:  MSG_KEY_ADD
 
     /// SEC1 public point (ES256) or 32-byte public key (Ed25519).
     /// The keyset, indexed by `(issuer, profile_id, kid)`.
@@ -188,7 +206,16 @@ struct ModuleState {
     verify_malformed: u32,
     no_key_errors: u32,
 
-    msg_buf: [u8; 2048],
+    /// Requests being collected until their body is whole.
+    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    /// The one answer, credit or refusal owed to `response_out`. Nothing new
+    /// is read while it is held, so a full channel holds an answer rather
+    /// than losing it.
+    outbox: ExchangeOutbox,
+    /// The record being read.
+    buf: [u8; x::RECORD_MAX],
+    /// The record being written.
+    out: [u8; x::RECORD_MAX],
 }
 
 #[no_mangle]
@@ -231,8 +258,10 @@ pub extern "C" fn module_new(
         s.syscalls = sys;
 
         s.in_requests = in_chan;
-        s.out_results = out_chan;
+        s.out_responses = out_chan;
         s.in_key = dev_channel_port(sys, 0, 1);
+        s.requests = Collector::new();
+        s.outbox = ExchangeOutbox::new();
 
         s.keys = [VerifyKey::empty(); MAX_KEYS];
         s.verify_ok = 0;
@@ -264,19 +293,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_key_material(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
+            // What is owed goes out first, and nothing new is read until it
+            // has: a request taken and then answered into a full channel
+            // would be answered with silence.
+            if !s.outbox.flush(sys, s.out_responses, &s.out) {
+                break;
+            }
             if !chan::can_read(sys, s.in_requests) {
                 break;
             }
-            // Every request produces exactly one reply; don't consume a
-            // request we cannot answer.
-            if !chan::can_write(sys, s.out_results) {
+            let n = (sys.channel_read)(s.in_requests, s.buf.as_mut_ptr(), s.buf.len());
+            if n <= 0 {
                 break;
             }
-            let (msg_type, plen) = chan::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
-            if msg_type != auth_wire::MSG_VERIFY_REQ {
-                continue;
+            let outcome = {
+                let ModuleState { requests, buf, .. } = &mut *s;
+                requests.accept(buf.get(..n as usize).unwrap_or(&[]))
+            };
+            // One record owes at most one thing: a body grant, a refusal, or
+            // (once whole) an answer.
+            if let Some((id, bytes)) = s.requests.take_grant() {
+                if let Some(len) = x::write_credit(&id, bytes, &mut s.out) {
+                    s.outbox.send(sys, s.out_responses, &s.out, len);
+                }
             }
-            handle_verify(s, sys, plen as usize);
+            if let Some((id, why)) = s.requests.take_refusal() {
+                answer_status(s, sys, &id, why.status());
+            }
+            if let Ok(Some(at)) = outcome {
+                handle_verify(s, sys, at);
+            }
         }
 
         0
@@ -408,9 +454,9 @@ fn select_key(s: &ModuleState, kid: &[u8], now: u64) -> Option<usize> {
     None
 }
 
-/// Handle one `MSG_VERIFY_REQ` payload sitting in `s.msg_buf[..plen]`.
+/// Verify the request the collector completed in slot `at`.
 ///
-/// Returns a typed `VerifiedIdentity`, never claims JSON. The policy the
+/// Answers a typed `VerifiedIdentity`, never claims JSON. The policy the
 /// credential must satisfy — audience, issuer, profile, assurance —
 /// travels in the request and is checked here, once, rather than by each
 /// caller afterwards in its own way.
@@ -420,34 +466,48 @@ fn select_key(s: &ModuleState, kid: &[u8], now: u64) -> Option<usize> {
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < 4 {
-        // No correlation id — nowhere to address a reply.
+unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(request) = s.requests.request(at) else {
+        return;
+    };
+    let id = request.id;
+    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    // Copied out of the collector so its slot is free, and the module
+    // borrowable, before the answer is written.
+    let body_len = request.body.len();
+    let mut req_bytes = [0u8; MAX_REQUEST];
+    req_bytes[..body_len].copy_from_slice(request.body);
+    s.requests.release(at);
+    if let Some(status) = refused {
+        answer_status(s, sys, &id, status);
         return;
     }
-    let corr = u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
+    let Some((auth_wire::MSG_VERIFY_REQ, payload)) =
+        typed_exchange::message(&req_bytes[..body_len])
+    else {
+        // Not a verify request at all: there is no verdict to give.
+        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        return;
+    };
 
     // An empty keyset is recoverable — keys may still arrive — so it is
     // reported before any parse of the request body.
     if !s.keys.iter().any(|k| k.live) {
         s.no_key_errors = s.no_key_errors.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::NO_KEY);
+        refuse(s, sys, &id, auth_wire::verify_err::NO_KEY);
         return;
     }
 
-    let mut req_buf = [0u8; MAX_CLAIMS_BYTES];
-    let req_len = plen.min(req_buf.len());
-    req_buf[..req_len].copy_from_slice(&s.msg_buf[..req_len]);
-    let Ok(req) = auth_wire::VerifyRequest::decode(&req_buf[..req_len]) else {
+    let Ok(req) = auth_wire::VerifyRequest::decode(payload) else {
         s.verify_malformed = s.verify_malformed.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::MALFORMED);
+        refuse(s, sys, &id, auth_wire::verify_err::MALFORMED);
         return;
     };
     let token = req.credential;
 
     let Some(jws) = jose::Jws::split(token) else {
         s.verify_malformed = s.verify_malformed.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::MALFORMED);
+        refuse(s, sys, &id, auth_wire::verify_err::MALFORMED);
         return;
     };
 
@@ -462,12 +522,12 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let obs = dev_trusted_unix(sys);
     let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
         s.verify_expired = s.verify_expired.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::NO_CLOCK);
+        refuse(s, sys, &id, auth_wire::verify_err::NO_CLOCK);
         return;
     };
     let Some(slot) = select_key(s, kid, now) else {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::UNKNOWN_KID);
+        refuse(s, sys, &id, auth_wire::verify_err::UNKNOWN_KID);
         return;
     };
 
@@ -478,7 +538,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let suite = s.keys[slot].suite;
     if auth_wire::suite::from_jose_alg(hdr_alg) != suite {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::SUITE_MISMATCH);
+        refuse(s, sys, &id, auth_wire::verify_err::SUITE_MISMATCH);
         return;
     }
 
@@ -513,7 +573,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
         };
     if !verified {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::BAD_SIGNATURE);
+        refuse(s, sys, &id, auth_wire::verify_err::BAD_SIGNATURE);
         return;
     }
 
@@ -525,7 +585,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let mut payload_json = [0u8; MAX_CLAIMS_BYTES];
     let Some(payload_len) = b64::decode(jws.payload_b64, &mut payload_json) else {
         s.verify_malformed = s.verify_malformed.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::MALFORMED);
+        refuse(s, sys, &id, auth_wire::verify_err::MALFORMED);
         return;
     };
     let json = &payload_json[..payload_len];
@@ -533,7 +593,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let exp = jose::claim_u64(json, b"exp").unwrap_or(0);
     if !jose::within_window(now, iat, exp, CLOCK_SKEW_SECS) {
         s.verify_expired = s.verify_expired.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::EXPIRED);
+        refuse(s, sys, &id, auth_wire::verify_err::EXPIRED);
         return;
     }
 
@@ -551,19 +611,19 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     // writing it — not by forgetting a field.
     if !req.expected_issuer.is_empty() && issuer != req.expected_issuer {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::WRONG_ISSUER);
+        refuse(s, sys, &id, auth_wire::verify_err::WRONG_ISSUER);
         return;
     }
     if !req.expected_audience.is_empty() && audience != req.expected_audience {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::WRONG_AUDIENCE);
+        refuse(s, sys, &id, auth_wire::verify_err::WRONG_AUDIENCE);
         return;
     }
     if req.expected_profile != auth_wire::suite::profile::NONE
         && req.expected_profile != s.keys[slot].profile_id
     {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::WRONG_PROFILE);
+        refuse(s, sys, &id, auth_wire::verify_err::WRONG_PROFILE);
         return;
     }
 
@@ -591,25 +651,24 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     {
         if !evidence.supports(claimed) {
             s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-            refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
+            refuse(s, sys, &id, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
             return;
         }
     }
     let Some(required) = level_from_discriminant(req.min_assurance) else {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
+        refuse(s, sys, &id, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
         return;
     };
     if presented < required {
         s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, corr, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
+        refuse(s, sys, &id, auth_wire::verify_err::INSUFFICIENT_ASSURANCE);
         return;
     }
 
     let kid_bytes = s.keys[slot].kid;
     let kid_out = &kid_bytes[..usize::from(s.keys[slot].kid_len)];
     let identity = auth_wire::VerifiedIdentity {
-        correlation: corr,
         status: auth_wire::verify_err::OK,
         profile_id: s.keys[slot].profile_id,
         issuer,
@@ -645,7 +704,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     };
 
     s.verify_ok = s.verify_ok.saturating_add(1);
-    emit(s, sys, &identity);
+    emit(s, sys, &id, &identity);
 }
 
 /// Read a credential's assurance claims into the shared evidence type.
@@ -703,31 +762,48 @@ fn level_from_discriminant(value: u8) -> Option<auth_wire::assurance::AssuranceL
     }
 }
 
-/// Emit a `MSG_VERIFY_RESP`.
+/// Answer with a `MSG_VERIFY_RESP`: a 200 whose body is the envelope.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn emit(s: &mut ModuleState, sys: &SyscallTable, id: &auth_wire::VerifiedIdentity<'_>) {
-    let mut framed = [0u8; MAX_CLAIMS_BYTES + 512];
-    let Ok(n) = id.encode(&mut framed) else {
-        return;
+unsafe fn emit(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    id: &ExchangeId,
+    identity: &auth_wire::VerifiedIdentity<'_>,
+) {
+    let len = match identity.encode(&mut s.out[typed_exchange::ANSWER_AT..]) {
+        Ok(len) => len,
+        // An identity that does not fit one answer is not delivered in part.
+        Err(_) => {
+            answer_status(s, sys, id, x::status::FAILED);
+            return;
+        }
     };
-    // `encode` writes the whole envelope; hand the channel the payload so
-    // it is not wrapped in a second one.
-    let Ok((_, payload)) = auth_wire::read_envelope(&framed[..n]) else {
-        return;
-    };
-    chan::channel_write_msg(sys, s.out_results, auth_wire::MSG_VERIFY_RESP, payload);
+    if let Some(n) = typed_exchange::seal_answer(id, len, &mut s.out) {
+        s.outbox.send(sys, s.out_responses, &s.out, n);
+    }
 }
 
-/// Emit a refusal, which carries no identity.
+/// Answer with a refusal verdict, which carries no identity.
 ///
 /// # Safety
 ///
 /// As [`emit`].
-unsafe fn refuse(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
-    emit(s, sys, &auth_wire::VerifiedIdentity::refused(corr, status));
+unsafe fn refuse(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u8) {
+    emit(s, sys, id, &auth_wire::VerifiedIdentity::refused(status));
+}
+
+/// Answer with a status alone: a request this operation did not read.
+///
+/// # Safety
+///
+/// As [`emit`].
+unsafe fn answer_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u16) {
+    if let Some(n) = typed_exchange::write_status(id, status, &mut s.out) {
+        s.outbox.send(sys, s.out_responses, &s.out, n);
+    }
 }

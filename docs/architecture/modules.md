@@ -22,15 +22,23 @@ compare.
 
 ## Wire protocol
 
-`modules/common/auth_wire.rs`. A 3-byte envelope carried over fluxor
-byte-stream ports:
+`modules/common/auth_wire.rs`. Every message is a 3-byte envelope:
 
 ```
 [msg_type u8][len u16 LE][payload]
 ```
 
 Field encodings are `f8` = `[len u8][bytes]` and `f16` = `[len u16 LE][bytes]`.
-Every request carries a `u32 LE` correlation id echoed in its reply.
+
+Two carriers. Operator inputs and module-private ports — secrets, the
+keyset, the control plane, the ledger — are byte streams of envelopes, and a
+request there carries a `u32 LE` correlation id its reply echoes. The typed
+operations other projects compose — verify, admit, grant, authorize, code
+exchange, mint — are exchanges of the workspace exchange contract: the
+request body is one envelope, the answer body another, every verdict is a
+200, and the exchange id is the correlation, so those messages carry none of
+their own. Their exchange rules and byte layouts are in
+[typed-operations.md](typed-operations.md).
 
 This is v1. There is one layout per message, changed in place when it needs
 to change, with every producer, consumer, fixture and graph moving with it.
@@ -82,13 +90,13 @@ caught up. `RETIRE` stops signing and keeps verifying; its
 | msg | dir | payload |
 |---|---|---|
 | `MINT_REQ` 0x31 | → mint | see below |
-| `MINT_RESP` 0x32 | mint → | `[corr][status][delivery u8][required_len u32][body f16]` |
+| `MINT_RESP` 0x32 | mint → | `[status][delivery u8][required_len u32][body f16]` |
 | `VERIFY_REQ` 0x42 | → verify | the credential and the policy it must satisfy |
 | `VERIFY_RESP` 0x43 | verify → | a typed `VerifiedIdentity` |
 
 ```text
 MINT_REQ:
-[corr u32][request_type u8][suite u16][profile_id u16][kid f8]
+[request_type u8][suite u16][profile_id u16][kid f8]
 [ttl_seconds u32][iss f16][sub f16][aud f16][scope f16]
 [thumbprint_alg u8][jkt f8][extra_count u8]
 ( [key f8][valtype u8][value f16] ) * extra_count
@@ -120,11 +128,11 @@ of once per caller.
 | `ADMIT_REQ` 0x35 | → admission | the credential and DPoP proof, with the request they were made for |
 | `ADMIT_RESP` 0x36 | admission → | subject, device, key binding and the evidence established, or a typed refusal |
 | `GRANT_REQ` 0x37 | → admission | as `ADMIT_REQ`; admission mints as well |
-| `GRANT_RESP` 0x38 | admission → | `[corr][status][token f16]` |
+| `GRANT_RESP` 0x38 | admission → | `[status][token f16]` |
 | `AUTHORIZE_REQ` 0x39 | → authcode | the client's ask plus the subject's presentation |
-| `AUTHORIZE_RESP` 0x3A | authcode → | `[corr][status][code f16][redirect_uri f16][state f16]` |
-| `CODE_EXCHANGE_REQ` 0x3B | → authcode | `[corr][code f16][redirect_uri f16][client_id f8][code_verifier f16]` |
-| `CODE_EXCHANGE_RESP` 0x3C | authcode → | `[corr][status][access_token f16][id_token f16]` |
+| `AUTHORIZE_RESP` 0x3A | authcode → | `[status][code f16][redirect_uri f16][state f16]` |
+| `CODE_EXCHANGE_REQ` 0x3B | → authcode | `[code f16][redirect_uri f16][client_id f8][code_verifier f16]` |
+| `CODE_EXCHANGE_RESP` 0x3C | authcode → | `[status][access_token f16][id_token f16]` |
 
 A grant request carries no subject, audience, scope or lifetime. The subject
 and key binding come from the credential admission established; the audience,
@@ -270,10 +278,12 @@ own proof. See [storage-key.md](storage-key.md).
 kagi publishes to the local OCI store (`fluxor publish` → the `kagi-common`
 source tree plus the module artefacts), so any fluxor-native project can add
 `[dependencies] kagi = "0.0.1"`, run `fluxor sync`, and wire `token_mint`
-into its graph: feed `MINT_REQ` frames from the stage that needs outbound
-credentials, deliver key material from the deployment's key source, and treat
-`MINT_RESP` `ST_OK` payloads as bearer tokens for the egress leg. Validation
-on the receiving side is `token_verify`, or `resource_gate` if the receiving
-surface wants the DPoP binding checked too.
+into its graph as the provider of an exchange: the stage that needs outbound
+credentials is the requester, sending one `POST` per token whose body is a
+`MINT_REQ` envelope and reading the `MINT_RESP` envelope from the 200; key
+material comes from the deployment's key source on `key_material`. Validation
+on the receiving side is `token_verify` — the same shape, `VERIFY_REQ` in and
+`VERIFY_RESP` out — or `resource_gate` if the receiving surface wants the
+DPoP binding checked too.
 
 Step by step: [../guides/embedding-token-mint.md](../guides/embedding-token-mint.md).
