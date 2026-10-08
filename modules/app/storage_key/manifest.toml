@@ -3,9 +3,9 @@ timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-# bcm2712 only: the service's state is its ledger's, and the ledger module
-# is bcm2712 only.
-hardware_targets = ["bcm2712"]
+# Where its ledger runs: the service's state is the ledger's, so it runs on the
+# runtimes `security_state` does.
+hardware_targets = ["bcm2712", "linux"]
 
 # Control and attach requests. This module is a PROVIDER of the workspace
 # exchange contract: each request body is one

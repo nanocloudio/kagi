@@ -15,7 +15,8 @@ decision each of those steps rests on.
 | The service module | `modules/app/storage_key` |
 | A recovery custodian | `modules/app/storage_custodian` |
 | The network edge, routing and module | `modules/common/storage_key_endpoint.rs`, `modules/app/storage_key_endpoint` |
-| Tests | `tests/harness/tests/storage_key.rs`, `storage_key_renew.rs`, `storage_key_erase.rs` |
+| Tests, against modelled vaults and a modelled ledger | `tests/harness/tests/storage_key.rs`, `storage_key_renew.rs`, `storage_key_erase.rs`, `storage_key_endpoint.rs` |
+| Tests, against running graphs | `storage_key_exchange_e2e.rs` (`configs/e2e-storage-key.yaml`), `storage_custodian_e2e.rs` (`configs/e2e-storage-custodian.yaml`) |
 
 ## The record
 
@@ -271,6 +272,22 @@ public half on `key_announce` as a VERIFY `MSG_KEY_ADD`, wired to every
 custodian's `verify_key`. Nothing else can: a vault label is the opening
 module's own, so only the service reads its key's public half.
 
+The custodians' recovery public keys travel the other way, and the service
+does not carry them. A creation names all three, so whoever creates must
+learn them first: a custodian answers `CUSTODIAN_KEY_REQ`
+`[corr u32][custodian u8]` on `orders` with `CUSTODIAN_KEY`
+`[corr u32][custodian u8][status u8][public f8]` on `results`, for its own
+index only, and `storage_key` ignores those answers on `custodian_in`. So the
+question comes from the operator's control plane, wired into the custodians'
+`orders` beside the service's `custodian_out`, and the answer is read from a
+tee of their `results`. Both carry `auth_wire` envelopes, which state their
+own length, so the runtime's fans keep every record whole.
+
+A custodian's recovery key is generated in its vault on first open and
+reopened under the same label afterwards, so it survives a restart: the
+custody envelopes a recovery set holds stay sealed to a key that still
+opens.
+
 ## Limits
 
 - One live grant per resource; its device policy names one device.
@@ -297,9 +314,17 @@ module's own, so only the service reads its key's public half.
   it attaches again.
 - `crypt_block` does not emit `ATTEST_KEY` evidence, so a node running it
   today attaches only under a possession-bound grant.
-- No graph in `configs/` wires these three modules. What is proven is the
-  decisions: the suites above drive the service state machine and the
-  custodians' order admission against modelled vaults and a modelled ledger.
-  Standing the service up — the ports above, a vault label per custodian,
-  and `key_announce` reaching every `verify_key` — is a deployment's own
-  wiring.
+- The decisions are proven against modelled vaults and a modelled ledger,
+  and two graphs stand the pieces up. `configs/e2e-storage-key.yaml` runs the
+  service behind its endpoint and a control route at once, two requesters on
+  its one provider port pair; the runtime carries that fan on mailboxes, one
+  exchange record per buffer, and every answer reaches the requester that
+  asked with many exchanges in flight.
+  `configs/e2e-storage-custodian.yaml` runs the service with its ledger and
+  three custodians, each holding its recovery key in the kernel's vault: a
+  volume key split with an independent implementation of the vault contract,
+  sealed to the keys the running custodians report, is rewrapped by their
+  vaults and recombines; a custodian refuses a second release under one
+  authorisation and any release of an erased resource. No graph runs the
+  endpoint and the custodians together, and none puts a custodian on a node
+  of its own.

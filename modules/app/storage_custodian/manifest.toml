@@ -5,7 +5,7 @@ entry = "mod.rs"
 edition = "2021"
 # The recovery key is a persistent labelled vault key, which needs a vault
 # with a durable sealed-object store.
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Rewrap orders from the storage-key issuer's `custodian_out`, and requests
 # for this custodian's recovery public key.

@@ -401,12 +401,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys = &*s.syscalls;
         let mut worked = drain_keys(s, sys);
-        // What is owed goes out before anything new is read: every record
-        // read below ends in at most one answer or mint call, and one placed
-        // on a full edge must be held rather than lost.
-        if !clear(s, sys) {
-            return 0;
-        }
+        // What is owed goes out first. Each drain below then reads only what
+        // it has room to answer for — see [`answers_clear`] for why that is
+        // per drain, and never one gate for the whole step.
+        let _ = clear(s, sys);
         if s.mint_down {
             fail_open_mints(s, sys);
         }
@@ -452,6 +450,21 @@ unsafe fn clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let answers = s.outbox.flush(sys, s.out_replies, &s.out);
     let calls = s.mint_outbox.flush(sys, s.out_mint, &s.mint_buf);
     answers && calls
+}
+
+/// Place a held answer, and report whether the answers outbox is clear.
+///
+/// What a drain must have room for is what reading one record can PRODUCE,
+/// not everything this module might ever write. An answer from a provider
+/// produces only an answer to the requester, so it is read whenever the
+/// answers outbox is clear — whatever call is waiting to leave. Gating it on
+/// the call as well closes a cycle on one-record mailbox edges: the held call
+/// waits for the provider to read, the provider waits to write its answer,
+/// and its answer waits for this module to read — which it would not do until
+/// the call had gone. Each waits on the next, and the path stays wedged for
+/// as long as the graph runs.
+unsafe fn answers_clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    s.outbox.flush(sys, s.out_replies, &s.out)
 }
 
 /// Answer `id` with the envelope `encode` writes. An answer that does not
@@ -1458,7 +1471,9 @@ unsafe fn fail_open_mints(s: &mut ModuleState, sys: &SyscallTable) {
         if !e.live || !matches!(e.flow, Flow::XchgMintAt | Flow::XchgMintId) {
             continue;
         }
-        if !clear(s, sys) {
+        // Gated on the answers alone: a mint call held for a mint that is
+        // down will not leave, and waiting on it here would fail nobody.
+        if !answers_clear(s, sys) {
             return;
         }
         s.pending[index] = Pending::zero();
@@ -1475,7 +1490,7 @@ unsafe fn drain_mint(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return false;
     }
     let mut worked = false;
-    while clear(s, sys) && chan::can_read(sys, s.in_mint) {
+    while answers_clear(s, sys) && chan::can_read(sys, s.in_mint) {
         let n = (sys.channel_read)(s.in_mint, s.buf.as_mut_ptr(), s.buf.len());
         if n <= 0 {
             break;

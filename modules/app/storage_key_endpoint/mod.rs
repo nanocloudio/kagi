@@ -167,10 +167,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return 0;
         }
         let mut worked = false;
-        // A call still held goes before anything new is read.
-        if !s.call_outbox.flush(sys, s.service_out, &s.call_buf) {
-            return 0;
-        }
+        // A call still held goes before anything new is sent. It does NOT
+        // stop the answers below being read: this module sits in a cycle with
+        // the service, and the service's answers reach it through whatever
+        // carries them to every requester at once. An endpoint that stopped
+        // reading answers while its own call waited would hold the one answer
+        // a sibling requester is waiting for; the service cannot write its
+        // next answer past that, so it stops reading requests — including the
+        // call this endpoint is holding. Each waits on the next and nothing
+        // moves. Reading answers is never what is blocked, because reading one
+        // only ever produces a response to the node, which has its own outbox.
+        let _ = s.call_outbox.flush(sys, s.service_out, &s.call_buf);
         // Answers first: they free slots and answer waiting nodes.
         while s.outbox.flush(sys, s.response_out, &s.out) && chan::can_read(sys, s.service_in) {
             let n = (sys.channel_read)(s.service_in, s.buf.as_mut_ptr(), BUF);

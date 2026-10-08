@@ -3,7 +3,7 @@ timer_class = "wall_clock"
 type = "Source"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # The step-cost instrument. One credential operation per step, timed with
 # the monotonic microsecond clock, reported as a recurring beat — never a

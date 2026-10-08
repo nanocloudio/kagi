@@ -390,13 +390,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
-        // What is already owed goes out first, and nothing new is read until
-        // it has gone: every record read below ends in at most one answer or
-        // one call, and one dropped on a refused write answers its request
-        // with silence.
-        if !clear(s, sys) {
-            return 0;
-        }
+        // What is already owed goes out first. Each drain below then reads
+        // only what it has room to answer for — see [`answers_clear`] for why
+        // that is per drain, and never one gate for the whole step.
+        let _ = clear(s, sys);
         fail_downed(s, sys);
 
         // Answers first: they free a pending slot, so a request arriving in
@@ -463,6 +460,28 @@ unsafe fn clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     answers && admits && mints
 }
 
+/// Place a held answer, and report whether the answers outbox is clear.
+///
+/// What a drain must have room for is what reading one record can PRODUCE,
+/// not everything this module might ever write. A mint's answer produces only
+/// an answer to the node; an admission's answer produces an answer or a mint
+/// call. Gating either on the admission call as well closes a cycle on
+/// one-record mailbox edges: the held call waits for the provider to read,
+/// the provider waits to write its answer, and its answer waits for this
+/// module to read — which it would not do until the call had gone. Each waits
+/// on the next, and the token path stays wedged for as long as the graph runs.
+unsafe fn answers_clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    s.outbox.flush(sys, s.out_responses, &s.out)
+}
+
+/// The answers outbox and the mint-call outbox, both clear: room for what an
+/// admission's answer can produce.
+unsafe fn answers_and_mints_clear(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let answers = answers_clear(s, sys);
+    let mints = s.mint_outbox.flush(sys, s.out_mint, &s.mint_buf);
+    answers && mints
+}
+
 /// Open a call: the next id on `port`.
 fn next_call(s: &mut ModuleState, port: i32) -> ExchangeId {
     let id = typed_exchange::call_id(s.next_call, port);
@@ -484,7 +503,9 @@ unsafe fn fail_downed(s: &mut ModuleState, sys: &SyscallTable) {
         if !slot.live || !downed {
             continue;
         }
-        if !clear(s, sys) {
+        // Gated on the answers alone: a call held for a provider that is down
+        // will not leave, and waiting on it here would fail nobody.
+        if !answers_clear(s, sys) {
             return;
         }
         s.pending[index] = Pending::zero();
@@ -505,7 +526,7 @@ unsafe fn drain_mint_replies(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         return worked;
     }
     for _ in 0..MAX_REPLIES_PER_STEP {
-        if !clear(s, sys) {
+        if !answers_clear(s, sys) {
             break;
         }
         if !chan::can_read(sys, s.in_mint) {
@@ -769,7 +790,7 @@ unsafe fn drain_admit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_admit < 0 {
         return worked;
     }
-    while clear(s, sys) && chan::can_read(sys, s.in_admit) {
+    while answers_and_mints_clear(s, sys) && chan::can_read(sys, s.in_admit) {
         let n = (sys.channel_read)(s.in_admit, s.buf.as_mut_ptr(), s.buf.len());
         if n <= 0 {
             break;

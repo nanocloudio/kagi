@@ -83,7 +83,22 @@ application behind it is one module. Static documents — `/healthz`,
 One WebSocket, terminated by `control_tls` and admitted by
 `control_admission`: a caller presents a client certificate under the
 deployment CA whose key hash is allowlisted, or gets a 403 at the upgrade.
-Behind it a `remote_channel` mux carries four logical channels:
+
+Behind it a `remote_channel` mux runs `require_peer: 1`, the second of the two
+checks. The first decides whether this certificate may hold the control plane;
+the second ties the session the mux opens to that same TLS session. `tls`
+numbers each session it opens and names it by the number on `peer_identity`;
+`http` carries the number on the connection's lifecycle event and `ws_net`
+hands it to the mux on `MSG_ACCEPTED`, so the mux greets only a peer whose
+identity record names the session it is opening. `control_tls` reports a
+handshake when it completes, before the upgrade that brings the connection to
+the mux, so the mux keeps each connection's record until its session is
+decided — one for every session `control_tls` can seat. Other clients
+completing handshakes between the operator's handshake and upgrade leave the
+operator's record where its session will find it, and bind nothing themselves:
+a record names one session, and theirs is not it.
+
+The mux carries four logical channels:
 
 ```
 ch0 → token_mint.key_material                (MSG_KEY_ADD)

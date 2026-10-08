@@ -7,7 +7,7 @@ edition = "2021"
 # a browser build of this module could answer nothing but ST_UNAVAILABLE —
 # and a store that cannot be conditional is not this module. A browser-hosted
 # kagi verifies credentials; it does not hold the authority's ledger.
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 [[ports]]
 name = "requests"

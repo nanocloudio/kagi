@@ -3,7 +3,7 @@ timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # One exchange request in from the listener, its records forwarded verbatim on
 # one of three ports — and the answers back the same way. This router is a

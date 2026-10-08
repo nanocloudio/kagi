@@ -7,7 +7,7 @@ edition = "2021"
 # in the browser today, so the wasm build runs memory-only (the same
 # graceful degrade as a Pi with no FS provider); durable browser storage
 # (OPFS/IndexedDB) is a future FS-provider concern, not a module change.
-hardware_targets = ["bcm2712", "wasm"]
+hardware_targets = ["bcm2712", "wasm", "linux"]
 
 [[ports]]
 name = "requests"
