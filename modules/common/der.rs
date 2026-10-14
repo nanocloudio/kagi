@@ -66,6 +66,19 @@ const OID_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x0F];
 const OID_EXT_KEY_USAGE: &[u8] = &[0x55, 0x1D, 0x25];
 /// `id-kp-clientAuth` (1.3.6.1.5.5.7.3.2).
 const OID_CLIENT_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02];
+/// `id-kp-serverAuth` (1.3.6.1.5.5.7.3.1).
+const OID_SERVER_AUTH: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+/// `id-ce-subjectKeyIdentifier` (2.5.29.14).
+const OID_SUBJECT_KEY_ID: &[u8] = &[0x55, 0x1D, 0x0E];
+/// `id-ce-authorityKeyIdentifier` (2.5.29.35).
+const OID_AUTHORITY_KEY_ID: &[u8] = &[0x55, 0x1D, 0x23];
+/// `[0]` IMPLICIT, primitive: AuthorityKeyIdentifier's `keyIdentifier`.
+const TAG_KEY_IDENTIFIER: u8 = 0x80;
+
+/// A key identifier: RFC 7093's method 1, the leftmost 160 bits of the
+/// SHA-256 of the subjectPublicKey BIT STRING's value. The caller hashes —
+/// this encoder holds no hash — so the identifiers are inputs here.
+pub type KeyId = [u8; 20];
 
 /// The algorithm an authority signs with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +94,27 @@ pub enum SubjectKey<'a> {
     Ed25519(&'a [u8; 32]),
     /// An uncompressed SEC1 P-256 point (`0x04 ‖ X ‖ Y`).
     P256(&'a [u8; 65]),
+}
+
+impl SubjectKey<'_> {
+    /// The subjectPublicKey BIT STRING's value, without its unused-bits
+    /// octet: what a key identifier (RFC 7093 method 1) hashes.
+    pub fn public_bits(&self) -> &[u8] {
+        match self {
+            SubjectKey::Ed25519(key) => key.as_slice(),
+            SubjectKey::P256(point) => point.as_slice(),
+        }
+    }
+}
+
+/// The two key identifiers a leaf carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KeyIds {
+    /// The certified key's: the leaf's `subjectKeyIdentifier`.
+    pub subject: KeyId,
+    /// The signing key's: the leaf's `authorityKeyIdentifier`, and the
+    /// authority's own `subjectKeyIdentifier`.
+    pub authority: KeyId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -387,6 +421,40 @@ impl<'a> Writer<'a> {
         })
     }
 
+    /// `subjectKeyIdentifier`, non-critical (RFC 5280 §4.2.1.2): which key
+    /// this certificate certifies, so a chain builder can find the issuer of
+    /// a certificate this one signs.
+    fn subject_key_id(&mut self, id: &KeyId) -> Result<(), DerError> {
+        self.constructed(TAG_SEQUENCE, |ext| {
+            ext.oid(OID_SUBJECT_KEY_ID)?;
+            let mut value = [0u8; 24];
+            let len = {
+                let mut w = Writer::new(&mut value);
+                w.primitive(TAG_OCTET_STRING, id)?;
+                w.len()
+            };
+            ext.primitive(TAG_OCTET_STRING, value.get(..len).ok_or(DerError::TooLong)?)
+        })
+    }
+
+    /// `authorityKeyIdentifier` by `keyIdentifier` alone, non-critical (RFC
+    /// 5280 §4.2.1.1): the signing key's identifier. RFC 5280 requires it on
+    /// every certificate a CA issues but its own, and a strict verifier
+    /// (Python's `VERIFY_X509_STRICT`, the X.509 profile CA/B and Go's
+    /// `x509` checks follow) refuses a leaf without it.
+    fn authority_key_id(&mut self, id: &KeyId) -> Result<(), DerError> {
+        self.constructed(TAG_SEQUENCE, |ext| {
+            ext.oid(OID_AUTHORITY_KEY_ID)?;
+            let mut value = [0u8; 26];
+            let len = {
+                let mut w = Writer::new(&mut value);
+                w.constructed(TAG_SEQUENCE, |aki| aki.primitive(TAG_KEY_IDENTIFIER, id))?;
+                w.len()
+            };
+            ext.primitive(TAG_OCTET_STRING, value.get(..len).ok_or(DerError::TooLong)?)
+        })
+    }
+
     /// The extensions an end-entity client certificate carries.
     ///
     /// `subjectAltName` is where the SPIFFE id belongs — relying parties
@@ -394,10 +462,18 @@ impl<'a> Writer<'a> {
     /// identity only in the `CN` is how a certificate ends up authorizing
     /// nothing.
     /// `dns_names` is a comma-separated list of dNSName entries added to the
-    /// subjectAltName beside the URI; empty adds none.
-    pub fn leaf_extensions(&mut self, san_uri: &[u8], dns_names: &[u8]) -> Result<(), DerError> {
+    /// subjectAltName beside the URI; empty adds none. `ids` names the
+    /// certified key and the key that signs it.
+    pub fn leaf_extensions(
+        &mut self,
+        san_uri: &[u8],
+        dns_names: &[u8],
+        ids: &KeyIds,
+    ) -> Result<(), DerError> {
         self.constructed(TAG_CONTEXT_3, |explicit| {
             explicit.constructed(TAG_SEQUENCE, |extensions| {
+                extensions.subject_key_id(&ids.subject)?;
+                extensions.authority_key_id(&ids.authority)?;
                 // basicConstraints: cA FALSE, critical. A leaf that did not
                 // say so could sign for anyone.
                 extensions.constructed(TAG_SEQUENCE, |ext| {
@@ -426,13 +502,26 @@ impl<'a> Writer<'a> {
                     ext.primitive(TAG_OCTET_STRING, &value[..len])
                 })?;
 
-                // extKeyUsage: clientAuth.
+                // extKeyUsage: clientAuth, and serverAuth when the leaf names
+                // hosts or is an SVID (a SPIFFE URI) — a certificate with DNS
+                // names is one a server presents, and an X509-SVID is
+                // presented by either end of a mutually authenticated link
+                // (the SPIFFE X509-SVID spec has both usages set). A verifier
+                // that checks usage (Go's does, fluxor's tls does) refuses a
+                // server certificate marked for clients only. A URI names no
+                // host, so serverAuth on an SVID lets it serve no named host.
                 extensions.constructed(TAG_SEQUENCE, |ext| {
                     ext.oid(OID_EXT_KEY_USAGE)?;
                     let mut value = [0u8; 32];
                     let len = {
                         let mut w = Writer::new(&mut value);
-                        w.constructed(TAG_SEQUENCE, |eku| eku.oid(OID_CLIENT_AUTH))?;
+                        w.constructed(TAG_SEQUENCE, |eku| {
+                            eku.oid(OID_CLIENT_AUTH)?;
+                            if !dns_names.is_empty() || !san_uri.is_empty() {
+                                eku.oid(OID_SERVER_AUTH)?;
+                            }
+                            Ok(())
+                        })?;
                         w.at
                     };
                     ext.primitive(TAG_OCTET_STRING, &value[..len])
@@ -474,9 +563,13 @@ impl<'a> Writer<'a> {
     ///
     /// `cA TRUE` with `pathLenConstraint` absent, and `keyCertSign`. A root
     /// that did not assert `cA` is a root nothing will chain to.
-    pub fn ca_extensions(&mut self) -> Result<(), DerError> {
+    ///
+    /// `subjectKeyIdentifier` too, which RFC 5280 requires of a CA: it is the
+    /// identifier every leaf's `authorityKeyIdentifier` repeats.
+    pub fn ca_extensions(&mut self, key_id: &KeyId) -> Result<(), DerError> {
         self.constructed(TAG_CONTEXT_3, |explicit| {
             explicit.constructed(TAG_SEQUENCE, |extensions| {
+                extensions.subject_key_id(key_id)?;
                 extensions.constructed(TAG_SEQUENCE, |ext| {
                     ext.oid(OID_BASIC_CONSTRAINTS)?;
                     ext.boolean(true)?;
@@ -502,6 +595,10 @@ impl<'a> Writer<'a> {
     ///
     /// Issuer and subject are the same name — that is what self-signed means,
     /// and a verifier reads the pair to decide it is looking at a root.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fields are X.509's, not ours, as in `tbs_certificate`"
+    )]
     pub fn ca_certificate(
         &mut self,
         serial: &[u8],
@@ -510,6 +607,7 @@ impl<'a> Writer<'a> {
         algorithm: SigningAlgorithm,
         not_before: u64,
         not_after: u64,
+        key_id: &KeyId,
     ) -> Result<(), DerError> {
         self.constructed(TAG_SEQUENCE, |tbs| {
             tbs.constructed(TAG_CONTEXT_0, |version| version.integer(&[0x02]))?;
@@ -525,7 +623,7 @@ impl<'a> Writer<'a> {
                 SubjectKey::Ed25519(k) => tbs.ed25519_spki(k)?,
                 SubjectKey::P256(point) => tbs.p256_spki(point)?,
             }
-            tbs.ca_extensions()
+            tbs.ca_extensions(key_id)
         })
     }
 
@@ -533,7 +631,7 @@ impl<'a> Writer<'a> {
     #[expect(
         clippy::too_many_arguments,
         reason = "the fields are X.509's, not ours; a struct would carry the \
-                  same eight and cost a copy on a no-allocator target"
+                  same ten and cost a copy on a no-allocator target"
     )]
     pub fn tbs_certificate(
         &mut self,
@@ -546,6 +644,7 @@ impl<'a> Writer<'a> {
         not_after: u64,
         san_uri: &[u8],
         dns_names: &[u8],
+        ids: &KeyIds,
     ) -> Result<(), DerError> {
         self.constructed(TAG_SEQUENCE, |tbs| {
             // version: v3, explicit [0].
@@ -565,7 +664,7 @@ impl<'a> Writer<'a> {
                 SubjectKey::Ed25519(key) => tbs.ed25519_spki(key)?,
                 SubjectKey::P256(point) => tbs.p256_spki(point)?,
             }
-            tbs.leaf_extensions(san_uri, dns_names)
+            tbs.leaf_extensions(san_uri, dns_names, ids)
         })
     }
 }

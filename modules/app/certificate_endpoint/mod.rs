@@ -138,6 +138,9 @@ struct ModuleState {
     key_label_len: u8,
     /// `auth_wire::suite` the labelled key is opened under.
     label_suite: u16,
+    /// A `signing_key` record whose key the vault could not open yet
+    /// (`E_AGAIN`), handled again each step before any newer one.
+    key_pending: issuer_key::PendingRecord,
 
     /// Serial numbers, monotonic. Two certificates from one CA sharing a
     /// serial is what makes revocation ambiguous.
@@ -278,6 +281,7 @@ pub extern "C" fn module_new(
         s.key_label = [0; auth_wire::MAX_KEY_LABEL];
         s.key_label_len = 0;
         s.label_suite = auth_wire::suite::ES256;
+        s.key_pending = issuer_key::PendingRecord::empty();
         s.next_serial = 1;
         s.certificate_issued = 0;
         s.certificate_no_key = 0;
@@ -361,12 +365,19 @@ unsafe fn open_labelled_key(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
     let n = usize::from(s.key_label_len);
-    s.key_label_len = 0;
     let mut label = [0u8; auth_wire::MAX_KEY_LABEL];
     label[..n].copy_from_slice(&s.key_label[..n]);
-    if !auth_wire::suite::is_implemented(s.label_suite)
-        || !s.key.open(sys, s.label_suite, &label[..n])
-    {
+    let rc = if auth_wire::suite::is_implemented(s.label_suite) {
+        s.key.open_status(sys, s.label_suite, &label[..n])
+    } else {
+        E_INVAL
+    };
+    // The vault cannot answer yet: keep the label and ask on a later step.
+    if rc == E_AGAIN {
+        return;
+    }
+    s.key_label_len = 0;
+    if rc != 0 {
         let m = b"[pki] key_label did not open";
         dev_log(sys, 1, m.as_ptr(), m.len());
         return;
@@ -391,6 +402,14 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_key < 0 {
         return;
     }
+    if s.key_pending.is_held() {
+        let mut held = [0u8; issuer_key::KEY_RECORD_MAX];
+        let n = s.key_pending.take(&mut held);
+        if take_key_record(s, sys, &held[..n]) {
+            s.key_pending.hold(&held[..n]);
+            return;
+        }
+    }
     for _ in 0..4 {
         if !chan::can_read(sys, s.in_key) {
             break;
@@ -401,34 +420,50 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         // signs one artefact shape and holds one key for it, so it takes
         // the ADD for its own profile and ignores everything else on the
         // channel — the channel carries the whole issuer keyset.
-        let payload = &buf[..plen as usize];
         if msg_type != auth_wire::MSG_KEY_ADD {
             continue;
         }
-        let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
-            continue;
-        };
-        if rec.key_use != auth_wire::key_use::SIGN
-            || rec.profile_id != auth_wire::suite::profile::DEVICE_CERTIFICATE
-        {
-            continue;
+        let payload = &buf[..plen as usize];
+        if take_key_record(s, sys, payload) {
+            s.key_pending.hold(payload);
+            return;
         }
-        if !auth_wire::suite::is_implemented(rec.suite)
-            || rec.key_ref.is_empty()
-            || rec.key_ref.len() > auth_wire::MAX_KEY_LABEL
-        {
-            continue;
-        }
-        // The record names a LABEL. A CA key is the one key in this system
-        // whose compromise forges every identity it ever issued, so it is
-        // the last one that should have travelled as bytes.
-        s.key.close(sys);
-        if !s.key.open(sys, rec.suite, rec.key_ref) {
-            continue;
-        }
-        s.key_suite = rec.suite;
-        announce_public_key(s, sys, rec.issuer, rec.kid, rec.profile_id);
     }
+}
+
+/// Act on one `signing_key` ADD record. True when the vault could not open
+/// its key yet (`E_AGAIN`), so the record is to be handled again.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn take_key_record(s: &mut ModuleState, sys: &SyscallTable, payload: &[u8]) -> bool {
+    let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
+        return false;
+    };
+    if rec.key_use != auth_wire::key_use::SIGN
+        || rec.profile_id != auth_wire::suite::profile::DEVICE_CERTIFICATE
+    {
+        return false;
+    }
+    if !auth_wire::suite::is_implemented(rec.suite)
+        || rec.key_ref.is_empty()
+        || rec.key_ref.len() > auth_wire::MAX_KEY_LABEL
+    {
+        return false;
+    }
+    // The record names a LABEL. A CA key is the one key in this system
+    // whose compromise forges every identity it ever issued, so it is
+    // the last one that should have travelled as bytes.
+    s.key.close(sys);
+    match s.key.open_status(sys, rec.suite, rec.key_ref) {
+        0 => {}
+        E_AGAIN => return true,
+        _ => return false,
+    }
+    s.key_suite = rec.suite;
+    announce_public_key(s, sys, rec.issuer, rec.kid, rec.profile_id);
+    false
 }
 
 /// # Safety
@@ -625,6 +660,25 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     };
     let serial = s.next_serial;
 
+    // The authority's key, named in the leaf (its authorityKeyIdentifier) and
+    // certified in the chain answered beside it.
+    let Some(ca_public) = ca_public_key(s) else {
+        respond(
+            s,
+            sys,
+            &id,
+            credit,
+            500,
+            b"application/json",
+            br#"{"error":"server_error"}"#,
+        );
+        return;
+    };
+    let ids = der::KeyIds {
+        subject: key_id(subject_key),
+        authority: key_id(ca_subject_key(&ca_public)),
+    };
+
     let mut tbs = [0u8; MAX_DER];
     let tbs_len = {
         let mut w = der::Writer::new(&mut tbs);
@@ -638,6 +692,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
             now + CERTIFICATE_TTL_SECS,
             &san[..san_len],
             &dns[..dns_len],
+            &ids,
         )
         .is_err()
         {
@@ -694,7 +749,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     // chain). The CA certificate is re-sealed per answer, so its window runs
     // from now like `GET /pki/ca`'s does.
     let mut ca_der = [0u8; MAX_DER];
-    let ca_len = ca_public_key(s).and_then(|public| ca_certificate(s, &public, now, &mut ca_der));
+    let ca_len = ca_certificate(s, &ca_public, now, &mut ca_der);
     let Some(ca_len) = ca_len else {
         respond(
             s,
@@ -731,6 +786,27 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let _ = put(&mut body, &mut at, b"\"}");
 
     respond(s, sys, &id, credit, 200, b"application/json", &body[..at]);
+}
+
+/// A key's identifier, RFC 7093 method 1: the leftmost 160 bits of the
+/// SHA-256 of its subjectPublicKey bits. The authority's is its CA
+/// certificate's `subjectKeyIdentifier` and every leaf's
+/// `authorityKeyIdentifier`; a leaf's own is its `subjectKeyIdentifier`.
+fn key_id(key: der::SubjectKey<'_>) -> der::KeyId {
+    let digest = sha256(key.public_bits());
+    let mut id = [0u8; 20];
+    for (d, s) in id.iter_mut().zip(digest.iter()) {
+        *d = *s;
+    }
+    id
+}
+
+/// The authority's public key as the key a certificate binds.
+fn ca_subject_key(public: &CaPublicKey) -> der::SubjectKey<'_> {
+    match public {
+        CaPublicKey::Ed25519(key) => der::SubjectKey::Ed25519(key),
+        CaPublicKey::P256(point) => der::SubjectKey::P256(point),
+    }
 }
 
 /// The algorithm the loaded key signs with.
@@ -783,10 +859,7 @@ fn ca_certificate(
     let mut tbs = [0u8; MAX_DER];
     let tbs_len = {
         let mut w = der::Writer::new(&mut tbs);
-        let subject_key = match public {
-            CaPublicKey::Ed25519(key) => der::SubjectKey::Ed25519(key),
-            CaPublicKey::P256(point) => der::SubjectKey::P256(point),
-        };
+        let subject_key = ca_subject_key(public);
         w.ca_certificate(
             &1u64.to_be_bytes(),
             &s.issuer_cn[..cn_len],
@@ -794,6 +867,7 @@ fn ca_certificate(
             algorithm(s.key_suite),
             now,
             now + CA_TTL_SECS,
+            &key_id(subject_key),
         )
         .ok()?;
         w.len()

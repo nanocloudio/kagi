@@ -138,6 +138,10 @@ struct KeySlot {
     /// The vault-held key itself, once opened — including the public half
     /// it exported, which this module is the only component able to learn.
     key: issuer_key::IssuerKey,
+    /// The vault could not open the key yet (`E_AGAIN`: its persistent
+    /// store is not ready): the slot is kept and the open asked again each
+    /// step, and nothing mints under it until it opens.
+    awaiting: bool,
 }
 
 impl KeySlot {
@@ -157,6 +161,7 @@ impl KeySlot {
             label: [0; auth_wire::MAX_KEY_LABEL],
             label_len: 0,
             key: issuer_key::IssuerKey::empty(),
+            awaiting: false,
         }
     }
 
@@ -386,6 +391,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Signing-key updates first, so a same-step mint uses the
         // latest kid/scalar.
         drain_key_material(s, sys);
+        retry_awaiting_slots(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
             // What is owed goes out first, and nothing new is read until it
@@ -524,8 +530,8 @@ unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
                 // whole snapshot for it would take out its live siblings
                 // too.
                 for i in 0..MAX_KEYS {
-                    if s.keys[i].live && !open_slot_key(s, sys, i) {
-                        s.keys[i] = KeySlot::empty();
+                    if s.keys[i].live {
+                        settle_slot_open(s, sys, i);
                     }
                 }
             }
@@ -660,10 +666,35 @@ unsafe fn apply_key_add(s: &mut ModuleState, sys: &SyscallTable, rec: &auth_wire
         return;
     }
     s.keys[i] = slot;
-    if !open_slot_key(s, sys, i) {
-        // A key that cannot be opened is not a key. Left un-live rather
-        // than kept as a configured-looking slot that refuses every mint.
-        s.keys[i] = KeySlot::empty();
+    settle_slot_open(s, sys, i);
+}
+
+/// Open slot `i`'s key and settle the slot on the answer: open, awaiting
+/// another try (`E_AGAIN`), or emptied. A key that cannot be opened is not
+/// a key: left un-live rather than kept as a configured-looking slot that
+/// refuses every mint.
+///
+/// # Safety
+///
+/// As `open_slot_key`.
+unsafe fn settle_slot_open(s: &mut ModuleState, sys: &SyscallTable, i: usize) {
+    match open_slot_key(s, sys, i) {
+        0 => s.keys[i].awaiting = false,
+        E_AGAIN => s.keys[i].awaiting = true,
+        _ => s.keys[i] = KeySlot::empty(),
+    }
+}
+
+/// Ask again for every slot whose key the vault could not open yet.
+///
+/// # Safety
+///
+/// As `open_slot_key`.
+unsafe fn retry_awaiting_slots(s: &mut ModuleState, sys: &SyscallTable) {
+    for i in 0..MAX_KEYS {
+        if s.keys[i].live && s.keys[i].awaiting {
+            settle_slot_open(s, sys, i);
+        }
     }
 }
 
@@ -684,16 +715,17 @@ unsafe fn apply_key_add(s: &mut ModuleState, sys: &SyscallTable, rec: &auth_wire
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn open_slot_key(s: &mut ModuleState, sys: &SyscallTable, i: usize) -> bool {
+unsafe fn open_slot_key(s: &mut ModuleState, sys: &SyscallTable, i: usize) -> i32 {
     let label_len = usize::from(s.keys[i].label_len);
     let mut label = [0u8; auth_wire::MAX_KEY_LABEL];
     label[..label_len].copy_from_slice(&s.keys[i].label[..label_len]);
     let suite = s.keys[i].suite;
-    if !s.keys[i].key.open(sys, suite, &label[..label_len]) {
-        return false;
+    let rc = s.keys[i].key.open_status(sys, suite, &label[..label_len]);
+    if rc != 0 {
+        return rc;
     }
     announce_public_key(s, sys, i);
-    true
+    0
 }
 
 /// The key-announcement buffer, sized from the REGISTRY like every store

@@ -130,6 +130,9 @@ struct ModuleState {
 
     /// The storage-grant signing key, as a vault label.
     key: issuer_key::IssuerKey,
+    /// A key record whose key the vault could not open yet (`E_AGAIN`),
+    /// handled again each step before any newer one.
+    key_pending: issuer_key::PendingRecord,
     /// Scratch for one vault SIGN over a record's signed prefix.
     sign_scratch: [u8; sk::MAX_RECORD + issuer_key::SIGN_SCRATCH_OVERHEAD],
 
@@ -444,6 +447,7 @@ pub extern "C" fn module_new(
         s.out_key_announce = dev_channel_port(sys, 1, 3);
 
         s.key = issuer_key::IssuerKey::empty();
+        s.key_pending = issuer_key::PendingRecord::empty();
         s.issuer = [0; sk::MAX_ID];
         s.issuer_len = 0;
 
@@ -596,40 +600,65 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_key < 0 {
         return;
     }
+    if s.key_pending.is_held() {
+        let mut held = [0u8; issuer_key::KEY_RECORD_MAX];
+        let n = s.key_pending.take(&mut held);
+        if take_key_record(s, sys, &held[..n]) {
+            s.key_pending.hold(&held[..n]);
+            return;
+        }
+    }
     for _ in 0..4 {
         if !chan::can_read(sys, s.in_key) {
             break;
         }
         let mut buf = [0u8; 256];
         let (msg_type, plen) = chan::channel_read_msg(sys, s.in_key, &mut buf);
+        let payload = &buf[..usize::from(plen)];
         // The channel carries the whole issuer keyset; this module signs one
         // profile and takes only that profile's signing record.
         if msg_type != auth_wire::MSG_KEY_ADD {
             continue;
         }
-        let Ok(rec) = auth_wire::KeyRecord::decode_add(&buf[..usize::from(plen)]) else {
-            continue;
-        };
-        if rec.key_use != auth_wire::key_use::SIGN
-            || rec.profile_id != auth_wire::suite::profile::STORAGE_GRANT
-        {
-            continue;
-        }
-        // Records are held in the ledger beside three envelopes, and a
-        // signature that would not fit there is not a record suite.
-        if !matches!(
-            rec.suite,
-            auth_wire::suite::ED25519 | auth_wire::suite::ES256
-        ) || rec.key_ref.is_empty()
-            || rec.key_ref.len() > auth_wire::MAX_KEY_LABEL
-        {
-            continue;
-        }
-        s.key.close(sys);
-        if s.key.open(sys, rec.suite, rec.key_ref) {
-            s.announce = 1;
+        if take_key_record(s, sys, payload) {
+            s.key_pending.hold(payload);
+            return;
         }
     }
+}
+
+/// Act on one key ADD record. True when the vault could not open its key
+/// yet (`E_AGAIN`), so the record is to be handled again on a later step.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn take_key_record(s: &mut ModuleState, sys: &SyscallTable, payload: &[u8]) -> bool {
+    let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
+        return false;
+    };
+    if rec.key_use != auth_wire::key_use::SIGN
+        || rec.profile_id != auth_wire::suite::profile::STORAGE_GRANT
+    {
+        return false;
+    }
+    // Records are held in the ledger beside three envelopes, and a
+    // signature that would not fit there is not a record suite.
+    if !matches!(
+        rec.suite,
+        auth_wire::suite::ED25519 | auth_wire::suite::ES256
+    ) || rec.key_ref.is_empty()
+        || rec.key_ref.len() > auth_wire::MAX_KEY_LABEL
+    {
+        return false;
+    }
+    s.key.close(sys);
+    match s.key.open_status(sys, rec.suite, rec.key_ref) {
+        0 => s.announce = 1,
+        E_AGAIN => return true,
+        _ => {}
+    }
+    false
 }
 
 /// Announce the open key's public half as a VERIFY `MSG_KEY_ADD`: what each

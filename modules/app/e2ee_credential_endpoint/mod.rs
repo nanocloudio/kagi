@@ -158,6 +158,9 @@ struct ModuleState {
     /// The signing key, held in the vault under the label the keyset record
     /// names. This module never holds a private key.
     key: issuer_key::IssuerKey,
+    /// A key record whose key the vault could not open yet (`E_AGAIN`),
+    /// handled again each step before any newer one.
+    key_pending: issuer_key::PendingRecord,
     kid: [u8; 32],
     kid_len: u8,
     /// Scratch for one vault SIGN. Sized for the largest signing input this
@@ -290,6 +293,7 @@ pub extern "C" fn module_new(
         s.in_directory = dev_channel_port(sys, 0, 2);
 
         s.key = issuer_key::IssuerKey::empty();
+        s.key_pending = issuer_key::PendingRecord::empty();
         s.kid = [0; 32];
         s.kid_len = 0;
         s.iss = [0; MAX_FIELD];
@@ -380,6 +384,14 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_key < 0 {
         return;
     }
+    if s.key_pending.is_held() {
+        let mut held = [0u8; issuer_key::KEY_RECORD_MAX];
+        let n = s.key_pending.take(&mut held);
+        if take_key_record(s, sys, &held[..n]) {
+            s.key_pending.hold(&held[..n]);
+            return;
+        }
+    }
     for _ in 0..4 {
         if !chan::can_read(sys, s.in_key) {
             break;
@@ -394,43 +406,59 @@ unsafe fn drain_key(s: &mut ModuleState, sys: &SyscallTable) {
         if msg_type != auth_wire::MSG_KEY_ADD {
             continue;
         }
-        let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
-            continue;
-        };
-        if rec.key_use != auth_wire::key_use::SIGN
-            || rec.profile_id != auth_wire::suite::profile::E2EE_CREDENTIAL
-        {
-            continue;
-        }
-
-        let (kid, label) = (rec.kid, rec.key_ref);
-        if rec.suite != auth_wire::suite::ED25519
-            || label.is_empty()
-            || label.len() > auth_wire::MAX_KEY_LABEL
-            || kid.is_empty()
-            || kid.len() > s.kid.len()
-        {
-            continue;
-        }
-        // The record names a LABEL; the key is generated inside the vault on
-        // first open and never travels. A label that will not open leaves
-        // the module without a key, which is the same state it was in
-        // before the record arrived — and `has_key` is now simply whether
-        // the vault holds one, so there is no flag to get out of step.
-        s.key.close(sys);
-        if !s.key.open(sys, rec.suite, label) {
-            continue;
-        }
-        s.kid = [0; 32];
-        s.kid[..kid.len()].copy_from_slice(kid);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "bounded by the kid.len() check"
-        )]
-        {
-            s.kid_len = kid.len() as u8;
+        if take_key_record(s, sys, payload) {
+            s.key_pending.hold(payload);
+            return;
         }
     }
+}
+
+/// Act on one key ADD record. True when the vault could not open its key
+/// yet (`E_AGAIN`), so the record is to be handled again on a later step.
+///
+/// # Safety
+///
+/// As `drain_key`.
+unsafe fn take_key_record(s: &mut ModuleState, sys: &SyscallTable, payload: &[u8]) -> bool {
+    let Ok(rec) = auth_wire::KeyRecord::decode_add(payload) else {
+        return false;
+    };
+    if rec.key_use != auth_wire::key_use::SIGN
+        || rec.profile_id != auth_wire::suite::profile::E2EE_CREDENTIAL
+    {
+        return false;
+    }
+
+    let (kid, label) = (rec.kid, rec.key_ref);
+    if rec.suite != auth_wire::suite::ED25519
+        || label.is_empty()
+        || label.len() > auth_wire::MAX_KEY_LABEL
+        || kid.is_empty()
+        || kid.len() > s.kid.len()
+    {
+        return false;
+    }
+    // The record names a LABEL; the key is generated inside the vault on
+    // first open and never travels. A label that will not open leaves
+    // the module without a key, which is the same state it was in
+    // before the record arrived — and `has_key` is now simply whether
+    // the vault holds one, so there is no flag to get out of step.
+    s.key.close(sys);
+    match s.key.open_status(sys, rec.suite, label) {
+        0 => {}
+        E_AGAIN => return true,
+        _ => return false,
+    }
+    s.kid = [0; 32];
+    s.kid[..kid.len()].copy_from_slice(kid);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bounded by the kid.len() check"
+    )]
+    {
+        s.kid_len = kid.len() as u8;
+    }
+    false
 }
 
 /// Finish every request whose directory answer has arrived.

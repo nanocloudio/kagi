@@ -43,6 +43,7 @@ pub const MAX_ISSUER_PUBKEY: usize = auth_wire::suite::MAX_IMPLEMENTED_PUBLIC_KE
 use crate::abi::SyscallTable;
 use crate::auth_wire;
 use crate::key_vault;
+use crate::E_INVAL;
 
 /// Scratch an [`IssuerKey::sign`] call needs BEYOND the signing input.
 ///
@@ -136,8 +137,23 @@ impl IssuerKey {
     ///
     /// `sys` must be a valid syscall table per the module ABI.
     pub unsafe fn open(&mut self, sys: &SyscallTable, suite: u16, label: &[u8]) -> bool {
+        self.open_status(sys, suite, label) == 0
+    }
+
+    /// As [`open`](Self::open), with the vault's answer: 0 when the key is
+    /// open; `E_AGAIN` when the vault cannot answer yet — its persistent
+    /// store is not ready, and a key that may already exist there must not
+    /// be generated afresh — so the same open is to be asked again; any
+    /// other negative errno when it is refused. A caller that opens on a
+    /// record it reads once must keep what it needs to ask again on
+    /// `E_AGAIN`, or the key never opens.
+    ///
+    /// # Safety
+    ///
+    /// As `open`.
+    pub unsafe fn open_status(&mut self, sys: &SyscallTable, suite: u16, label: &[u8]) -> i32 {
         if label.is_empty() || label.len() > auth_wire::MAX_KEY_LABEL {
-            return false;
+            return E_INVAL;
         }
         const USAGE: u32 =
             key_vault::usage::SIGN | key_vault::usage::EXPORT_PUBLIC | key_vault::usage::PERSIST;
@@ -147,7 +163,7 @@ impl IssuerKey {
         let mut arg = [0u8; 8 + auth_wire::MAX_KEY_LABEL + 12];
         let vault = vault_suite(suite);
         if vault == key_vault::suite::NONE {
-            return false;
+            return E_INVAL;
         }
         arg[0..2].copy_from_slice(&vault.to_le_bytes());
         arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
@@ -174,7 +190,7 @@ impl IssuerKey {
         let handle =
             (sys.provider_call)(-1, key_vault::OPEN_OR_GENERATE, arg.as_mut_ptr(), tail + 12);
         if handle < 0 {
-            return false;
+            return handle;
         }
         let pub_len = usize::from(u16::from_le_bytes([arg[tail + 10], arg[tail + 11]]));
         if pub_len == 0 || pub_len > MAX_ISSUER_PUBKEY {
@@ -183,7 +199,7 @@ impl IssuerKey {
             // check. Released rather than kept: a half-open key is the state
             // that looks configured and is not.
             let _ = (sys.provider_call)(handle, key_vault::DESTROY, core::ptr::null_mut(), 0);
-            return false;
+            return E_INVAL;
         }
         self.handle = handle;
         self.suite = suite;
@@ -198,7 +214,7 @@ impl IssuerKey {
             self.pub_len = pub_len as u16;
             self.label_len = label.len() as u8;
         }
-        true
+        0
     }
 
     /// Sign `input` in the vault, returning the raw 64-byte signature.
@@ -300,5 +316,58 @@ impl IssuerKey {
             let _ = (sys.provider_call)(self.handle, key_vault::DESTROY, core::ptr::null_mut(), 0);
         }
         *self = Self::empty();
+    }
+}
+
+/// The largest key record an endpoint reads off its key channel.
+pub const KEY_RECORD_MAX: usize = 256;
+
+/// One key record held for another try. An endpoint opens its key while
+/// handling a record it reads once; when the vault answers `E_AGAIN` (its
+/// persistent store is not ready yet) the record is kept here and handled
+/// again on a later step, rather than consumed with the key never opened.
+/// Later records wait behind it, so they are handled in the order sent.
+#[repr(C)]
+pub struct PendingRecord {
+    buf: [u8; KEY_RECORD_MAX],
+    len: u16,
+}
+
+impl PendingRecord {
+    pub const fn empty() -> Self {
+        Self {
+            buf: [0; KEY_RECORD_MAX],
+            len: 0,
+        }
+    }
+
+    /// Is a record waiting?
+    pub fn is_held(&self) -> bool {
+        self.len != 0
+    }
+
+    /// Keep `payload` for another try; a record past `KEY_RECORD_MAX` is
+    /// not one this endpoint reads, and is not kept.
+    pub fn hold(&mut self, payload: &[u8]) {
+        if payload.is_empty() || payload.len() > KEY_RECORD_MAX {
+            self.len = 0;
+            return;
+        }
+        self.buf[..payload.len()].copy_from_slice(payload);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bounded by KEY_RECORD_MAX immediately above"
+        )]
+        {
+            self.len = payload.len() as u16;
+        }
+    }
+
+    /// Take the held record into `out`: its length, 0 when none.
+    pub fn take(&mut self, out: &mut [u8; KEY_RECORD_MAX]) -> usize {
+        let n = usize::from(self.len).min(KEY_RECORD_MAX);
+        out[..n].copy_from_slice(&self.buf[..n]);
+        self.len = 0;
+        n
     }
 }
