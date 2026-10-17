@@ -64,10 +64,27 @@ const FS_WRITE: u32 = 0x0906;
 /// contract; store-file creation needs the write tier.
 const FS_OPEN_CREATE: u32 = 0x0909;
 
-/// FS E_AGAIN: the FS provider is present but still initialising.
-/// Distinct from a hard error (ENODEV/ENOSYS = no provider): on
-/// E_AGAIN we retry next step rather than degrading to memory-only.
+/// FS E_AGAIN: not now, nothing consumed (mount not up, data not yet
+/// cached, device busy). Distinct from a hard error (ENODEV/ENOSYS = no
+/// provider): on E_AGAIN we ask again next step rather than degrading
+/// to memory-only.
 const FS_E_AGAIN: i32 = -11;
+/// FS E_INPROGRESS: taken, not yet decided (FSYNC, OPEN_CREATE). Re-ask
+/// the byte-identical request on a later step; the answer is the decision.
+const FS_E_INPROGRESS: i32 = -36;
+
+/// Neither answer is a failure, end of data or absence.
+const fn fs_pending(rc: i32) -> bool {
+    rc == FS_E_AGAIN || rc == FS_E_INPROGRESS
+}
+
+/// Store-file rewrite stages (`persist_stage`). The rewrite is a step
+/// machine: each stage is re-asked on later steps until it decides.
+const PST_IDLE: u8 = 0;
+const PST_OPEN: u8 = 1;
+const PST_SEEK: u8 = 2;
+const PST_WRITE: u8 = 3;
+const PST_FSYNC: u8 = 4;
 
 // Module phases
 const PHASE_LOAD: u8 = 0;
@@ -166,8 +183,18 @@ struct ModuleState {
     /// Hard FS failure seen on the write path — degrade to memory-only.
     no_fs: bool,
     no_fs_logged: bool,
-    /// A persist is owed (E_AGAIN or channel pressure); retry next step.
+    /// The records changed since the image being (or last) written: a
+    /// rewrite is owed once the one in flight decides.
     dirty: bool,
+    /// Store-file rewrite in flight (`PST_*`), its FD, the image length in
+    /// `file_buf` and how much of it the provider has taken.
+    persist_stage: u8,
+    persist_fd: i32,
+    persist_total: usize,
+    persist_off: usize,
+    /// Boot load in flight: FD (-1 = not open) and bytes read so far.
+    load_fd: i32,
+    load_total: usize,
 
     records: [Record; MAX_RECORDS],
 
@@ -237,6 +264,12 @@ pub extern "C" fn module_new(
         s.no_fs = false;
         s.no_fs_logged = false;
         s.dirty = false;
+        s.persist_stage = PST_IDLE;
+        s.persist_fd = -1;
+        s.persist_total = 0;
+        s.persist_off = 0;
+        s.load_fd = -1;
+        s.load_total = 0;
         s.records = [Record::zero(); MAX_RECORDS];
         s.get_ops = 0;
         s.put_ops = 0;
@@ -273,10 +306,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // KEK updates first, so a same-step PUT uses the latest epoch.
         drain_key_updates(s, sys);
 
-        // Owed persist from a previous E_AGAIN — retry before new work.
-        if s.dirty && !s.no_fs {
-            persist(s, sys);
-        }
+        // Advance the store-file rewrite in flight, or start an owed one.
+        step_persist(s, sys);
 
         for _ in 0..MAX_REQS_PER_STEP {
             if !chan::can_read(sys, s.in_requests) {
@@ -736,9 +767,12 @@ unsafe fn reply_value(
 
 // ── Persistence ─────────────────────────────────────────────
 
-/// One-time boot load of `secrets/store.bin`. E_AGAIN holds the module
-/// in PHASE_LOAD (requests backpressure); any other open failure —
-/// missing file or missing provider — starts empty.
+/// One-time boot load of `secrets/store.bin`, resumable across steps:
+/// the FD and the bytes read so far persist, so E_AGAIN (on OPEN or
+/// mid-read) holds the module in PHASE_LOAD (requests backpressure) and
+/// the next step continues where this one stopped. A missing file starts
+/// empty; a read that fails part-way degrades to memory-only rather
+/// than serving — and later overwriting — a truncated store.
 ///
 /// # Safety
 ///
@@ -746,34 +780,58 @@ unsafe fn reply_value(
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
-    let mut path = [0u8; 32];
-    path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
-    let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), STORE_PATH.len());
-    if fd == FS_E_AGAIN {
-        // Provider still initialising — retry next step.
-        return 0;
-    }
-    if fd < 0 {
-        // No file yet (fresh deployment) or no provider. Start empty;
-        // the write path decides memory-only degradation on its own.
-        s.phase = PHASE_NORMAL;
-        return 0;
+    if s.load_fd < 0 {
+        let mut path = [0u8; 32];
+        path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), STORE_PATH.len());
+        if fs_pending(fd) {
+            // Not now (mount not up, entry not cached) — ask again next step.
+            return 0;
+        }
+        if fd < 0 {
+            // No file yet (fresh deployment) or no provider. Start empty;
+            // the write path decides memory-only degradation on its own.
+            s.phase = PHASE_NORMAL;
+            return 0;
+        }
+        s.load_fd = fd;
+        s.load_total = 0;
     }
 
-    let mut total = 0usize;
-    while total < FILE_BUF_LEN {
+    // Read while bytes move; a short count is not end of file (only 0 is).
+    while s.load_total < FILE_BUF_LEN {
         let r = (sys.provider_call)(
-            fd,
+            s.load_fd,
             FS_READ,
-            s.file_buf.as_mut_ptr().add(total),
-            FILE_BUF_LEN - total,
+            s.file_buf.as_mut_ptr().add(s.load_total),
+            FILE_BUF_LEN - s.load_total,
         );
-        if r <= 0 {
+        if fs_pending(r) {
+            // Sectors still being fetched; keep the FD and progress.
+            return 0;
+        }
+        if r < 0 || r as usize > FILE_BUF_LEN - s.load_total {
+            (sys.provider_call)(s.load_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.load_fd = -1;
+            s.no_fs = true;
+            s.no_fs_logged = true;
+            dev_log(
+                sys,
+                2,
+                b"[sstore] store read failed; memory-only".as_ptr(),
+                39,
+            );
+            s.phase = PHASE_NORMAL;
+            return 0;
+        }
+        if r == 0 {
             break;
         }
-        total += r as usize;
+        s.load_total += r as usize;
     }
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    (sys.provider_call)(s.load_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    s.load_fd = -1;
+    let total = s.load_total;
 
     if total >= FILE_HDR && s.file_buf[..4] == FILE_MAGIC {
         let body_len =
@@ -824,10 +882,8 @@ fn parse_dec_u32(bytes: &[u8]) -> Option<u32> {
     Some(v)
 }
 
-/// Rewrite the whole store file (`[magic][body_len][records...]`) via
-/// OPEN_CREATE + WRITE + FSYNC + CLOSE. On E_AGAIN the write is owed
-/// (`dirty`) and retried next step; on a hard failure the store
-/// degrades to memory-only permanently (logged once).
+/// Owe a rewrite of the whole store file and start it as far as the
+/// provider allows this step (see [`step_persist`]).
 ///
 /// # Safety
 ///
@@ -835,11 +891,13 @@ fn parse_dec_u32(bytes: &[u8]) -> Option<u32> {
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn persist(s: &mut ModuleState, sys: &SyscallTable) {
-    if s.no_fs {
-        return;
-    }
+    s.dirty = true;
+    step_persist(s, sys);
+}
 
-    // Build the file image.
+/// Snapshot the records into `file_buf` as `[magic][body_len][records...]`
+/// and return the image length.
+unsafe fn build_image(s: &mut ModuleState) -> usize {
     let mut total = FILE_HDR;
     for i in 0..MAX_RECORDS {
         if !s.records[i].used {
@@ -858,38 +916,120 @@ unsafe fn persist(s: &mut ModuleState, sys: &SyscallTable) {
     s.file_buf[..4].copy_from_slice(&FILE_MAGIC);
     let body_len = (total - FILE_HDR) as u32;
     s.file_buf[4..8].copy_from_slice(&body_len.to_le_bytes());
+    total
+}
 
-    let mut path = [0u8; 32];
-    path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), STORE_PATH.len());
-    if fd == FS_E_AGAIN {
+/// Release the rewrite's FD and settle the stage. `retry` owes another
+/// rewrite (from a fresh image) after a real failure of this one.
+unsafe fn persist_end(s: &mut ModuleState, sys: &SyscallTable, retry: bool) {
+    if s.persist_fd >= 0 {
+        (sys.provider_call)(s.persist_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.persist_fd = -1;
+    }
+    s.persist_stage = PST_IDLE;
+    if retry {
         s.dirty = true;
+    }
+}
+
+/// Advance the store-file rewrite: OPEN_CREATE → SEEK(0) → WRITE (by
+/// short counts) → FSYNC (re-asked until it decides) → CLOSE. Each stage
+/// that answers E_AGAIN/E_INPROGRESS is asked again on a later step,
+/// resuming where it stopped. The image is snapshotted once per rewrite,
+/// so records changed meanwhile only mark the next one owed (`dirty`).
+/// The file is durable only on FSYNC's 0, never on CLOSE. On a hard open
+/// failure the store degrades to memory-only permanently (logged once).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.no_fs {
+        s.dirty = false;
         return;
     }
-    if fd < 0 {
-        // Hard failure — no write-capable provider. Memory-only from
-        // here on; say so exactly once.
-        s.no_fs = true;
-        s.dirty = false;
-        if !s.no_fs_logged {
-            s.no_fs_logged = true;
-            dev_log(sys, 2, b"[sstore] no fs; memory-only".as_ptr(), 27);
+    loop {
+        match s.persist_stage {
+            PST_IDLE => {
+                if !s.dirty {
+                    return;
+                }
+                s.persist_total = build_image(s);
+                s.persist_off = 0;
+                s.dirty = false;
+                s.persist_stage = PST_OPEN;
+            }
+            PST_OPEN => {
+                let mut path = [0u8; 32];
+                path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
+                let fd =
+                    (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), STORE_PATH.len());
+                if fs_pending(fd) {
+                    return;
+                }
+                if fd < 0 {
+                    // Hard failure — no write-capable provider. Memory-only
+                    // from here on; say so exactly once.
+                    s.persist_stage = PST_IDLE;
+                    s.no_fs = true;
+                    s.dirty = false;
+                    if !s.no_fs_logged {
+                        s.no_fs_logged = true;
+                        dev_log(sys, 2, b"[sstore] no fs; memory-only".as_ptr(), 27);
+                    }
+                    return;
+                }
+                s.persist_fd = fd;
+                s.persist_stage = PST_SEEK;
+            }
+            PST_SEEK => {
+                // OPEN_CREATE position is provider-defined; pin to 0 for a rewrite.
+                let seek = 0i32.to_le_bytes();
+                let rc = (sys.provider_call)(s.persist_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                if fs_pending(rc) {
+                    return;
+                }
+                if rc < 0 {
+                    persist_end(s, sys, true);
+                    return;
+                }
+                s.persist_stage = PST_WRITE;
+            }
+            PST_WRITE => {
+                if s.persist_off >= s.persist_total {
+                    s.persist_stage = PST_FSYNC;
+                    continue;
+                }
+                let left = s.persist_total - s.persist_off;
+                let w = (sys.provider_call)(
+                    s.persist_fd,
+                    FS_WRITE,
+                    s.file_buf.as_mut_ptr().add(s.persist_off),
+                    left,
+                );
+                if fs_pending(w) {
+                    return;
+                }
+                if w <= 0 || w as usize > left {
+                    // Failed write: rewrite from a fresh image next step.
+                    persist_end(s, sys, true);
+                    return;
+                }
+                s.persist_off += w as usize;
+            }
+            _ => {
+                let rc = (sys.provider_call)(s.persist_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                if fs_pending(rc) {
+                    return;
+                }
+                // Durable on 0; a failed fence owes the rewrite again.
+                persist_end(s, sys, rc != 0);
+                return;
+            }
         }
-        return;
     }
-
-    // OPEN_CREATE position is provider-defined; pin to 0 for a rewrite.
-    let seek = 0i32.to_le_bytes();
-    (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
-    let w = (sys.provider_call)(fd, FS_WRITE, s.file_buf.as_mut_ptr(), total);
-    if (w as usize) == total {
-        (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-        s.dirty = false;
-    } else {
-        // Short/failed write: keep the persist owed and retry.
-        s.dirty = true;
-    }
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
 }
 
 // WASM entry wrappers (module_init_wasm / module_step_wasm). Emits

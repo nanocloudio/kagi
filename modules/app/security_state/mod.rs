@@ -43,6 +43,17 @@
 //! compare-and-swap fails and the caller retries. The reverse order would
 //! pair a fresh etag with a stale value, and the compare-and-swap would
 //! succeed on a basis that was never true.
+//!
+//! ## A read that waits decides nothing
+//!
+//! Each of those reads may answer `EAGAIN` — not yet — and on the board's
+//! replicated store they do. That is neither "no such record" nor "no
+//! store", so it is answered as neither: the read is held in one slot, its
+//! requester gets no reply, no further request is drained, and the stage
+//! that waited (a `RANGE_GET` on the handle it already holds) is asked again
+//! on a later step. The `HEAD` that re-reads a decided write's etag waits the
+//! same way, holding the `ACK`. `modules/common/object_read.rs` is the step
+//! machine; the host harness drives it against a provider that waits.
 
 #![no_std]
 #![allow(
@@ -71,6 +82,8 @@ mod auth_wire;
 mod chan;
 #[path = "../../common/lattice_kv.rs"]
 mod lattice_kv;
+#[path = "../../common/object_read.rs"]
+mod object_read;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
 #[path = "../../common/time_policy.rs"]
@@ -207,6 +220,57 @@ impl WritePending {
     }
 }
 
+/// What the one held read is reading for.
+const READ_NONE: u8 = 0;
+/// A `MSG_STATE_GET`: `HEAD`, `GET`, `RANGE_GET`, then a `VALUE` reply.
+const READ_GET: u8 = 1;
+/// The `HEAD` after a decided write, for the etag its `ACK` carries.
+const READ_ETAG: u8 = 2;
+
+/// A read the `object` provider answered `EAGAIN` to: not yet.
+///
+/// A waiting read decides nothing. `EAGAIN` is neither absence nor a failed
+/// store, so answering it `ST_NOT_FOUND` or `ST_UNAVAILABLE` says something
+/// the store never said; and a write's `ACK` sent before its etag `HEAD`
+/// answers would tell the caller there is nothing to chain against. The
+/// requester is owed one reply and gets it when the provider answers.
+///
+/// ONE slot, held like [`WritePending`] and for the same reason: the read's
+/// key, the etag `HEAD` parsed and the body `RANGE_GET` is copying into live
+/// in `key_buf`, `etag_buf` and `value_buf`, which the next request would
+/// overwrite, so no request is drained while it is live. A held `RANGE_GET`
+/// keeps its handle in [`object_read::ObjectRead`] and is asked again on
+/// that handle, never by a second `GET`.
+#[derive(Clone, Copy)]
+struct ReadPending {
+    kind: u8,
+    read: object_read::ObjectRead,
+    namespace: u8,
+    key_len: usize,
+    /// The etag the `HEAD` parsed into `etag_buf`, once it has answered.
+    etag_len: usize,
+    corr: u32,
+    client: u8,
+}
+
+impl ReadPending {
+    const fn zero() -> Self {
+        Self {
+            kind: READ_NONE,
+            read: object_read::ObjectRead::idle(),
+            namespace: 0,
+            key_len: 0,
+            etag_len: 0,
+            corr: 0,
+            client: 0,
+        }
+    }
+
+    const fn live(&self) -> bool {
+        self.kind != READ_NONE
+    }
+}
+
 /// Requests parked on a lattice answer. Small and refusing when full —
 /// parked requests are admissions-in-waiting, and an unbounded queue is
 /// the eviction-under-load shape.
@@ -261,6 +325,8 @@ struct ModuleState {
     kv_pending: [KvPending; MAX_KV_PENDING],
     /// The one `object` write awaiting a decision, if any.
     write_pending: WritePending,
+    /// The one `object` read awaiting an answer, if any.
+    read_pending: ReadPending,
     next_kv_corr: u64,
     kv_buf: [u8; MSG_BUF_LEN],
 
@@ -282,6 +348,9 @@ struct ModuleState {
     /// Writes the provider took without deciding. A rising count is a slow
     /// store, not a broken one — it is the back-pressure made visible.
     state_pending: u32,
+    /// Reads the provider answered `EAGAIN` to, one per step held. Like
+    /// `state_pending`, a slow store made visible, never a broken one.
+    state_read_pending: u32,
     state_malformed: u32,
     /// Reads refused because the view they were served from is weaker than
     /// the namespace allows a decision to rest on.
@@ -374,6 +443,7 @@ pub extern "C" fn module_new(
         s.in_kv = dev_channel_port(sys, 0, 1);
         s.kv_pending = [KvPending::zero(); MAX_KV_PENDING];
         s.write_pending = WritePending::zero();
+        s.read_pending = ReadPending::zero();
         s.next_kv_corr = 1;
         parse_tlv(s, params, params_len);
         s.state_get = 0;
@@ -383,6 +453,7 @@ pub extern "C" fn module_new(
         s.state_conflict = 0;
         s.state_unavailable = 0;
         s.state_pending = 0;
+        s.state_read_pending = 0;
         s.state_malformed = 0;
         s.state_read_too_weak = 0;
         dev_log(sys, 3, b"[state] init".as_ptr(), 12);
@@ -401,6 +472,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if !s.probed {
             probe(s, sys);
+            // A probe the provider answered `EAGAIN` decided nothing; no
+            // request is answered until it has. They wait in the channel.
+            if !s.probed {
+                return 0;
+            }
         }
 
         drain_kv(s, sys);
@@ -421,6 +497,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // A read the provider has not answered is asked again — once, this
+        // step — before anything else is drained, for the same reason: its
+        // reply is owed and its buffers are the next request's. A decided
+        // write whose etag `HEAD` waits lands here too, on the same step.
+        if s.read_pending.live() {
+            if !chan::can_write(sys, s.out_replies) {
+                return 0;
+            }
+            resume_read(s, sys);
+            if s.read_pending.live() {
+                return 0;
+            }
+        }
+
         for _ in 0..MAX_REQS_PER_STEP {
             if !chan::can_read(sys, s.in_requests) {
                 break;
@@ -435,6 +525,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 continue;
             }
             handle_request(s, sys, msg_type, plen as usize);
+            // A write or read that has to wait holds the buffers the next
+            // request would be decoded into: stop draining until it answers.
+            if s.write_pending.live || s.read_pending.live() {
+                break;
+            }
         }
         0
     }
@@ -497,7 +592,17 @@ unsafe fn probe(s: &mut ModuleState, sys: &SyscallTable) {
         );
         return;
     }
-    let rc = head_object(s, sys, PROBE_KEY);
+    let mut i = 0usize;
+    while i < PROBE_KEY.len() && i < s.key_buf.len() {
+        s.key_buf[i] = PROBE_KEY[i];
+        i += 1;
+    }
+    let rc = head_object(s, sys, PROBE_KEY.len());
+    if rc == object_read::EAGAIN {
+        // Not yet: neither absent nor present. Asked again next step.
+        s.probed = false;
+        return;
+    }
     // `ENXIO` — absent — is the expected healthy answer. Anything that is not
     // a real answer about a key means there is no conditional store here.
     if rc == abi::kernel_abi::errno::ENOSYS
@@ -608,6 +713,9 @@ fn copy_field(dst: &mut [u8], src: &[u8]) -> usize {
 /// Read a record: `HEAD` for the etag, then `GET`/`RANGE_GET` for the value.
 /// See the module note for why that order and not the reverse.
 ///
+/// The read is started here and advanced by [`resume_read`] — this step as
+/// far as the provider answers, and on later steps from wherever it waited.
+///
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
@@ -619,72 +727,193 @@ unsafe fn do_get(
     corr: u32,
     client: u8,
 ) {
-    let mut key = [0u8; MAX_COMPOSED_KEY];
-    key[..key_len].copy_from_slice(&s.key_buf[..key_len]);
-
-    let rc = head_object(s, sys, &key[..key_len]);
-    if rc < 0 {
-        // Absent is a miss; anything else is the store failing to answer,
-        // which must not be reported as "no such record".
-        let status = if rc == abi::kernel_abi::errno::ENXIO {
-            auth_wire::ST_NOT_FOUND
-        } else {
-            s.state_unavailable = s.state_unavailable.saturating_add(1);
-            auth_wire::ST_UNAVAILABLE
-        };
-        reply(s, sys, corr, client, status, &[], true);
-        return;
-    }
-
-    // WHICH VIEW answered. `HEAD` writes back the fence its answer was
-    // served under, and the namespace says how strong a view a decision on
-    // this class of state may rest on. A single-use record read from a view
-    // with no linearization point is how a consumed transaction reads as
-    // unconsumed and is spent twice — so a read below the floor is refused
-    // rather than answered.
-    //
-    // Read floor, not the write floor: a provider legitimately answers a
-    // read `ViewConsistent` and a write `LocalDurable`, and they answer
-    // different questions. `ST_UNAVAILABLE`, because from the caller's side
-    // this is the same fact as no store — there is no view it may decide on.
-    let served_under = s.fence_buf[0];
-    if !state_wire::read_fence_satisfies(ns, served_under) {
-        s.state_read_too_weak = s.state_read_too_weak.saturating_add(1);
-        reply(s, sys, corr, client, auth_wire::ST_UNAVAILABLE, &[], true);
-        return;
-    }
-
-    let Some((size, etag_len)) = parse_head(&s.head_buf[..rc as usize], &mut s.etag_buf) else {
-        reply(s, sys, corr, client, auth_wire::ST_UNAVAILABLE, &[], true);
-        return;
-    };
-
-    let value_len = read_body(s, sys, &key[..key_len], size);
-    let Some(value_len) = value_len else {
-        reply(s, sys, corr, client, auth_wire::ST_UNAVAILABLE, &[], true);
-        return;
-    };
-
-    let mut etag = [0u8; state_wire::MAX_ETAG];
-    etag[..etag_len].copy_from_slice(&s.etag_buf[..etag_len]);
-    let mut value = [0u8; state_wire::MAX_VALUE];
-    value[..value_len].copy_from_slice(&s.value_buf[..value_len]);
-
-    let n = match state_wire::encode_value(
-        &mut s.out_buf,
+    s.read_pending = ReadPending {
+        kind: READ_GET,
+        read: object_read::ObjectRead::start(),
+        namespace: ns,
+        key_len,
+        etag_len: 0,
         corr,
         client,
-        auth_wire::ST_OK,
-        &etag[..etag_len],
-        &value[..value_len],
-    ) {
-        Ok(n) => n,
-        Err(_) => {
-            reply(s, sys, corr, client, auth_wire::ST_FULL, &[], true);
-            return;
-        }
     };
-    write_out(s, sys, n);
+    resume_read(s, sys);
+}
+
+/// Ask the held read's provider once more, and answer its requester if the
+/// provider has now answered. A read still waiting stays held, unanswered.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`,
+/// and `s.read_pending` is live.
+unsafe fn resume_read(s: &mut ModuleState, sys: &SyscallTable) {
+    let mut p = s.read_pending;
+    let cap = s.value_buf.len();
+    let mut port = Port {
+        s,
+        sys,
+        namespace: p.namespace,
+        key_len: p.key_len,
+        etag_len: p.etag_len,
+    };
+    if p.kind == READ_ETAG {
+        let etag = object_read::etag_after_write(&mut port);
+        let s = port.s;
+        let etag_len = match etag {
+            object_read::Etag::Held => {
+                s.state_read_pending = s.state_read_pending.saturating_add(1);
+                return;
+            }
+            object_read::Etag::Found(n) => n,
+            object_read::Etag::None => 0,
+        };
+        s.read_pending = ReadPending::zero();
+        let mut etag_out = [0u8; state_wire::MAX_ETAG];
+        for (d, b) in etag_out.iter_mut().zip(s.etag_buf.iter().take(etag_len)) {
+            *d = *b;
+        }
+        let n = etag_len.min(etag_out.len());
+        reply(
+            s,
+            sys,
+            p.corr,
+            p.client,
+            auth_wire::ST_OK,
+            etag_out.get(..n).unwrap_or(&[]),
+            false,
+        );
+        return;
+    }
+
+    let out = p.read.step(&mut port, cap);
+    p.etag_len = port.etag_len;
+    let s = port.s;
+    if out == object_read::Read::Held {
+        // Nothing decided and nothing answered; the stage and any handle
+        // are kept for the next step.
+        s.state_read_pending = s.state_read_pending.saturating_add(1);
+        s.read_pending = p;
+        return;
+    }
+    s.read_pending = ReadPending::zero();
+    match out {
+        object_read::Read::Found(value_len) => {
+            let etag = s.etag_buf.get(..p.etag_len).unwrap_or(&[]);
+            let value = s.value_buf.get(..value_len).unwrap_or(&[]);
+            match state_wire::encode_value(
+                &mut s.out_buf,
+                p.corr,
+                p.client,
+                auth_wire::ST_OK,
+                etag,
+                value,
+            ) {
+                Ok(n) => write_out(s, sys, n),
+                Err(_) => reply(s, sys, p.corr, p.client, auth_wire::ST_FULL, &[], true),
+            }
+        }
+        _ => {
+            if out == object_read::Read::TooWeak {
+                // WHICH VIEW answered. `HEAD` writes back the fence its
+                // answer was served under, and the namespace says how strong
+                // a view a decision on this class of state may rest on. A
+                // single-use record read from a view with no linearization
+                // point is how a consumed transaction reads as unconsumed
+                // and is spent twice — so a read below the floor is refused
+                // rather than answered. `ST_UNAVAILABLE`, because from the
+                // caller's side there is no view it may decide on.
+                s.state_read_too_weak = s.state_read_too_weak.saturating_add(1);
+            } else if out == object_read::Read::Unavailable {
+                // The store failing to answer, which must not be reported
+                // as "no such record".
+                s.state_unavailable = s.state_unavailable.saturating_add(1);
+            }
+            let status = out.status().unwrap_or(auth_wire::ST_UNAVAILABLE);
+            reply(s, sys, p.corr, p.client, status, &[], true);
+        }
+    }
+}
+
+/// The `object` provider as one held read asks it: [`object_read`]'s
+/// decisions over this module's buffers.
+struct Port<'a> {
+    s: &'a mut ModuleState,
+    sys: &'a SyscallTable,
+    namespace: u8,
+    key_len: usize,
+    etag_len: usize,
+}
+
+impl object_read::ObjectReads for Port<'_> {
+    fn head(&mut self) -> i32 {
+        // SAFETY: `Port` is built only by `resume_read`, whose caller holds
+        // the exclusive state and the live table.
+        unsafe { head_object(self.s, self.sys, self.key_len) }
+    }
+
+    fn view(&mut self, n: usize) -> object_read::HeadView {
+        // Read floor, not the write floor: a provider legitimately answers
+        // a read `ViewConsistent` and a write `LocalDurable`, and they
+        // answer different questions.
+        if !state_wire::read_fence_satisfies(self.namespace, self.s.fence_buf[0]) {
+            return object_read::HeadView::TooWeak;
+        }
+        let Some(record) = self.s.head_buf.get(..n) else {
+            return object_read::HeadView::Unreadable;
+        };
+        match parse_head(record, &mut self.s.etag_buf) {
+            Some((size, etag_len)) => {
+                self.etag_len = etag_len;
+                object_read::HeadView::Size(size)
+            }
+            None => object_read::HeadView::Unreadable,
+        }
+    }
+
+    fn etag(&mut self, n: usize) -> Option<usize> {
+        let record = self.s.head_buf.get(..n)?;
+        let (_, etag_len) = parse_head(record, &mut self.s.etag_buf)?;
+        self.etag_len = etag_len;
+        Some(etag_len)
+    }
+
+    fn open(&mut self) -> i32 {
+        let mut key_arg = [0u8; MAX_COMPOSED_KEY];
+        for (d, b) in key_arg
+            .iter_mut()
+            .zip(self.s.key_buf.iter().take(self.key_len))
+        {
+            *d = *b;
+        }
+        let len = self.key_len.min(key_arg.len());
+        // SAFETY: as `head`; `key_arg` holds `len` initialised bytes.
+        unsafe { (self.sys.provider_call)(-1, OBJECT_GET, key_arg.as_mut_ptr(), len) }
+    }
+
+    fn range(&mut self, handle: i32, len: usize) -> i32 {
+        let Ok(len) = u32::try_from(len.min(self.s.value_buf.len())) else {
+            return abi::kernel_abi::errno::EINVAL;
+        };
+        let out_ptr = self.s.value_buf.as_mut_ptr();
+        let mut arg = [0u8; 20];
+        let fields = 0u64
+            .to_le_bytes()
+            .into_iter()
+            .chain(len.to_le_bytes())
+            .chain((out_ptr as u64).to_le_bytes());
+        for (d, b) in arg.iter_mut().zip(fields) {
+            *d = b;
+        }
+        // SAFETY: as `head`; `out_ptr` addresses `len` writable bytes of
+        // `value_buf`, which stays put until the read settles.
+        unsafe { (self.sys.provider_call)(handle, OBJECT_RANGE_GET, arg.as_mut_ptr(), 20) }
+    }
+
+    fn close(&mut self, handle: i32) {
+        let mut nothing = [0u8; 1];
+        // SAFETY: as `head`.
+        let _ = unsafe { (self.sys.provider_call)(handle, OBJECT_CLOSE, nothing.as_mut_ptr(), 0) };
+    }
 }
 
 /// Write a record under a precondition.
@@ -850,28 +1079,21 @@ unsafe fn finish_write(s: &mut ModuleState, sys: &SyscallTable, p: WritePending,
         return;
     }
 
-    // Re-read the etag the write produced so the
-    // caller can chain a compare-and-swap without a further round trip.
-    let mut key = [0u8; MAX_COMPOSED_KEY];
-    key[..key_len].copy_from_slice(&s.key_buf[..key_len]);
-    let head_rc = head_object(s, sys, &key[..key_len]);
-    let mut etag_out = [0u8; state_wire::MAX_ETAG];
-    let mut etag_out_len = 0usize;
-    if head_rc > 0 {
-        if let Some((_, n)) = parse_head(&s.head_buf[..head_rc as usize], &mut s.etag_buf) {
-            etag_out[..n].copy_from_slice(&s.etag_buf[..n]);
-            etag_out_len = n;
-        }
-    }
-    reply(
-        s,
-        sys,
+    // Re-read the etag the write produced so the caller can chain a
+    // compare-and-swap without a further round trip. The `HEAD` is a read,
+    // and it may answer `EAGAIN`: then the `ACK` is held until it answers,
+    // because `ST_OK` with an empty etag would tell the caller there is
+    // nothing to chain against. The write itself is decided and stands.
+    s.read_pending = ReadPending {
+        kind: READ_ETAG,
+        read: object_read::ObjectRead::idle(),
+        namespace,
+        key_len,
+        etag_len: 0,
         corr,
         client,
-        auth_wire::ST_OK,
-        &etag_out[..etag_out_len],
-        false,
-    );
+    };
+    resume_read(s, sys);
 }
 
 /// Remove a record under an etag guard.
@@ -924,63 +1146,27 @@ unsafe fn do_delete(
     );
 }
 
-/// `HEAD` a key into `s.head_buf`. Returns the provider's result: bytes
-/// written, or a negative errno.
+/// `HEAD` the first `key_len` bytes of `s.key_buf` into `s.head_buf`.
+/// Returns the provider's result: bytes written, or a negative errno —
+/// `EAGAIN` among them, which the caller holds rather than decides on.
 ///
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
-unsafe fn head_object(s: &mut ModuleState, sys: &SyscallTable, key: &[u8]) -> i32 {
+unsafe fn head_object(s: &mut ModuleState, sys: &SyscallTable, key_len: usize) -> i32 {
     // Cleared first: a provider that writes no fence leaves whatever the last
     // call left, and a stale strong fence would pass a floor this answer never
     // met. Zero is `Volatile`, the weakest, so silence fails closed.
     s.fence_buf = [0u8; FENCE_CAP];
     let out_ptr = s.head_buf.as_mut_ptr();
     let fence_ptr = s.fence_buf.as_mut_ptr();
+    let Some(key) = s.key_buf.get(..key_len) else {
+        return abi::kernel_abi::errno::EINVAL;
+    };
     let Some(arg_len) = encode_head_arg(&mut s.arg_buf, key, out_ptr, fence_ptr) else {
         return abi::kernel_abi::errno::EINVAL;
     };
     (sys.provider_call)(-1, OBJECT_HEAD, s.arg_buf.as_mut_ptr(), arg_len)
-}
-
-/// Read a body of `size` bytes into `s.value_buf` via `GET`/`RANGE_GET`.
-///
-/// # Safety
-///
-/// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
-unsafe fn read_body(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    key: &[u8],
-    size: u64,
-) -> Option<usize> {
-    let want = usize::try_from(size).ok()?;
-    if want > s.value_buf.len() {
-        return None;
-    }
-    let mut key_arg = [0u8; MAX_COMPOSED_KEY];
-    key_arg[..key.len()].copy_from_slice(key);
-    let handle = (sys.provider_call)(-1, OBJECT_GET, key_arg.as_mut_ptr(), key.len());
-    if handle < 0 {
-        return None;
-    }
-
-    let out_ptr = s.value_buf.as_mut_ptr();
-    let mut arg = [0u8; 24];
-    arg[0..8].copy_from_slice(&0u64.to_le_bytes());
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "bounded by value_buf.len() above"
-    )]
-    arg[8..12].copy_from_slice(&(want as u32).to_le_bytes());
-    arg[12..20].copy_from_slice(&(out_ptr as u64).to_le_bytes());
-    let n = (sys.provider_call)(handle, OBJECT_RANGE_GET, arg.as_mut_ptr(), 20);
-    let mut nothing = [0u8; 1];
-    let _ = (sys.provider_call)(handle, OBJECT_CLOSE, nothing.as_mut_ptr(), 0);
-    if n < 0 {
-        return None;
-    }
-    usize::try_from(n).ok()
 }
 
 /// Pull `size` and the etag out of a HEAD record.

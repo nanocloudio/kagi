@@ -68,4 +68,5 @@ metrics = [
     "state_pending",
     "state_malformed",
     "state_read_too_weak",
+    "state_read_pending",
 ]
