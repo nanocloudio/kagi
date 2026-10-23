@@ -149,7 +149,10 @@ device-certificate keyset, an operator input); `state_requests` out[1] /
 `mint_in` in[3] — on these, admission is the REQUESTER of `token_mint`'s
 exchange, used by `GRANT_REQ`. Params: `iss` (1, str), `aud` (2, str),
 `scope` (3, str), `ttl_seconds` (4, u32), `suite` (5, credential suite id,
-default 2 = Ed25519) — grant-mode policy, never client-supplied.
+default 2 = Ed25519) — grant-mode policy, never client-supplied — and
+`origin` (6, str, required), the public origin of the endpoint presenters
+reach, which a DPoP proof's `htu` names ahead of the forwarded `path` (see
+[DPoP binding](#dpop-binding)).
 
 ### `MSG_ADMIT_REQ` 0x35 and `MSG_GRANT_REQ` 0x37
 
@@ -158,7 +161,7 @@ The same payload:
 | Offset | Field | Encoding |
 |---|---|---|
 | 0 | `method` | f8 — the request the DPoP proof is bound to |
-| 1+m | `uri` | f16 |
+| 1+m | `path` | f16 — that request's path, in origin form |
 | 3+m+u | `credential` | f16 — the device certificate (compact JWS) |
 | 5+m+u+c | `proof` | f16 — the DPoP proof |
 | 7+m+u+c+p | `otp` | f8 — a one-time code, or empty |
@@ -205,14 +208,16 @@ Ports: `request_in` in[0], `response_out` out[0]; `verify_key` in[1];
 `state_requests` out[1] / `state_replies` in[2]; `mint_out` out[2] /
 `mint_in` in[3] (authcode is the REQUESTER of `token_mint`'s exchange).
 Params: `iss` (1, str), `aud` (2, str), `ttl_seconds` (3, u32),
-`id_ttl_seconds` (4, u32), `suite` (5, default 2 = Ed25519).
+`id_ttl_seconds` (4, u32), `suite` (5, default 2 = Ed25519), `origin` (6,
+str, required) — the public origin of the /authorize endpoint presenters
+reach (see [DPoP binding](#dpop-binding)).
 
 ### `MSG_AUTHORIZE_REQ` 0x39
 
 | # | Field | Encoding |
 |---|---|---|
 | 1 | `method` | f8 |
-| 2 | `uri` | f16 |
+| 2 | `path` | f16 — the request's path, in origin form |
 | 3 | `credential` | f16 — the subject's device certificate |
 | 4 | `proof` | f16 — its DPoP proof |
 | 5 | `client_id` | f8 |
@@ -255,6 +260,44 @@ OK carries both tokens; a refusal neither (`[status][0,0][0,0]`).
 `authz_err`: 0 OK, 1 UNAUTHENTICATED, 2 UNKNOWN_CLIENT, 3 BAD_REDIRECT,
 4 NO_PKCE, 5 INVALID_GRANT, 6 PKCE_FAILED, 7 MISMATCH, 8 STATE_UNAVAILABLE,
 9 NO_CLOCK, 10 NO_KEY, 11 MALFORMED, 12 REPLAY, 20 MINT_FAILED.
+
+## DPoP binding
+
+Every module that verifies a presentation — `mint_admission` and `authcode`
+here, and `resource_gate`, `enrollment_endpoint`, `keypackage_endpoint` and
+`e2ee_state_endpoint` behind their own listeners — checks the DPoP proof
+the way RFC 9449 §4.3 specifies, through the shared `dpop` and
+`device_auth` fragments:
+
+- the header's `typ` is `dpop+jwt`, its `jwk` is a public `EC` P-256 or
+  `OKP` Ed25519 key with no private member, and its `alg` is that key's
+  own asymmetric algorithm (`ES256`; `EdDSA` or `Ed25519`). The key type,
+  never `alg`, selects the verifier;
+- `htm` is the request's method;
+- `htu` is the request's target URI without query and fragment. A module
+  never learns that URI from the request — `Host` is the client's to write
+  — so each declares its public **`origin`** (`scheme://authority`, e.g.
+  `https://idp.example.com` or `http://127.0.0.1:15100`; no path), and the
+  expected URI is that origin followed by the request's path. Both sides are
+  compared after RFC 3986 syntax-based and scheme-based normalization: scheme
+  and host lowercased, percent-encoding hex uppercased and unreserved
+  characters decoded, dot-segments removed, a default port (443 for
+  `https`, 80 for `http`) dropped, and an empty path read as `/`. A URI that
+  is not well-formed `http`/`https`, or is longer than 512 bytes, matches
+  nothing;
+- `ath` is base64url(SHA-256) of the credential presented with the proof,
+  because every presentation carries a DPoP-bound credential;
+- `iat` is at most five minutes old and at most the credential clock skew
+  (60 s) in the future, and `jti` is present and unseen: the replay record
+  holds it until the proof is stale.
+
+`origin` is required. A module whose origin is absent or malformed refuses
+to construct, the same way `token_mint` refuses an undeclared `posture`: an
+expectation nobody declared is not one to compare proofs against.
+
+On the wire, `ADMIT_REQ`, `GRANT_REQ` and `AUTHORIZE_REQ` carry the request's
+`path` and the provider supplies its own origin, so the caller that forwards
+a request cannot choose which URI the proof is held to.
 
 ## token_mint
 

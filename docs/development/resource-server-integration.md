@@ -13,12 +13,17 @@ following hold:
 1. The access token's signature verifies against the issuer JWKS, `iss`
    and `aud` match your API, and the token is inside its `exp` window.
 2. A matching DPoP proof accompanies the request: `Authorization: DPoP
-   <access_token>` plus a `DPoP` header carrying the signed proof.
+   <access_token>` plus a `DPoP` header carrying the signed proof, whose
+   header has `typ: dpop+jwt`, a public `jwk` and that key's own asymmetric
+   `alg`, and whose signature verifies under that `jwk`.
 3. The proof's JWK thumbprint equals the token's `cnf.jkt` — that is the
    binding, and a token presented without it is a bearer token.
-4. The proof's `htm`/`htu` match the method and the absolute request URI,
-   and its `iat` is recent.
-5. The proof's `jti` has not been seen for at least five minutes.
+4. The proof is about this request and this token (RFC 9449 §4.3): `htm` is
+   the method; `htu` is the request's target URI — your own origin followed
+   by the path, without query or fragment, compared after RFC 3986
+   normalization; `ath` is base64url(SHA-256) of the access token; and
+   `iat` is recent.
+5. The proof's `jti` has not been seen while the proof is fresh.
 
 ## `resource_gate`
 
@@ -36,12 +41,21 @@ record, the same key lifecycle every other verifier takes. **Until a key arrives
 request is refused**: a gate that admitted while it had nothing to verify
 against would be a gate in name only.
 
-Two params tune the floor:
+Its params:
 
 | param | meaning |
 |---|---|
+| `origin` | **required** — the gate's public origin, `scheme://authority` (e.g. `https://api.example.com`, no path): the URI clients reach it at. A proof's `htu` must be this origin followed by the request path. Absent or malformed, the gate refuses to construct |
 | `min_acr` | the minimum assurance as its `acr` word (e.g. `aal2`) |
 | `max_auth_age` | seconds since `auth_time`; `0` means no limit |
+
+`origin` is the gate's own declaration rather than anything read off the
+request, because the `Host` header is written by the client: a gate that
+took its expectation from it would accept a proof minted for any host the
+client cared to name. The comparison normalizes both sides — scheme and host
+case, percent-encoding, dot-segments, a default port (`443`/`80`), an empty
+path as `/` — so a client spelling the same URI differently is not refused
+for it.
 
 A request that falls short of `min_acr` is answered `401` with an RFC
 9470 `WWW-Authenticate` challenge naming the level required, so a client
@@ -59,7 +73,8 @@ sketch below is Node with `jose`; the structure is what matters, not the
 language.
 
 ```js
-import { createLocalJWKSet, jwtVerify, calculateJwkThumbprint } from 'jose';
+import { createHash } from 'node:crypto';
+import { createLocalJWKSet, importJWK, jwtVerify, calculateJwkThumbprint } from 'jose';
 
 const jwks = createLocalJWKSet(await (await fetch(`${ISSUER}/.well-known/jwks.json`)).json());
 const seen = new Map(); // jti -> expiry; use a shared store across replicas
@@ -78,9 +93,18 @@ export async function requireAuth(req, res, next) {
 
     // 2-4. the proof, verified under its own embedded key
     const header = JSON.parse(Buffer.from(proof.split('.')[0], 'base64url'));
-    const { payload: dpop } = await jwtVerify(proof, await importJWK(header.jwk));
-    const htu = `${BASE_URI}${req.originalUrl.split('?')[0]}`;
-    if (dpop.htm !== req.method || dpop.htu !== htu) throw new Error('proof is for another request');
+    if (header.typ !== 'dpop+jwt' || header.jwk?.d) throw new Error('not a DPoP proof');
+    const { payload: dpop } = await jwtVerify(proof, await importJWK(header.jwk, header.alg), {
+      algorithms: ['ES256', 'EdDSA'],
+    });
+    // `URL` normalizes scheme/host case, default ports and dot-segments.
+    const target = (u) => { const x = new URL(u); return x.origin + x.pathname; };
+    if (dpop.htm !== req.method || target(dpop.htu) !== target(`${ORIGIN}${req.path}`)) {
+      throw new Error('proof is for another request');
+    }
+    if (dpop.ath !== createHash('sha256').update(token).digest('base64url')) {
+      throw new Error('proof is for another token');
+    }
     if (Math.abs(Date.now() / 1000 - dpop.iat) > 300) throw new Error('proof is stale');
     if (await calculateJwkThumbprint(header.jwk) !== payload.cnf?.jkt) {
       return res.status(403).json({ error: 'not_bound' });
@@ -101,7 +125,10 @@ export async function requireAuth(req, res, next) {
 Two things this sketch gets right that are easy to get wrong:
 
 - **`htu` is the absolute URI without the query**, rebuilt from your own
-  origin rather than from a `Host` header a caller controls.
+  origin rather than from a `Host` header a caller controls, and compared
+  normalized rather than byte for byte.
+- **`ath` ties the proof to the token.** Without it a proof captured
+  beside one token could be presented with another the same key holds.
 - **A thumbprint mismatch is `403`, not `401`.** The token was valid; it
   was presented by the wrong holder, and retrying with fresh credentials
   will not help.

@@ -76,14 +76,11 @@ use auth_wire::{MintClaimValue, MintRequest, PayloadWriter};
 // parameter whose absence refuses at construction (`define_params!` below,
 // applied in `module_new`).
 //
-// It was a hardcoded `Development` constant until 2026-09-01, with the
-// stated rationale that a parameter's permissive direction is silent: a
-// production graph that left it unset would issue under a software key and
-// look exactly like one that had chosen to. That rationale survives the
-// change, because the default here is neither posture — it is UNDECLARED,
-// and undeclared refuses. A graph says `posture: development` or
-// `posture: production`, or `token_mint` does not construct. The silent
-// path was never "development by default"; it is "no module at all".
+// A permissive default would be silent: a production graph that left it
+// unset would issue under a software key and look exactly like one that had
+// chosen to. So the default is neither posture — it is UNDECLARED, and
+// undeclared refuses. A graph says `posture: development` or
+// `posture: production`, or `token_mint` does not construct.
 
 /// `posture` param values. `0` deliberately maps to no posture.
 const POSTURE_UNDECLARED: u8 = 0;

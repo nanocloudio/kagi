@@ -173,12 +173,17 @@ device_id = base64url( SHA256(device_pubkey) )[0:22]
    {
      "htu": "https://issuer.example/token",
      "htm": "POST",
+     "ath": "b64url(SHA256(DC))",
      "jti": "<uuid>",
      "iat": now()
    }
    ```
 
-   Signed with the device private key.
+   Signed with the device private key, its public half as the header's
+   `jwk`. `htu` is the absolute URI of the request without query and
+   fragment (RFC 9449 §4.2) — the issuer's declared origin followed by the
+   path — and `ath` binds the proof to the certificate it is presented
+   with.
 
 2. **Token request**
 
@@ -192,7 +197,9 @@ device_id = base64url( SHA256(device_pubkey) )[0:22]
 
 3. **Issuer validates**
    - Verify `DC` signature, expiry, audience.
-   - Verify DPoP signature using `device_pubkey` from `DC`.
+   - Verify DPoP signature using `device_pubkey` from `DC`, and that its
+     `htm`, `htu` (normalized, against the issuer's own origin) and `ath`
+     are this request's and this certificate's.
    - Return short-lived Access Token (AT):
 
      ```
@@ -222,7 +229,9 @@ device_id = base64url( SHA256(device_pubkey) )[0:22]
 1. Validate JWT signature against Issuer JWKS.  
 2. Ensure `aud` matches API audience.  
 3. Validate `exp`, `nbf`.  
-4. Confirm DPoP proof matches `cnf.jkt`.  
+4. Confirm the DPoP proof's key matches `cnf.jkt`, its `htm`/`htu` match
+   this request (`htu` against your own origin plus the path), and its
+   `ath` is the hash of this token.  
 5. Authorise the request on `sub`, `scope`, and — where the operation
    warrants it — `acr` and `auth_time`.
 

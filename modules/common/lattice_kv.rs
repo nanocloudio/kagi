@@ -144,22 +144,11 @@ pub const RESPONSE_FENCE_TAIL: usize = 8 + 8 + 4 + 1 + 8 + 8;
 /// Offset of `durability` within the fence tail.
 pub const FENCE_DURABILITY_AT: usize = 8 + 8 + 4;
 
-/// Protocol of origin, mirroring lattice's `types::PROTO_INTERNAL_DATA`.
-///
-/// It was `0x05` here until 2026-09-01, which is lattice's
-/// `PROTO_INTERNAL_WATCH`. Nothing caught it because nothing runs this
-/// file: it is mounted by the host suites and by no application module,
-/// no config and no runtime graph.
-///
-/// Be precise about what the byte does, because the wrong version of that
-/// story is what let the wrong value look right. `lattice_data_anchor`
-/// stamps this field, and `kv_request_router` selects the reply port from
-/// it. `lattice_data_client` — the module kagi actually speaks to —
-/// parses the envelope's corr/tenant/conn/consistency/op/body_len and
-/// never reads byte 8 at all, so on kagi's path a wrong value is inert
-/// rather than a misroute. That makes this a correctness fix, not an
-/// outage fix: a constant that claims to mirror lattice's must, or the
-/// next reader takes it as evidence about lattice.
+/// Protocol of origin (envelope byte 8): lattice's
+/// `types::PROTO_INTERNAL_DATA`, a request raised inside the graph rather than
+/// by a protocol client. `kv_request_router` remembers it per request to pick
+/// the port the reply goes out on, so the value mirrors lattice's exactly;
+/// another protocol's value would send the reply to that protocol's port.
 pub const PROTO_INTERNAL_DATA: u8 = 0x09;
 
 /// A stored security record: kagi's value bytes with the expiry lattice

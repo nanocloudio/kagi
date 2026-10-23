@@ -206,6 +206,10 @@ struct ModuleState {
     /// refuses rather than evicting — an eviction under load is an admission
     /// under load.
     replay: dpop::ReplayWindow<128>,
+    /// This listener's public origin, from the `origin` param: the
+    /// `scheme://authority` devices reach it at, which a proof's `htu`
+    /// names ahead of the request path.
+    origin: dpop::Origin,
     /// Scratch for one vault SIGN, kept in module state rather than on the
     /// PIC stack.
     sign_scratch: [u8; MAX_TOKEN + issuer_key::SIGN_SCRATCH_OVERHEAD],
@@ -775,6 +779,13 @@ define_params! {
             s.tenant_seed_len = n as u16;
         }
     };
+
+    // This listener's public origin, `scheme://authority` — what a DPoP
+    // proof's `htu` names ahead of the request path. Declared, never
+    // defaulted: an absent or malformed origin refuses at construction.
+    4, origin, str, 0 => |s, d, len| {
+        s.origin.set(core::slice::from_raw_parts(d, len));
+    };
 }
 
 /// Why a request was refused.
@@ -1018,7 +1029,17 @@ pub extern "C" fn module_new(
         s.pending = [Pending::zero(); MAX_PENDING];
         s.next_corr = 1;
 
+        s.origin = dpop::Origin::empty();
         parse_tlv(s, params, params_len);
+
+        // The origin must be DECLARED. A proof's `htu` is compared with the
+        // URI devices reach this listener at, and only the deployment knows
+        // it: the request's own `Host` is the client's to write.
+        if s.origin.declared().is_none() {
+            let why = b"[enrol] refusing to construct: origin undeclared or malformed (origin: scheme://host[:port])";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -1;
+        }
 
         dev_log(sys, 3, b"[enrol] init".as_ptr(), 12);
         0
@@ -1343,7 +1364,7 @@ unsafe fn authenticate_device(
         credential,
         proof,
         method,
-        uri,
+        path,
     } = *presented;
     if credential.is_empty() || proof.is_empty() || !s.key.is_open() {
         return Err(Refusal::Unauthenticated);
@@ -1370,7 +1391,8 @@ unsafe fn authenticate_device(
     let mut replayed = false;
     let admitted = {
         let seen = &mut replayed;
-        let mut offer = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+        let origin = s.origin;
+        let mut offer = |jti: &[u8; 32], until: u64| match s.replay.offer(jti, now, until) {
             dpop::Replay::Recorded => true,
             dpop::Replay::Seen | dpop::Replay::Full => {
                 *seen = true;
@@ -1384,7 +1406,12 @@ unsafe fn authenticate_device(
                 public: &pubkey[..pubkey_len],
             },
             &device_auth::Presentation { credential, proof },
-            &device_auth::Request { method, uri, now },
+            &device_auth::Request {
+                method,
+                origin: origin.as_bytes(),
+                path,
+                now,
+            },
             &policy,
             claims_out,
             &mut offer,
@@ -1411,7 +1438,9 @@ struct Presented<'a> {
     credential: &'a [u8],
     proof: &'a [u8],
     method: &'a [u8],
-    uri: &'a [u8],
+    /// The request's path, which the module's `origin` completes into the
+    /// URI the proof's `htu` must name.
+    path: &'a [u8],
 }
 
 /// What authenticating a presentation established.
@@ -1422,7 +1451,9 @@ struct Authenticated {
     device_id_len: usize,
 }
 
-/// How long a DPoP proof presented to this module stays fresh.
+/// How long a DPoP proof presented to this module stays fresh. Its `jti`
+/// is remembered until it is stale (`replayable_until`), and not a second
+/// less.
 const PROOF_WINDOW_SECS: u64 = 300;
 
 /// HMAC-SHA256 in the shape the TOTP fragment takes.
@@ -2208,16 +2239,12 @@ unsafe fn totp_route(
 
     let mut credential = [0u8; MAX_TOKEN];
     let mut proof = [0u8; MAX_TOKEN];
-    let mut uri = [0u8; MAX_FIELD];
-    let (credential_len, proof_len, uri_len) = {
-        let uri_len = path.len().min(uri.len());
-        uri[..uri_len].copy_from_slice(&path[..uri_len]);
+    let (credential_len, proof_len) = {
         (
             header_value(headers, b"authorization")
                 .and_then(strip_dpop_scheme)
                 .map_or(0, |v| copy_into(v, &mut credential)),
             header_value(headers, b"dpop").map_or(0, |v| copy_into(v, &mut proof)),
-            uri_len,
         )
     };
 
@@ -2226,7 +2253,7 @@ unsafe fn totp_route(
             credential: &credential[..credential_len],
             proof: &proof[..proof_len],
             method: b"POST",
-            uri: &uri[..uri_len],
+            path,
         };
         match authenticate_device(s, &presented, now) {
             Ok(who) => who,

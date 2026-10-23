@@ -418,7 +418,7 @@ pub fn claim_u64(payload_json: &[u8], key: &[u8]) -> Option<u64> {
 /// Extract a string claim's raw bytes from a flat JSON object. Matches
 /// `"<key>":"<value>"` and returns the value bytes as they appear in the
 /// source (escape sequences NOT decoded — callers compare against expected
-/// ASCII values like `DPoP` `htm`/`htu`, which contain no escapes). Returns
+/// ASCII values like `cty` or `kid`, which contain no escapes). Returns
 /// `None` if the key is absent or its value is not a string. Like
 /// `claim_u64`, this is a scanner for kagi's flat claim objects, not a
 /// general JSON parser.

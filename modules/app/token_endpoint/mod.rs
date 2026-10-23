@@ -727,10 +727,6 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
 
-    let uri_len = path_len.min(MAX_FIELD);
-    let mut uri = [0u8; MAX_FIELD];
-    uri[..uri_len].copy_from_slice(&path[..uri_len]);
-
     let mut entry = Pending::zero();
     entry.id = id;
     entry.credit = credit;
@@ -754,7 +750,9 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
 
     let ask = auth_wire::AdmitRequest {
         method: b"POST",
-        uri: &uri[..uri_len],
+        // The path as it arrived; admission completes it with its own
+        // declared origin into the URI the proof's `htu` must name.
+        path,
         credential: &credential[..credential_len],
         proof: &proof[..proof_len],
         otp: &otp[..otp_len],

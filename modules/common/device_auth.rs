@@ -13,11 +13,15 @@
 //!
 //! 1. The credential's signature verifies under the supplied issuer key, and
 //!    the credential is inside its own `iat`/`exp` window.
-//! 2. The DPoP proof's signature verifies under the key its own header
-//!    carries — not under the issuer key, and never under the algorithm the
-//!    header names, which is the algorithm-confusion path.
-//! 3. `typ`, the `htm`/`htu` binding and `iat` freshness hold
-//!    (`dpop::check_proof`).
+//! 2. The DPoP proof's header is well-formed — `typ`, an asymmetric `alg`
+//!    that is the algorithm of the public `jwk` it carries (`dpop::proof_key`)
+//!    — and its signature verifies under that key: not under the issuer key,
+//!    and never under the algorithm the header names, which is the
+//!    algorithm-confusion path.
+//! 3. The `htm`/`htu` binding to the request, the `ath` binding to the
+//!    presented credential and `iat` freshness hold (`dpop::check_proof`).
+//!    Every presentation carries a DPoP-bound credential in
+//!    `Authorization: DPoP`, so every proof carries `ath` (RFC 9449 §4.3).
 //! 4. The proof key's thumbprint equals the credential's `cnf.jkt`. Steps 2
 //!    and 3 prove the presenter holds *a* key; this proves it is *the* key
 //!    the credential was issued against.
@@ -124,8 +128,12 @@ pub struct Presentation<'a> {
 pub struct Request<'a> {
     /// The HTTP method name, uppercase, as `htm` spells it.
     pub method: &'a [u8],
-    /// The request URI, as `htu` spells it.
-    pub uri: &'a [u8],
+    /// The verifying module's public origin (`scheme://authority`), from its
+    /// declared `origin` parameter — never from the request's `Host`.
+    pub origin: &'a [u8],
+    /// The request's path, in origin form. The expected `htu` is `origin`
+    /// followed by this, compared under `dpop::htu_matches`.
+    pub path: &'a [u8],
     /// Seconds since the Unix epoch.
     ///
     /// A caller on a platform whose clock may be unavailable must decide what
@@ -138,7 +146,8 @@ pub struct Request<'a> {
 pub struct Policy {
     /// How old a DPoP proof may be.
     pub proof_max_age_secs: u64,
-    /// Clock skew allowed on the credential's own window.
+    /// Clock skew allowed on the credential's own window, and how far in
+    /// the future a proof's `iat` may be.
     pub clock_skew_secs: u64,
     /// The `cty` the credential header must carry, or `None` to accept a
     /// credential that names none — which is what an access token does.
@@ -155,7 +164,8 @@ pub enum AuthError {
     /// window, or not the credential kind the policy names.
     Credential,
     /// The proof is malformed, not signed by the key its header carries, or
-    /// fails the `typ` / `htm` / `htu` / `iat` checks.
+    /// fails the `typ` / `alg` / `jwk` / `htm` / `htu` / `ath` / `iat`
+    /// checks.
     Proof,
     /// The proof verified, but its `jti` has been seen before.
     Replay,
@@ -172,6 +182,9 @@ pub struct Authenticated<'a> {
     pub claims: &'a [u8],
     /// The proof's `jti` digest, already passed to `record_replay`.
     pub jti_digest: [u8; 32],
+    /// When the proof stops being acceptable — the expiry `record_replay`
+    /// was given, for a caller that also claims the proof in a ledger.
+    pub replayable_until: u64,
     /// The thumbprint of the key that presented the credential, which step 4
     /// has already shown equals the credential's `cnf.jkt`.
     pub thumbprint: [u8; 43],
@@ -185,8 +198,10 @@ pub const MAX_SEGMENT: usize = 1024;
 ///
 /// `claims_out` receives the decoded credential payload and must live as long
 /// as the returned claims are read.
-/// `record_replay` is called once with the proof's `jti` digest, between
-/// steps 3 and 4, and returns `false` if the identifier has been seen before.
+/// `record_replay` is called once with the proof's `jti` digest and the
+/// second from which the proof is stale (`dpop::ProofFacts::replayable_until`,
+/// the earliest the record may be forgotten), between steps 3 and 4, and
+/// returns `false` if the identifier has been seen before.
 pub fn authenticate<'b>(
     v: &Verifiers,
     key: &IssuerKey<'_>,
@@ -194,7 +209,7 @@ pub fn authenticate<'b>(
     req: &Request<'_>,
     policy: &Policy,
     claims_out: &'b mut [u8],
-    record_replay: &mut impl FnMut(&[u8; 32]) -> bool,
+    record_replay: &mut impl FnMut(&[u8; 32], u64) -> bool,
 ) -> Result<Authenticated<'b>, AuthError> {
     // ── 1. the credential verifies and is live ────────────────────────────
     let cred_jws = jose::Jws::split(presented.credential).ok_or(AuthError::Credential)?;
@@ -226,12 +241,12 @@ pub fn authenticate<'b>(
     let mut proof_header = [0u8; MAX_SEGMENT];
     let proof_header_len =
         b64::decode(proof_jws.header_b64, &mut proof_header).ok_or(AuthError::Proof)?;
-    let proof_header = &proof_header[..proof_header_len];
+    let proof_key =
+        dpop::proof_key(&proof_header[..proof_header_len]).map_err(|_| AuthError::Proof)?;
     let mut canonical = [0u8; jwk::MAX_CANONICAL];
-    let canonical_len =
-        canonical_header_jwk(proof_header, &mut canonical).ok_or(AuthError::Proof)?;
+    let canonical_len = canonical_jwk(&proof_key, &mut canonical).ok_or(AuthError::Proof)?;
     let canonical = &canonical[..canonical_len];
-    if !verify_under_header_jwk(v, proof_header, &proof_jws) {
+    if !verify_under_proof_key(v, &proof_key, &proof_jws) {
         return Err(AuthError::Proof);
     }
 
@@ -241,18 +256,22 @@ pub fn authenticate<'b>(
         b64::decode(proof_jws.payload_b64, &mut proof_payload).ok_or(AuthError::Proof)?;
     let facts = dpop::check_proof(
         v.sha256,
-        proof_header,
         &proof_payload[..proof_payload_len],
-        req.method,
-        req.uri,
+        &dpop::Binding {
+            method: req.method,
+            origin: req.origin,
+            path: req.path,
+            access_token: presented.credential,
+        },
         req.now,
         policy.proof_max_age_secs,
+        policy.clock_skew_secs,
     )
     .map_err(|_| AuthError::Proof)?;
 
     // Recorded only now: a `jti` taken from an unverified proof would let
     // anyone burn an honest client's identifiers.
-    if !record_replay(&facts.jti_digest) {
+    if !record_replay(&facts.jti_digest, facts.replayable_until) {
         return Err(AuthError::Replay);
     }
 
@@ -266,6 +285,7 @@ pub fn authenticate<'b>(
     Ok(Authenticated {
         claims: &claims_out[..claims_len],
         jti_digest: facts.jti_digest,
+        replayable_until: facts.replayable_until,
         thumbprint,
     })
 }
@@ -370,51 +390,38 @@ fn decode_signature<'a>(
 
 /// Verify a DPoP proof under the public key its own header carries.
 ///
-/// The algorithm comes from the header jwk's `kty`, never from the header's
-/// `alg`: `alg` is written by whoever made the proof, and letting it choose
-/// the verifier is the algorithm-confusion path.
-fn verify_under_header_jwk(v: &Verifiers, header_json: &[u8], jws: &jose::Jws<'_>) -> bool {
-    let Some(kty) = jose::claim_str(header_json, b"kty") else {
-        return false;
-    };
-    // The key type picks the suite, and the suite gives the length — so the
-    // proof's own `alg` never reaches this, and a signature of the wrong
-    // length for the key it names is refused before any curve sees it.
-    //
-    // `AKP`, RFC 9964's post-quantum key type, is not accepted here. A
-    // DPoP key is the DEVICE's, and an AKP thumbprint is taken over
-    // `alg`/`kty`/`pub` where an `EC` or `OKP` one is taken over
-    // `crv`/`kty`/`x` — so admitting one would change the `cnf.jkt` that
-    // every binding already issued was computed against. The ISSUER's
-    // keys reach ML-DSA through `verify_under_issuer`, where no
-    // thumbprint is involved.
-    let suite_id = match kty {
-        b"OKP" => SUITE_ED25519,
-        b"EC" => SUITE_ES256,
-        _ => return false,
+/// The algorithm comes from the key, never from the header's `alg`: `alg` is
+/// written by whoever made the proof, and letting it choose the verifier is
+/// the algorithm-confusion path. `dpop::proof_key` has already refused an
+/// `alg` that is not the key's own.
+///
+/// `AKP`, RFC 9964's post-quantum key type, is not a proof key. A DPoP key
+/// is the DEVICE's, and an AKP thumbprint is taken over `alg`/`kty`/`pub`
+/// where an `EC` or `OKP` one is taken over `crv`/`kty`/`x` — so admitting
+/// one would change the `cnf.jkt` that every binding issued is computed
+/// against. The ISSUER's keys reach ML-DSA through `verify_under_issuer`,
+/// where no thumbprint is involved.
+fn verify_under_proof_key(v: &Verifiers, key: &dpop::ProofKey<'_>, jws: &jose::Jws<'_>) -> bool {
+    // The key type picks the suite, and the suite gives the length — so a
+    // signature of the wrong length for the key it names is refused before
+    // any curve sees it.
+    let suite_id = match key {
+        dpop::ProofKey::Ed25519 { .. } => SUITE_ED25519,
+        dpop::ProofKey::Es256 { .. } => SUITE_ES256,
     };
     let mut buf = [0u8; suite::max_signature_len_over(PROOF_SUITES)];
     let Some(sig) = decode_signature(jws.signature_b64, suite_id, &mut buf) else {
         return false;
     };
-    match kty {
-        b"OKP" => {
-            let Some(x) = jose::claim_str(header_json, b"x") else {
-                return false;
-            };
+    match *key {
+        dpop::ProofKey::Ed25519 { x } => {
             let mut pk = [0u8; 32];
             if b64::decode(x, &mut pk) != Some(32) {
                 return false;
             }
             (v.ed25519_verify)(&pk, jws.signing_input, sig)
         }
-        b"EC" => {
-            let (Some(x), Some(y)) = (
-                jose::claim_str(header_json, b"x"),
-                jose::claim_str(header_json, b"y"),
-            ) else {
-                return false;
-            };
+        dpop::ProofKey::Es256 { x, y } => {
             // SEC1 uncompressed: 0x04 ‖ X ‖ Y.
             let mut point = [0u8; 65];
             point[0] = 0x04;
@@ -428,29 +435,26 @@ fn verify_under_header_jwk(v: &Verifiers, header_json: &[u8], jws: &jose::Jws<'_
             (v.sha256)(jws.signing_input, &mut hash);
             (v.ecdsa_verify)(&point, &hash, sig)
         }
-        _ => false,
     }
 }
 
-/// Rebuild the header's `jwk` in the canonical member order a thumbprint is
-/// taken over.
+/// The proof key's JWK in the canonical member order a thumbprint is taken
+/// over.
 ///
 /// The proof's own spelling of the JWK is not used: RFC 7638 thumbprints are
 /// defined over a canonical form, and hashing whatever order the presenter
 /// happened to write would let the same key produce two thumbprints.
-pub fn canonical_header_jwk(header_json: &[u8], out: &mut [u8]) -> Option<usize> {
-    let mut record = jwk::JwkRecord::new();
-    if let Some(value) = jose::claim_str(header_json, b"crv") {
-        record.crv = jwk::Field::set(value).ok()?;
+fn canonical_jwk(key: &dpop::ProofKey<'_>, out: &mut [u8]) -> Option<usize> {
+    let record = match *key {
+        dpop::ProofKey::Ed25519 { x } => jwk::JwkRecord::okp_ed25519(x),
+        dpop::ProofKey::Es256 { x, y } => jwk::JwkRecord::ec_p256(x, y),
     }
-    if let Some(value) = jose::claim_str(header_json, b"kty") {
-        record.kty = jwk::Field::set(value).ok()?;
-    }
-    if let Some(value) = jose::claim_str(header_json, b"x") {
-        record.x = jwk::Field::set(value).ok()?;
-    }
-    if let Some(value) = jose::claim_str(header_json, b"y") {
-        record.y = jwk::Field::set(value).ok()?;
-    }
+    .ok()?;
     record.canonical_json(out).ok()
+}
+
+/// The canonical JWK of the key a proof header carries, after the header
+/// checks `dpop::proof_key` makes; its length in `out`.
+pub fn canonical_header_jwk(header_json: &[u8], out: &mut [u8]) -> Option<usize> {
+    canonical_jwk(&dpop::proof_key(header_json).ok()?, out)
 }

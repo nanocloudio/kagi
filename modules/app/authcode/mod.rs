@@ -107,6 +107,8 @@ const MAX_FIELD: usize = 256;
 const CODE_ID_BYTES: usize = 16; // 16 random bytes → 22 base64url chars
 const CODE_ID_CHARS: usize = 22;
 const CODE_TTL_SECS: u64 = 60;
+/// How long a DPoP proof stays fresh. Its `jti` is remembered until it is
+/// stale (`replayable_until`), and not a second less.
 const PROOF_WINDOW_SECS: u64 = 300;
 /// This module's identity to the state ledger. Not an OAuth client id, and
 /// not a namespace — those are `state_wire::NS_OAUTH_*`.
@@ -185,6 +187,9 @@ struct Pending {
     /// The proof's replay identifier, base64url, as the ledger files it.
     replay_key: [u8; 43],
     replay_key_len: u8,
+    /// When the proof stops being acceptable, and so how long its ledger
+    /// claim must hold.
+    replayable_until: u64,
     auth_time: u64,
     access_token: [u8; 4096],
     access_len: u16,
@@ -219,6 +224,7 @@ impl Pending {
             code_etag_len: 0,
             replay_key: [0; 43],
             replay_key_len: 0,
+            replayable_until: 0,
             auth_time: 0,
             access_token: [0; 4096],
             access_len: 0,
@@ -245,6 +251,10 @@ struct ModuleState {
     mint_down: bool,
     keyset: verify_keyset::Keyset,
     replay: dpop::ReplayWindow<128>,
+    /// This module's public origin, from the `origin` param: the
+    /// `scheme://authority` of the /authorize endpoint presenters reach,
+    /// which a proof's `htu` names ahead of the forwarded path.
+    origin: dpop::Origin,
     pending: [Pending; MAX_IN_FLIGHT],
     // Deployment policy for the ACCESS token, never client-supplied.
     iss: [u8; MAX_FIELD],
@@ -298,6 +308,13 @@ define_params! {
     5, suite, u32, 2 => |s, d, len| {
         if len >= 1 { s.token_suite = u16::from(*d); }
     };
+    // The public origin, `scheme://authority`, of the /authorize endpoint
+    // presenters reach — what a DPoP proof's `htu` names ahead of the
+    // forwarded path. Declared, never defaulted: an absent or malformed
+    // origin refuses at construction.
+    6, origin, str, 0 => |s, d, len| {
+        s.origin.set(core::slice::from_raw_parts(d, len));
+    };
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -347,7 +364,17 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
+        s.origin = dpop::Origin::empty();
         parse_tlv(s, params, params_len);
+
+        // The origin must be DECLARED. A proof's `htu` is compared with the
+        // URI presenters reach /authorize at, and only the deployment knows
+        // it.
+        if s.origin.declared().is_none() {
+            let why = b"[authcode] refusing to construct: origin undeclared or malformed (origin: scheme://host[:port])";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -1;
+        }
 
         s.in_requests = in_chan;
         s.out_replies = out_chan;
@@ -665,11 +692,12 @@ unsafe fn handle_authorize(
     let admitted = {
         let seen = &mut replayed;
         let claimed = &mut proof_id;
-        let mut offer = |jti: &[u8; 32]| {
+        let origin = s.origin;
+        let mut offer = |jti: &[u8; 32], until: u64| {
             // Kept for the durable claim. The window answers first because
             // it is free and catches a replay inside this process at once.
             *claimed = *jti;
-            match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+            match s.replay.offer(jti, now, until) {
                 dpop::Replay::Recorded => true,
                 dpop::Replay::Seen | dpop::Replay::Full => {
                     *seen = true;
@@ -689,7 +717,8 @@ unsafe fn handle_authorize(
             },
             &device_auth::Request {
                 method: req.method,
-                uri: req.uri,
+                origin: origin.as_bytes(),
+                path: req.path,
                 now,
             },
             &POLICY,
@@ -729,6 +758,7 @@ unsafe fn handle_authorize(
     e.flow = Flow::AuthzClaim;
     e.caller = *caller;
     e.auth_time = now;
+    e.replayable_until = admitted.replayable_until;
     copy_field(&mut e.sub, &mut e.sub_len, sub);
     copy_field(&mut e.device_id, &mut e.device_id_len, device_id);
     e.jkt = admitted.thumbprint;
@@ -782,7 +812,7 @@ unsafe fn claim_proof(s: &ModuleState, sys: &SyscallTable, corr: u32, e: &Pendin
         corr,
         STATE_CLIENT,
         &e.replay_key[..usize::from(e.replay_key_len)],
-        e.auth_time + PROOF_WINDOW_SECS,
+        e.replayable_until,
     );
     let mut frame = [0u8; 512];
     state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)

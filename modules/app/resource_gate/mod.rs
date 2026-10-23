@@ -14,8 +14,11 @@
 //! 2. The DPoP proof's signature verifies under the key its own header
 //!    carries — not under the issuer key, and not under an algorithm the
 //!    header names.
-//! 3. `typ`, the `htm`/`htu` binding and `iat` freshness hold, and the proof
-//!    has not been seen before (`dpop::check_proof` and `dpop::ReplayWindow`).
+//! 3. `typ`, the `htm`/`htu` binding to this request, the `ath` binding to
+//!    the presented token and `iat` freshness hold, and the proof has not
+//!    been seen before (`dpop::check_proof` and `dpop::ReplayWindow`). The
+//!    `htu` a proof must name is the gate's declared `origin` followed by
+//!    the request's path.
 //! 4. The proof key's thumbprint equals the token's `cnf.jkt`
 //!    (`jwk::thumbprint_from_canonical`). Steps 2 and 3 prove the presenter
 //!    holds *a* key; this is what proves it is *the* key the token was issued
@@ -122,10 +125,6 @@ const MAX_PUBKEY_LEN: usize = 65;
 const CLOCK_SKEW_SECS: u64 = 60;
 /// Freshness window (seconds) for a DPoP proof's `iat`.
 const PROOF_MAX_AGE_SECS: u64 = 300;
-/// Alias tying the replay window to the freshness policy: they are one
-/// number, and remembering a proof for less than its window leaves a
-/// replayable gap.
-const PROOF_WINDOW_SECS: u64 = PROOF_MAX_AGE_SECS;
 /// Decoded JOSE segment ceiling. A token or proof whose header or payload
 /// exceeds it fails closed rather than being parsed from a truncated copy.
 const MAX_SEGMENT: usize = 1024;
@@ -233,6 +232,10 @@ struct ModuleState {
     max_auth_age: u32,
     /// Proof identifiers already spent.
     replay: dpop::ReplayWindow<REPLAY_DEPTH>,
+    /// This gate's public origin, from the `origin` param: the
+    /// `scheme://authority` clients reach it at, which a proof's `htu`
+    /// names ahead of the request path.
+    origin: dpop::Origin,
 
     // Metrics (names mirror manifest [observability])
     gate_admitted: u32,
@@ -319,6 +322,13 @@ define_params! {
             s.max_auth_age = u32::from_le_bytes([*d, *d.add(1), *d.add(2), *d.add(3)]);
         }
     };
+
+    // This gate's public origin, `scheme://authority` — what a DPoP proof's
+    // `htu` names ahead of the request path. Declared, never defaulted: an
+    // absent or malformed origin refuses at construction.
+    3, origin, str, 0 => |s, d, len| {
+        s.origin.set(core::slice::from_raw_parts(d, len));
+    };
 }
 
 #[no_mangle]
@@ -387,7 +397,17 @@ pub extern "C" fn module_new(
 
         s.min_level = AssuranceLevel::Aal1;
         s.max_auth_age = 0;
+        s.origin = dpop::Origin::empty();
         parse_tlv(s, params, params_len);
+
+        // The origin must be DECLARED. A proof's `htu` is compared with the
+        // URI clients reach this gate at, and only the deployment knows it:
+        // the request's own `Host` is the client's to write.
+        if s.origin.declared().is_none() {
+            let why = b"[gate] refusing to construct: origin undeclared or malformed (origin: scheme://host[:port])";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -1;
+        }
 
         dev_log(sys, 3, b"[gate] init".as_ptr(), 11);
         0
@@ -505,7 +525,8 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     };
     let (id, credit) = (req.id, req.resp_credit);
     let mut proof_id = [0u8; 32];
-    match admit(s, sys, at, &mut proof_id) {
+    let mut proof_until = 0u64;
+    match admit(s, sys, at, &mut proof_id, &mut proof_until) {
         Ok(subject_len) => {
             // `subject` lives in `s.out`'s tail, disjoint from the response
             // this writes into its head.
@@ -518,7 +539,15 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
                 // a proof whose freshness nothing established, and letting
                 // the ledger's absence admit would make losing the ledger a
                 // way to replay.
-                claim_and_pend(s, sys, &id, credit, &subject[..subject_len], &proof_id);
+                claim_and_pend(
+                    s,
+                    sys,
+                    &id,
+                    credit,
+                    &subject[..subject_len],
+                    &proof_id,
+                    proof_until,
+                );
             } else {
                 s.gate_admitted = s.gate_admitted.saturating_add(1);
                 respond(s, sys, &id, credit, 200, &subject[..subject_len]);
@@ -550,6 +579,7 @@ unsafe fn admit(
     sys: &SyscallTable,
     at: usize,
     proof_id: &mut [u8; 32],
+    proof_until: &mut u64,
 ) -> Result<usize, Refusal> {
     if s.keyset.is_empty() {
         return Err(Refusal::NoKey);
@@ -565,8 +595,12 @@ unsafe fn admit(
     let hdr_len = req.headers.len().min(header_buf.len());
     header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
     let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
-    let path_len = req.target.len().min(target_buf.len());
-    target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
+    let path_len = req.target.len();
+    if path_len > target_buf.len() {
+        // A path the proof could only be compared with in part.
+        return Err(Refusal::Proof);
+    }
+    target_buf[..path_len].copy_from_slice(req.target);
     let mut token = [0u8; MAX_SEGMENT];
     let mut proof = [0u8; MAX_SEGMENT];
     let headers = &header_buf[..hdr_len];
@@ -620,10 +654,12 @@ unsafe fn admit(
     // `false`; the counters below keep them apart for an operator,
     // since "somebody replayed a proof" and "the window is saturated"
     // are different problems.
-    let mut replay = |jti: &[u8; 32]| {
+    let origin = s.origin;
+    let mut replay = |jti: &[u8; 32], until: u64| {
         // Kept for the durable claim, when the ledger lane is wired.
         *proof_id = *jti;
-        match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+        *proof_until = until;
+        match s.replay.offer(jti, now, until) {
             dpop::Replay::Recorded => true,
             dpop::Replay::Seen => false,
             dpop::Replay::Full => false,
@@ -641,7 +677,8 @@ unsafe fn admit(
         },
         &device_auth::Request {
             method: method_name(method),
-            uri: &target_buf[..path_len],
+            origin: origin.as_bytes(),
+            path: &target_buf[..path_len],
             now,
         },
         &POLICY,
@@ -821,6 +858,7 @@ unsafe fn claim_and_pend(
     credit: u32,
     subject: &[u8],
     proof_id: &[u8; 32],
+    proof_until: u64,
 ) {
     let Some(index) = s.pending.iter().position(|p| !p.live) else {
         // Full is a refusal, not a queue: unbounded parked admissions is
@@ -838,20 +876,14 @@ unsafe fn claim_and_pend(
         respond(s, sys, id, credit, 503, b"state_unavailable");
         return;
     };
-    let obs = dev_trusted_unix(sys);
-    let Some(now) = time_policy::now_for(time_policy::Decision::CredentialWindow, &obs) else {
-        s.gate_state_unavailable = s.gate_state_unavailable.saturating_add(1);
-        respond(s, sys, id, credit, 503, b"state_unavailable");
-        return;
-    };
-
     let state_corr = s.next_corr;
     s.next_corr = s.next_corr.wrapping_add(1).max(1);
     let request = state_wire::claim_replay(
         state_corr,
         STATE_CLIENT,
         &replay_key[..replay_key_len],
-        now + PROOF_WINDOW_SECS,
+        // Held until the proof is stale, and not a second less.
+        proof_until,
     );
     let mut frame = [0u8; 512];
     let sent = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)

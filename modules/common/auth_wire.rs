@@ -450,14 +450,16 @@ pub mod request_type {
 /// [`MSG_ADMIT_REQ`].
 ///
 /// ```text
-/// [method f8][uri f16]
+/// [method f8][path f16]
 /// [credential f16][proof f16]
 /// [otp f8]
 /// ```
 ///
-/// `method` and `uri` are the request the DPoP proof must be bound to, and
+/// `method` and `path` are the request the DPoP proof must be bound to, and
 /// they travel because the proof's binding is checked against the request
-/// that actually arrived — not one the admitter assumes.
+/// that actually arrived — not one the admitter assumes. `path` is the
+/// request's path in origin form; the admitter's own declared `origin`
+/// completes it into the target URI the proof's `htu` must name.
 ///
 /// **Nothing here names a subject, an audience or a key binding.** That is
 /// why this message exists: admission derives them from the credential, and
@@ -465,7 +467,7 @@ pub mod request_type {
 /// permission for.
 pub struct AdmitRequest<'a> {
     pub method: &'a [u8],
-    pub uri: &'a [u8],
+    pub path: &'a [u8],
     pub credential: &'a [u8],
     pub proof: &'a [u8],
     /// A one-time code from the presenter's second factor, or empty.
@@ -485,7 +487,7 @@ impl<'a> AdmitRequest<'a> {
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
         w.field8(self.method)?;
-        w.field16(self.uri)?;
+        w.field16(self.path)?;
         w.field16(self.credential)?;
         w.field16(self.proof)?;
         w.field8(self.otp)?;
@@ -496,7 +498,7 @@ impl<'a> AdmitRequest<'a> {
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
         let method = r.field8()?;
-        let uri = r.field16()?;
+        let path = r.field16()?;
         let credential = r.field16()?;
         let proof = r.field16()?;
         let otp = r.field8()?;
@@ -510,7 +512,7 @@ impl<'a> AdmitRequest<'a> {
         }
         Ok(Self {
             method,
-            uri,
+            path,
             credential,
             proof,
             otp,
@@ -614,7 +616,7 @@ impl<'a> AdmitResponse<'a> {
 /// payload of [`MSG_GRANT_REQ`], the /oauth/token slice.
 ///
 /// ```text
-/// [method f8][uri f16]
+/// [method f8][path f16]
 /// [credential f16][proof f16]
 /// [otp f8]
 /// ```
@@ -634,7 +636,7 @@ impl<'a> AdmitResponse<'a> {
 /// in the handler, not at decode.
 pub struct GrantRequest<'a> {
     pub method: &'a [u8],
-    pub uri: &'a [u8],
+    pub path: &'a [u8],
     pub credential: &'a [u8],
     pub proof: &'a [u8],
     /// A one-time code from the presenter's second factor, or empty. As
@@ -647,7 +649,7 @@ impl<'a> GrantRequest<'a> {
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
         w.field8(self.method)?;
-        w.field16(self.uri)?;
+        w.field16(self.path)?;
         w.field16(self.credential)?;
         w.field16(self.proof)?;
         w.field8(self.otp)?;
@@ -658,13 +660,13 @@ impl<'a> GrantRequest<'a> {
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
         let method = r.field8()?;
-        let uri = r.field16()?;
+        let path = r.field16()?;
         let credential = r.field16()?;
         let proof = r.field16()?;
         let otp = r.field8()?;
         Ok(Self {
             method,
-            uri,
+            path,
             credential,
             proof,
             otp,
@@ -718,7 +720,7 @@ impl<'a> GrantResponse<'a> {
 /// presentation. Payload of [`MSG_AUTHORIZE_REQ`].
 ///
 /// ```text
-/// [method f8][uri f16]
+/// [method f8][path f16]
 /// [credential f16][proof f16]        // the subject's dc+jwt + DPoP
 /// [client_id f8][redirect_uri f16][scope f16][state f16]
 /// [code_challenge f8][nonce f16]     // PKCE S256; nonce may be empty
@@ -730,7 +732,7 @@ impl<'a> GrantResponse<'a> {
 /// verbatim. An empty credential decodes, and is answered with a refusal.
 pub struct AuthorizeRequest<'a> {
     pub method: &'a [u8],
-    pub uri: &'a [u8],
+    pub path: &'a [u8],
     pub credential: &'a [u8],
     pub proof: &'a [u8],
     pub client_id: &'a [u8],
@@ -746,7 +748,7 @@ impl<'a> AuthorizeRequest<'a> {
         let mut payload = [0u8; 4096];
         let mut w = PayloadWriter::new(&mut payload);
         w.field8(self.method)?;
-        w.field16(self.uri)?;
+        w.field16(self.path)?;
         w.field16(self.credential)?;
         w.field16(self.proof)?;
         w.field8(self.client_id)?;
@@ -762,7 +764,7 @@ impl<'a> AuthorizeRequest<'a> {
     pub fn decode(payload: &'a [u8]) -> Result<Self, WireError> {
         let mut r = PayloadReader::new(payload);
         let method = r.field8()?;
-        let uri = r.field16()?;
+        let path = r.field16()?;
         let credential = r.field16()?;
         let proof = r.field16()?;
         let client_id = r.field8()?;
@@ -773,7 +775,7 @@ impl<'a> AuthorizeRequest<'a> {
         let nonce = r.field16()?;
         Ok(Self {
             method,
-            uri,
+            path,
             credential,
             proof,
             client_id,

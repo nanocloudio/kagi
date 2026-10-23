@@ -137,13 +137,12 @@ const MAX_REQUEST: usize = 4096 + auth_wire::ENVELOPE;
 /// This module's client id on the ledger's shared reply port.
 const STATE_CLIENT: u8 = 6;
 
-/// How long a DPoP proof stays fresh, and therefore how long its `jti` must
-/// be remembered.
+/// How long a DPoP proof stays fresh.
 ///
-/// One constant for both, because they are one number: remembering a proof
-/// for less than its freshness window leaves a replayable gap, and
-/// remembering it for longer wastes a slot on a proof `check_proof` would
-/// refuse anyway.
+/// A proof's `jti` is remembered for exactly as long as `check_proof` would
+/// still accept it — until `iat` plus this window (`replayable_until`), which
+/// `device_auth` hands the replay record — so the record neither leaves a
+/// replayable gap nor holds a slot for a proof that is already refused.
 const PROOF_WINDOW_SECS: u64 = 300;
 
 /// The `Sha256Fn` shape the fragments take, over the SDK's hasher.
@@ -286,6 +285,10 @@ struct ModuleState {
 
     /// DPoP identifiers already spent.
     replay: dpop::ReplayWindow<128>,
+    /// This authority's public origin, from the `origin` param: the
+    /// `scheme://authority` presenters reach it at, which a proof's `htu`
+    /// names ahead of the request path the caller forwards.
+    origin: dpop::Origin,
 
     pending: [Pending; MAX_IN_FLIGHT],
 
@@ -352,6 +355,14 @@ define_params! {
     5, suite, u32, 2 => |s, d, len| {
         if len >= 1 { s.grant_suite = u16::from(*d); }
     };
+
+    // The public origin, `scheme://authority`, of the endpoint presenters
+    // reach this authority through — what a DPoP proof's `htu` names ahead
+    // of the forwarded path. Declared, never defaulted: an absent or
+    // malformed origin refuses at construction.
+    6, origin, str, 0 => |s, d, len| {
+        s.origin.set(core::slice::from_raw_parts(d, len));
+    };
 }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
@@ -401,10 +412,20 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
-        // Grant-mode policy (iss/aud/scope/ttl/suite). Applies defaults even
-        // when the graph passes none, so `grant_suite` is Ed25519 rather
-        // than the 0 an uninitialised field would hold.
+        // Grant-mode policy (iss/aud/scope/ttl/suite) and the origin.
+        // Applies defaults even when the graph passes none, so `grant_suite`
+        // is Ed25519 rather than the 0 an uninitialised field would hold.
+        s.origin = dpop::Origin::empty();
         parse_tlv(s, params, params_len);
+
+        // The origin must be DECLARED. A proof's `htu` is compared with the
+        // URI presenters reach this authority at, and only the deployment
+        // knows it.
+        if s.origin.declared().is_none() {
+            let why = b"[admit] refusing to construct: origin undeclared or malformed (origin: scheme://host[:port])";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -1;
+        }
 
         s.in_requests = in_chan;
         s.out_replies = out_chan;
@@ -727,7 +748,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
                 &Ask {
                     caller: id,
                     method: g.method,
-                    uri: g.uri,
+                    path: g.path,
                     credential: g.credential,
                     proof: g.proof,
                     otp: g.otp,
@@ -743,7 +764,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
                 &Ask {
                     caller: id,
                     method: req.method,
-                    uri: req.uri,
+                    path: req.path,
                     credential: req.credential,
                     proof: req.proof,
                     otp: req.otp,
@@ -772,7 +793,7 @@ const MAX_OTP: usize = 8;
 struct Ask<'a> {
     caller: ExchangeId,
     method: &'a [u8],
-    uri: &'a [u8],
+    path: &'a [u8],
     credential: &'a [u8],
     proof: &'a [u8],
     otp: &'a [u8],
@@ -788,7 +809,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
     let Ask {
         caller,
         method,
-        uri,
+        path,
         credential,
         proof,
         otp,
@@ -852,12 +873,13 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
         // different operator problems.
         let seen = &mut replayed;
         let claimed = &mut proof_id;
-        let mut offer = |jti: &[u8; 32]| {
+        let origin = s.origin;
+        let mut offer = |jti: &[u8; 32], until: u64| {
             // Kept for the durable claim below. The local window answers
             // first because it is free and catches a replay inside this
             // process immediately; the ledger answers for every process.
             *claimed = *jti;
-            match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+            match s.replay.offer(jti, now, until) {
                 dpop::Replay::Recorded => true,
                 dpop::Replay::Seen | dpop::Replay::Full => {
                     *seen = true;
@@ -872,7 +894,12 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
                 public: &pubkey[..pubkey_len],
             },
             &device_auth::Presentation { credential, proof },
-            &device_auth::Request { method, uri, now },
+            &device_auth::Request {
+                method,
+                origin: origin.as_bytes(),
+                path,
+                now,
+            },
             &POLICY,
             &mut claims_buf,
             &mut offer,
@@ -984,7 +1011,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, ask: &Ask<'_>) {
         state_corr,
         STATE_CLIENT,
         &replay_key[..replay_key_len],
-        now + PROOF_WINDOW_SECS,
+        admitted.replayable_until,
     );
     let mut frame = [0u8; 512];
     let Ok(n) = state_wire::encode_request(&mut frame, state_wire::MSG_STATE_PUT_ABS, &request)

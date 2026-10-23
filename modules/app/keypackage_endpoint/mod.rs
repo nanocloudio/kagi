@@ -43,6 +43,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
@@ -173,13 +174,12 @@ impl Pool {
     }
 }
 
-/// How long a DPoP proof stays fresh, and therefore how long its `jti`
-/// must be remembered.
+/// How long a DPoP proof stays fresh.
 ///
-/// One constant for both, because they are one number: remembering a proof
-/// for less than its freshness window leaves a replayable gap, and
-/// remembering it for longer wastes a slot on a proof `check_proof` would
-/// refuse anyway.
+/// A proof's `jti` is remembered for exactly as long as `check_proof` would
+/// still accept it — until `iat` plus this window (`replayable_until`), which
+/// `device_auth` hands the replay record — so the record neither leaves a
+/// replayable gap nor holds a slot for a proof that is already refused.
 const PROOF_WINDOW_SECS: u64 = 300;
 
 #[repr(C)]
@@ -207,6 +207,10 @@ struct ModuleState {
     /// instead, because there a replay at another replica reaches the same
     /// state.
     replay: dpop::ReplayWindow<128>,
+    /// This listener's public origin, from the `origin` param: the
+    /// `scheme://authority` devices reach it at, which a proof's `htu`
+    /// names ahead of the request path.
+    origin: dpop::Origin,
 
     keypkg_unauthenticated: u32,
     keypkg_wrong_device: u32,
@@ -235,6 +239,17 @@ struct ModuleState {
     out: [u8; abi::CHANNEL_BUFFER_SIZE],
 }
 
+define_params! {
+    ModuleState;
+
+    // This listener's public origin, `scheme://authority` — what a DPoP
+    // proof's `htu` names ahead of the request path. Declared, never
+    // defaulted: an absent or malformed origin refuses at construction.
+    1, origin, str, 0 => |s, d, len| {
+        s.origin.set(core::slice::from_raw_parts(d, len));
+    };
+}
+
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
@@ -245,14 +260,19 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "fluxor module ABI entry point: the runtime owns these pointers \
+              and the signature is fixed by the contract"
+)]
 #[no_mangle]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -274,6 +294,16 @@ pub extern "C" fn module_new(
         s.in_verify_key = dev_channel_port(sys, 0, 1);
         s.keyset = verify_keyset::Keyset::new();
         s.replay = dpop::ReplayWindow::new();
+        s.origin = dpop::Origin::empty();
+        parse_tlv(s, params, params_len);
+        // The origin must be DECLARED. A proof's `htu` is compared with the
+        // URI devices reach this listener at, and only the deployment knows
+        // it: the request's own `Host` is the client's to write.
+        if s.origin.declared().is_none() {
+            let why = b"[keypkg] refusing to construct: origin undeclared or malformed (origin: scheme://host[:port])";
+            dev_log(sys, 1, why.as_ptr(), why.len());
+            return -1;
+        }
         s.keypkg_unauthenticated = 0;
         s.keypkg_wrong_device = 0;
         s.out_responses = out_chan;
@@ -440,10 +470,6 @@ unsafe fn authenticate(
         );
         return None;
     }
-    let mut uri = [0u8; MAX_ID];
-    let uri_len = path.len().min(MAX_ID);
-    uri[..uri_len].copy_from_slice(&path[..uri_len]);
-
     let mut credential = [0u8; device_auth::MAX_SEGMENT];
     let mut proof = [0u8; device_auth::MAX_SEGMENT];
     let (credential_len, proof_len) = {
@@ -505,7 +531,8 @@ unsafe fn authenticate(
         // `false`; the counters below keep them apart for an operator,
         // since "somebody replayed a proof" and "the window is saturated"
         // are different problems.
-        let mut replay = |jti: &[u8; 32]| match s.replay.offer(jti, now, now + PROOF_WINDOW_SECS) {
+        let origin = s.origin;
+        let mut replay = |jti: &[u8; 32], until: u64| match s.replay.offer(jti, now, until) {
             dpop::Replay::Recorded => true,
             dpop::Replay::Seen => false,
             dpop::Replay::Full => false,
@@ -522,7 +549,8 @@ unsafe fn authenticate(
             },
             &device_auth::Request {
                 method: b"POST",
-                uri: &uri[..uri_len],
+                origin: origin.as_bytes(),
+                path,
                 now,
             },
             &POLICY,
