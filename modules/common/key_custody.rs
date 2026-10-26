@@ -60,6 +60,10 @@ pub enum KeyRole {
     /// A key encrypting data at rest, where losing it loses the data and
     /// compromising it reads the data — but which authorises nobody.
     DataEncryption,
+    /// The key signing key-custody transfer grants (`transfer_grant.rs`): a
+    /// grant authorises a vault to move live TLS traffic secrets to a
+    /// standby, so a stolen key moves them anywhere. Issuer-grade.
+    TransferGrant,
 }
 
 /// Whether this deployment is production.
@@ -97,7 +101,10 @@ pub const fn required_tier(role: KeyRole, posture: Posture) -> u8 {
         // time anyone runs it is then in production.
         Posture::Development => TIER_SOFTWARE,
         Posture::Production => match role {
-            KeyRole::Issuer | KeyRole::CertificateAuthority | KeyRole::Workload => TIER_PROCESS_HW,
+            KeyRole::Issuer
+            | KeyRole::CertificateAuthority
+            | KeyRole::Workload
+            | KeyRole::TransferGrant => TIER_PROCESS_HW,
             KeyRole::EnrolmentChallenge | KeyRole::DataEncryption => TIER_SOFTWARE,
         },
     }

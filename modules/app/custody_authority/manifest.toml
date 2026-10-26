@@ -1,0 +1,85 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# Where its ledger runs: a grant's single-use state is the ledger's.
+hardware_targets = ["bcm2712", "linux"]
+
+# custody_authority — the continuity authority a Fluxor
+# TRANSPORT_CONTINUITY provider asks, as a module of the provider's graph
+# (modules/common/custody_authority_service.rs). Custody checks (0xC4) are
+# decided here and answered (0xC5) once the transfer's KTGR is signed and
+# its single-use state written CONSUMED in the ledger; token checks (0xC2)
+# are relayed to Clustor's session directory and its verdicts (0xC3) back.
+
+# The provider's `auth_req`: `[type][len u16][payload]` frames, custody and
+# token checks.
+[[ports]]
+name = "auth_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+# The TRANSFER_GRANT signing key (`MSG_KEY_ADD`, a vault label).
+[[ports]]
+name = "signing_key"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The security-state ledger's answers (`kagi/transfer-grants/`).
+[[ports]]
+name = "ledger_in"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# Clustor's session directory `replies`: token verdicts (0xC3); anything
+# else on the shared port is skipped. Optional: unwired, token checks are
+# not relayed and the provider's own wait refuses them.
+[[ports]]
+name = "token_in"
+index = 3
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# The provider's `auth_rsp`: custody verdicts (0xC5) and relayed token
+# verdicts (0xC3).
+[[ports]]
+name = "auth_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+# To the security-state ledger.
+[[ports]]
+name = "ledger_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# To Clustor's session directory `requests`: relayed token checks (0xC2).
+[[ports]]
+name = "token_out"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# Every KTGR granted, signed (audit), as `0x4B [record]`. Optional.
+[[ports]]
+name = "grant_out"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[observability]
+metrics = ["custody_granted", "custody_refused", "custody_replayed", "tokens_relayed"]

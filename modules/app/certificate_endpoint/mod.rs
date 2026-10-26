@@ -12,6 +12,17 @@
 //! already at `LINUX_NET_MAX_INBOUND`, the provider's eight producer lanes,
 //! so a ninth `http` module there would get no lane and never bind.
 //!
+//! Three classes of identity are issued, by the request's `class`: a
+//! `device` (`tenant` + `device`, the default), a `host` (`host_id`, the
+//! deployment's fixed 16-byte host identity as 32 hex digits) and an
+//! `operator` (`operator_id`, likewise). Which classes this authority mints
+//! is the graph's `issue_classes` parameter, devices alone by default: a
+//! host or operator leaf is what authorises a control act
+//! (`modules/common/control_act.rs`), so minting one is a deployment
+//! decision. Every leaf with a SPIFFE SAN carries `clientAuth` and
+//! `serverAuth`, which is what lets a host present it on either end of a
+//! mutually authenticated control link.
+//!
 //! The SPIFFE identity goes in the `subjectAltName`, not the subject `CN`.
 //! Relying parties authorize on the SAN URI; an identity written only into
 //! the `CN` is a certificate that authorizes nothing.
@@ -128,6 +139,13 @@ struct ModuleState {
     /// has no claim to. Unset = no DNS names at all.
     dns_suffix: [u8; MAX_FIELD],
     dns_suffix_len: u16,
+    /// The identity classes this authority issues, comma-separated
+    /// (`device`, `host`, `operator`); `device` alone when unset. A graph
+    /// parameter: a host identity authorises ownership-changing control acts
+    /// (`control_act.rs`), so which endpoint may mint one is the
+    /// deployment's decision, never a caller's.
+    issue_classes: [u8; MAX_FIELD],
+    issue_classes_len: u16,
     /// The vault label of the CA key, when the GRAPH names it rather than an
     /// operator pushing a keyset record on `signing_key`. A label is not a
     /// secret — it names a key the vault generates and never exports — so it
@@ -210,6 +228,19 @@ define_params! {
         s.label_suite = p_u16(d, len, 0, auth_wire::suite::ES256);
     };
 
+    6, issue_classes, str, 0 => |s, d, len| {
+        let n = if len > MAX_FIELD { MAX_FIELD } else { len };
+        let mut i = 0usize;
+        while i < n {
+            s.issue_classes[i] = *d.add(i);
+            i += 1;
+        }
+        #[expect(clippy::cast_possible_truncation, reason = "clamped to MAX_FIELD above")]
+        {
+            s.issue_classes_len = n as u16;
+        }
+    };
+
     2, trust_domain, str, 0 => |s, d, len| {
         let n = if len > MAX_FIELD { MAX_FIELD } else { len };
         let mut i = 0usize;
@@ -278,6 +309,8 @@ pub extern "C" fn module_new(
         s.trust_domain_len = 0;
         s.dns_suffix = [0; MAX_FIELD];
         s.dns_suffix_len = 0;
+        s.issue_classes = [0; MAX_FIELD];
+        s.issue_classes_len = 0;
         s.key_label = [0; auth_wire::MAX_KEY_LABEL];
         s.key_label_len = 0;
         s.label_suite = auth_wire::suite::ES256;
@@ -533,14 +566,26 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let mut subject = [0u8; MAX_FIELD];
     let mut tenant = [0u8; MAX_FIELD];
     let mut device = [0u8; MAX_FIELD];
+    let mut class_name = [0u8; MAX_FIELD];
+    let mut fixed_id = [0u8; MAX_FIELD];
     let mut ed25519_key = [0u8; 32];
     let mut p256_point = [0u8; 65];
     let mut dns = [0u8; MAX_DNS];
-    let (subject_len, tenant_len, device_len, key_bytes, dns_len) = {
+    let (subject_len, tenant_len, device_len, key_bytes, dns_len, class_len, fixed_len) = {
         let dns_len = json_string(body, b"dns", &mut dns);
         let subject_len = json_string(body, b"subject", &mut subject);
         let tenant_len = json_string(body, b"tenant", &mut tenant);
         let device_len = json_string(body, b"device", &mut device);
+        // Which class of identity is asked for. Absent means a device, which
+        // is what every caller before this field existed asked for. A host
+        // names its `host_id`, an operator its `operator_id`: 32 lowercase
+        // hex digits, the deployment's fixed 16-byte identity for it.
+        let class_len = json_string(body, b"class", &mut class_name);
+        let fixed_len = match &class_name[..class_len] {
+            b"host" => json_string(body, b"host_id", &mut fixed_id),
+            b"operator" => json_string(body, b"operator_id", &mut fixed_id),
+            _ => 0,
+        };
         let mut encoded = [0u8; 192];
         let encoded_len = json_string(body, b"public_key", &mut encoded);
         // The key's own length says which kind it is: 32 bytes is Ed25519, 65
@@ -558,7 +603,15 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
             65 => p256_point.copy_from_slice(&scratch),
             _ => {}
         }
-        (subject_len, tenant_len, device_len, key_bytes, dns_len)
+        (
+            subject_len,
+            tenant_len,
+            device_len,
+            key_bytes,
+            dns_len,
+            class_len,
+            fixed_len,
+        )
     };
     // DNS names, when asked for: each must be a plain hostname ending in the
     // configured suffix. One name outside it refuses the whole request —
@@ -601,7 +654,45 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         }
     };
 
-    if subject_len == 0 || tenant_len == 0 || device_len == 0 {
+    let class = match &class_name[..class_len] {
+        b"" | b"device" => spiffe::Class::Device,
+        b"host" => spiffe::Class::Host,
+        b"operator" => spiffe::Class::Operator,
+        _ => {
+            s.certificate_malformed = s.certificate_malformed.saturating_add(1);
+            respond(
+                s,
+                sys,
+                &id,
+                credit,
+                400,
+                b"application/json",
+                br#"{"error":"invalid_request","error_description":"unknown class"}"#,
+            );
+            return;
+        }
+    };
+    // A class the graph did not admit is refused as a policy decision, not a
+    // malformed request: the request is well formed, this authority just
+    // does not mint that kind of identity.
+    if !class_admitted(&s.issue_classes[..usize::from(s.issue_classes_len)], class) {
+        respond(
+            s,
+            sys,
+            &id,
+            credit,
+            403,
+            b"application/json",
+            br#"{"error":"access_denied","error_description":"class not issued here"}"#,
+        );
+        return;
+    }
+    let well_formed = subject_len != 0
+        && match class {
+            spiffe::Class::Device => tenant_len != 0 && device_len != 0,
+            _ => fixed_len == spiffe::ID_HEX_LEN,
+        };
+    if !well_formed {
         s.certificate_malformed = s.certificate_malformed.saturating_add(1);
         respond(
             s,
@@ -616,16 +707,30 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     }
 
     // The SPIFFE id is composed here from the deployment's trust domain and
-    // the tenant and device the caller named — never taken whole from the
-    // request, because a caller that could write its own SPIFFE id could
-    // write one in somebody else's trust domain.
+    // the tenant and device (or the fixed id) the caller named — never taken
+    // whole from the request, because a caller that could write its own
+    // SPIFFE id could write one in somebody else's trust domain.
     let mut san = [0u8; spiffe::MAX_NAME];
-    let Some(san_len) = spiffe::write_device(
-        &mut san,
-        &s.trust_domain[..usize::from(s.trust_domain_len)],
-        &tenant[..tenant_len],
-        &device[..device_len],
-    ) else {
+    let trust_domain = &s.trust_domain[..usize::from(s.trust_domain_len)];
+    let composed = match class {
+        spiffe::Class::Device => spiffe::write_device(
+            &mut san,
+            trust_domain,
+            &tenant[..tenant_len],
+            &device[..device_len],
+        ),
+        // Written from the parsed id rather than the caller's hex, so the
+        // path is the id's one canonical spelling: a caller writing
+        // uppercase hex gets the lowercase name, or nothing.
+        _ => decode_fixed_id(&fixed_id[..fixed_len]).and_then(|fixed| {
+            if class == spiffe::Class::Host {
+                spiffe::write_host(&mut san, trust_domain, &fixed)
+            } else {
+                spiffe::write_operator(&mut san, trust_domain, &fixed)
+            }
+        }),
+    };
+    let Some(san_len) = composed else {
         s.certificate_malformed = s.certificate_malformed.saturating_add(1);
         respond(
             s,
@@ -1101,6 +1206,34 @@ fn dns_names_allowed(list: &[u8], suffix: &[u8]) -> bool {
             && n.iter()
                 .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
     })
+}
+
+/// Whether `class` is in the graph's `issue_classes` list. An unset list
+/// admits devices alone: the one class every deployment issued before the
+/// list existed, and the one that authorises no control act.
+fn class_admitted(list: &[u8], class: spiffe::Class) -> bool {
+    if list.is_empty() {
+        return class == spiffe::Class::Device;
+    }
+    list.split(|&b| b == b',')
+        .any(|entry| entry.trim_ascii() == class.word())
+}
+
+/// The 16-byte id 32 lowercase hex digits spell, or `None`.
+fn decode_fixed_id(hex: &[u8]) -> Option<[u8; spiffe::ID_LEN]> {
+    if hex.len() != spiffe::ID_HEX_LEN {
+        return None;
+    }
+    let mut out = [0u8; spiffe::ID_LEN];
+    for (slot, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        *slot = (digit(pair[0])? << 4) | digit(pair[1])?;
+    }
+    Some(out)
 }
 
 fn json_string(body: &[u8], key: &[u8], out: &mut [u8]) -> usize {

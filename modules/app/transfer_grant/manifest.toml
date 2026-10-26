@@ -1,0 +1,67 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# Where its ledger runs: the grants' single-use state is the ledger's, so it
+# runs on the runtimes `security_state` does.
+hardware_targets = ["bcm2712", "linux"]
+
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one `transfer_grant::msg::REQUEST` envelope (issue,
+# consume, invalidate) and each answer body one `REPLY` envelope. Callers
+# authenticate with a cert-bound carrier from their host or operator leaf.
+# Layouts: docs/architecture/control-acts.md.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
+# The TRANSFER_GRANT signing key, by vault label.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The certificate authority's public key: the anchor callers' and
+# destinations' leaves chain to.
+[[ports]]
+name = "ca_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The security-state ledger: `kagi/transfer-grants/`.
+[[ports]]
+name = "ledger_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+[[ports]]
+name = "ledger_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# The grant key's public half, as a VERIFY MSG_KEY_ADD, for the vault hosts
+# that check a grant before they wrap.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 512
+max_record = 512
+
+[observability]
+metrics = ["transfer_issued", "transfer_consumed", "transfer_refused", "transfer_invalidated"]

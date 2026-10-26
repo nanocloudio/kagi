@@ -227,6 +227,15 @@ no fs provider there it runs memory-only, and the AES-256-GCM sealing uses the
 SDK's portable code path. It exports the fluxor module ABI and imports only
 the declared host capability surface.
 
+`MSG_SECRET_DERIVE` (`[corr][id f8][context f16]`) answers
+`HMAC-SHA256(secret, "kagi/secret-derive.v1" ‖ context)` for one context
+(`modules/common/secret_derive.rs`), the secret itself never leaving the
+store. A secret several hosts must hold alike is provisioned into each
+host's store once and read only that way: Wormhole's route seed secret
+(`wormhole/route-seed`), from which every route builder derives its route's
+seed secret for `"wh-route-seed.v1" ‖ service ‖ hash_seed_ref`, so the
+directors of a route agree per flow on every host.
+
 ## token_mint
 
 Stateless JWS minting, WCET-bounded at four signs per step. The bound is a

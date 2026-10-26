@@ -413,11 +413,23 @@ pub mod profile {
     pub const ID_TOKEN: u16 = 6;
     /// Storage-key grant and release records.
     pub const STORAGE_GRANT: u16 = 7;
+    /// Signed control acts: provenance for ownership-changing control-plane
+    /// requests (`control_act.rs`, `KCAC`).
+    pub const CONTROL_ACT: u16 = 8;
+    /// Key-custody transfer grants (`transfer_grant.rs`, `KTGR`).
+    pub const TRANSFER_GRANT: u16 = 9;
+    /// Private attachment publications and grants (`attachment_grant.rs`,
+    /// `KATT`).
+    pub const ATTACHMENT_GRANT: u16 = 10;
+    /// Signed `service_dns` projections (`service_dns.rs`, `KSDN`).
+    pub const SERVICE_DNS: u16 = 11;
+    /// Least-privilege operation scopes (`operation_scope.rs`, `KSCP`).
+    pub const OPERATION_SCOPE: u16 = 12;
 
     /// Highest profile this registry defines. Raise it with every profile
     /// added above: a bound that trails the list silently excludes the
     /// newest profile from anything that range-checks one.
-    pub const MAX_ID: u16 = STORAGE_GRANT;
+    pub const MAX_ID: u16 = OPERATION_SCOPE;
 
     /// Short stable token, for an operator-facing log line.
     #[must_use]
@@ -430,6 +442,11 @@ pub mod profile {
             E2EE_CREDENTIAL => b"e2ee-credential",
             ID_TOKEN => b"id-token",
             STORAGE_GRANT => b"storage-grant",
+            CONTROL_ACT => b"control-act",
+            TRANSFER_GRANT => b"transfer-grant",
+            ATTACHMENT_GRANT => b"attachment-grant",
+            SERVICE_DNS => b"service-dns",
+            OPERATION_SCOPE => b"operation-scope",
             _ => b"none",
         }
     }

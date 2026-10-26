@@ -12,6 +12,12 @@ answer, and never sees a key, a signature or a claim it did not ask for.
 | `authcode` | `MSG_AUTHORIZE_REQ` 0x39, `MSG_CODE_EXCHANGE_REQ` 0x3B | `MSG_AUTHORIZE_RESP` 0x3A, `MSG_CODE_EXCHANGE_RESP` 0x3C |
 | `token_mint` | `MSG_MINT_REQ` 0x31 | `MSG_MINT_RESP` 0x32 |
 | `storage_key` | `msg::REQUEST` 0x80 | `msg::REPLY` 0x81 |
+| `control_act_verify` | `control_act::msg::VERIFY_REQ` 0x90 | `VERIFY_RESP` 0x91 |
+| `control_act_mint` | `control_act::msg::MINT_REQ` 0x92 | `MINT_RESP` 0x93 |
+| `transfer_grant` | `transfer_grant::msg::REQUEST` 0x94 | `REPLY` 0x95 |
+| `attachment_authorize` | `attachment_grant::msg::REQUEST` 0x96 | `REPLY` 0x97 |
+| `service_dns_sign` | `service_dns::msg::REQUEST` 0x98 | `REPLY` 0x99 |
+| `scope_mint` | `operation_scope::msg::REQUEST` 0x9A | `REPLY` 0x9B |
 
 Each is a PROVIDER of the workspace exchange contract (fluxor's
 `contracts/exchange.rs`; `docs/architecture/exchange.md` in fluxor): it
@@ -64,8 +70,10 @@ read by the operation, and answered **200 with the operation's own
 `MALFORMED` verdict**. 400 means "this is not a request"; a `MALFORMED`
 verdict means "this request does not say anything I can act on".
 
-Body bounds: `token_verify` 8192 bytes; `token_mint`, `mint_admission` and
-`authcode` 4099 (a 4096-byte payload and its envelope); `storage_key` 2052.
+Body bounds: `token_verify`, `control_act_verify`, `control_act_mint`,
+`transfer_grant` and `attachment_authorize` 8192 bytes; `token_mint`,
+`mint_admission` and `authcode` 4099 (a 4096-byte payload and its
+envelope); `storage_key` 2052.
 
 ## Field encodings
 
@@ -354,6 +362,162 @@ module-private); `key_announce` out[3]. Param: `iss` (1, str).
 `msg::REPLY` 0x81 payload: `[op u8][status u8][refusal u8][audited u8]
 [record f16][bundle f16][extra f16]`. The operations, their bodies and the
 refusal codes are in [storage-key.md](storage-key.md).
+
+## control_act_verify and control_act_mint
+
+The signed control act (`KCAC`) and why it exists are in
+[control-acts.md](control-acts.md); its record layout is in
+`modules/common/control_act.rs`.
+
+`control_act_verify` — ports: `request_in` in[0], `response_out` out[0],
+`verify_key` in[1] (the `CONTROL_ACT` keyset lifecycle). No params.
+
+`control_act_mint` — ports: `request_in` in[0], `response_out` out[0];
+`signing_key` in[1] (the act key, by vault label); `ca_key` in[2] (the
+authority's VERIFY `MSG_KEY_ADD`, the anchor an actor's leaf chains to);
+`key_announce` out[1]; `audit_out` out[2] (one `msg::AUDIT` 0x9E `KCAA`
+entry per decision). Params: `iss` (1), `trust_domain` (2), `audience` (3)
+— all required.
+
+### `VERIFY_REQ` 0x90
+
+| Offset | Field | Encoding |
+|---|---|---|
+| 0 | `record` | f16 — the `KCAC` record |
+| 2+r | `declaration` | f16 — the declaring payload; empty = not checked |
+
+### `VERIFY_RESP` 0x91
+
+A fixed 124 bytes: `[status u8][kind u8][actor class u8][target kind u8]
+[actor 16][tenant 16][service 16][target 16][operation 16]
+[expected epoch u64][record digest 32]`. `status` 0 is OK, otherwise a
+`control_act::Refusal` code; a refusal carries every later field zero (it
+does not decode otherwise). `record digest` is what a Wormhole route record
+stores as `provenance_digest`.
+
+### `MINT_REQ` 0x92
+
+| Offset | Field | Encoding |
+|---|---|---|
+| 0 | `kind` | u8 — `control_act::kind` |
+| 1 | `target_kind` | u8 |
+| 2 | `tenant` | 16 |
+| 18 | `service` | 16 |
+| 34 | `target` | 16 |
+| 50 | `operation` | 16 |
+| 66 | `expected_epoch` | u64 |
+| 74 | `ttl_ms` | u32 — clamped to 600 000 |
+| 78 | `declaration` | 32 — SHA-256 of the declaring payload |
+| 110 | `policy` | 32 |
+| 142 | `carrier` | f16 — the actor's cert-bound identity carrier |
+
+There is no actor field: the actor is the carrier's verified leaf, and over
+mTLS the exchange's verified SVID must be the carrier's key.
+
+### `MINT_RESP` 0x93
+
+`[status u8][record f16]` — the signed record on OK, empty on every refusal.
+
+`control_act::Refusal`: 1 MALFORMED, 2 UNKNOWN_KEY, 3 BAD_SIGNATURE,
+4 EXPIRED, 5 NOT_YET_VALID, 6 WINDOW_INVALID, 7 UNKNOWN_KIND,
+8 ACTOR_NOT_PERMITTED, 9 NO_ISSUER_KEY, 10 NOT_AUTHENTICATED, 11 NO_CLOCK,
+12 DECLARATION_MISMATCH, 13 REPLAYED.
+
+## transfer_grant
+
+Ports: `request_in` in[0], `response_out` out[0]; `signing_key` in[1];
+`ca_key` in[2]; `ledger_in` in[3] / `ledger_out` out[1] (`security_state`,
+`kagi/transfer-grants/`); `key_announce` out[2]. Params: `iss` (1),
+`trust_domain` (2), `audience` (3), `allow_possession` (4, u8, default 0),
+`min_tier` (5, u8, default 1 = `PROCESS_HW`), `posture` (6, required:
+`development` | `production`).
+
+`REQUEST` 0x94 payload: `[op u8][body]`; `REPLY` 0x95 payload: `[op u8]
+[status u8][record f16][generation u64]` — the signed `KTGR` on an issue,
+empty otherwise and on every refusal; `generation` the recovery generation
+the operation read or wrote.
+
+| op | Body |
+|---|---|
+| 1 ISSUE | `[service 16][flow 16][session 16][source host 16][destination host 16][destination anchor 8][target epoch u64][traffic epoch u32][algorithm u16][use u8][direction u8][ttl ms u32][recipient public f8][evidence f16][destination leaf f16][carrier f16]` |
+| 2 CONSUME | `[grant f16][carrier f16]` |
+| 3 INVALIDATE | `[recovery generation u64][carrier f16]` — an operator's |
+
+`evidence` is `ATTEST_KEY` output (`FXHA` record ‖ signature) signed by the
+destination leaf's key over `transfer_grant::attestation_challenge`.
+`transfer_grant::Refusal`: 1 MALFORMED, 2 NOT_AUTHENTICATED, 3 NOT_SOURCE,
+4 DESTINATION_MISMATCH, 5 ATTESTATION_REQUIRED, 6 ATTESTATION_INSUFFICIENT,
+7 ATTESTATION_INVALID, 8 WRONG_RECIPIENT, 9 EXPIRED, 10 REPLAYED,
+11 INVALIDATED, 12 UNKNOWN_GRANT, 13 BAD_SIGNATURE, 14 UNKNOWN_KEY,
+15 NO_ISSUER_KEY, 16 LEDGER_UNAVAILABLE, 17 CONFLICT, 18 NO_CLOCK, 19 BUSY,
+20 NOT_OPERATOR, 21 GENERATION_NOT_ADVANCED, 22 WINDOW_INVALID,
+23 NOT_THIS_TRANSFER (a vault host's `Record::authorize_wrap`, never on
+this wire).
+
+## attachment_authorize
+
+Ports: `request_in` in[0], `response_out` out[0]; `signing_key` in[1];
+`ca_key` in[2]; `ledger_in` in[3] / `ledger_out` out[1] (`security_state`,
+`kagi/attachments/`); `federation_key` in[4] (pinned federated trust
+domains); `key_announce` out[2]. Params: `iss` (1), `trust_domain` (2,
+lowercase), `audience` (3), `posture` (6, required).
+
+`REQUEST` 0x96 payload: `[op u8][body]`; `REPLY` 0x97 payload: `[op u8]
+[status u8][record f16][generation u64]` — the signed `KATT` publication or
+grant, empty on a revocation and on every refusal.
+
+| op | Body |
+|---|---|
+| 1 PUBLISH | `[producer tenant 16][service 16][direction u8][disclosure u8][connections u32][bytes/s u32][flows u32][mirror credits u32][ttl ms u64][tenant count u8][tenants 16×][domain count u8][domain names f8×][carrier f16]` |
+| 2 REQUEST | `[publication f16][producer tenant 16][service 16][consumer tenant 16][attachment generation u64][connections u32][bytes/s u32][flows u32][mirror credits u32][ttl ms u64][carrier f16]` |
+| 3 REVOKE | `[producer tenant 16][service 16][revocation generation u64][carrier f16]` |
+
+`attachment_grant::Refusal`: 1 MALFORMED, 2 NOT_AUTHENTICATED, 3 WILDCARD,
+4 TENANT_NOT_ACCEPTED, 5 DOMAIN_NOT_ACCEPTED, 6 ACTOR_NOT_PERMITTED,
+7 WRONG_SERVICE, 8 QUOTA_EXCEEDED, 9 EXPIRED, 10 REVOKED, 11 BAD_SIGNATURE,
+12 UNKNOWN_KEY, 13 NO_ISSUER_KEY, 14 LEDGER_UNAVAILABLE, 15 CONFLICT,
+16 NO_CLOCK, 17 BUSY, 18 GENERATION_NOT_ADVANCED, 19 WINDOW_INVALID,
+20 FOREIGN_PRODUCER, 21 WRONG_KIND (a broker's `Record::verify_as`, never
+on this wire).
+
+## service_dns_sign
+
+Ports: `request_in` in[0], `response_out` out[0]; `signing_key` in[1]
+(the `SERVICE_DNS` key, by label); `ca_key` in[2]; `key_announce` out[1].
+Params: `iss` (1), `trust_domain` (2), `audience` (3), `posture` (6,
+required: `development` | `production`), `publisher_1` … `publisher_8`
+(7–14): `service:<id>:<service>` or `host:<id>:<service>`, each 32
+lowercase hex digits. A publisher param that does not parse refuses to
+construct; a graph pinning none signs for nobody.
+
+`REQUEST` 0x98 payload: `[projection f16][carrier f16]` — the projection is
+Wormhole's unsigned 224-byte `region_ctl.v1` 0xB6 record, its trailing 32
+bytes zero. `REPLY` 0x99 payload: `[status u8][record f16]` — the signed
+`KSDN` record (`[KSDN][version][reserved 3][projection 224][issuer f8][kid
+f8][suite u16][signature f16]`), empty on every refusal.
+
+`service_dns::Refusal`: 1 MALFORMED, 2 NOT_AUTHENTICATED, 3 NOT_PUBLISHER,
+4 WINDOW_INVALID, 5 EXPIRED, 6 NOT_YET_VALID, 7 BAD_SIGNATURE,
+8 UNKNOWN_KEY, 9 NO_ISSUER_KEY, 10 NO_CLOCK, 11 REPLAYED.
+
+## scope_mint
+
+Ports: `request_in` in[0], `response_out` out[0]; `signing_key` in[1]
+(the `OPERATION_SCOPE` key, by label); `ca_key` in[2]; `key_announce`
+out[1]. Params: `iss` (1), `trust_domain` (2), `audience` (3), `posture`
+(6, required).
+
+`REQUEST` 0x9A payload: `[kind u8][level u8][operations u32][region u32]
+[cell u32][locality u32][recovery generation u64][tenant 16][service 16]
+[object 16][ttl ms u32][policy digest 32][carrier f16]`. `REPLY` 0x9B
+payload: `[status u8][record f16]` — the signed `KSCP` scope, empty on every
+refusal. The actor is the carrier's; the ttl is clamped to an hour.
+
+`operation_scope::Refusal`: 1 MALFORMED, 2 NOT_AUTHENTICATED,
+3 UNKNOWN_KIND, 4 NOT_PERMITTED, 5 LEVEL_INVALID, 6 WINDOW_INVALID,
+7 EXPIRED, 8 NOT_YET_VALID, 9 BAD_SIGNATURE, 10 UNKNOWN_KEY,
+11 NO_ISSUER_KEY, 12 NO_CLOCK, 13 REPLAYED, 14 OUT_OF_SCOPE (a relying
+party's `Scope::authorizes`, never on this wire).
 
 ## Requesters inside kagi
 

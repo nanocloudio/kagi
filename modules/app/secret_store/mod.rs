@@ -48,6 +48,8 @@ include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
 mod auth_wire;
 #[path = "../../common/chan.rs"]
 mod chan;
+#[path = "../../common/secret_derive.rs"]
+mod secret_derive;
 #[path = "../../common/secret_record.rs"]
 mod secret_record;
 
@@ -387,6 +389,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, msg_type: u8, 
         auth_wire::MSG_SECRET_PUT => handle_put(s, sys, corr, plen),
         auth_wire::MSG_SECRET_LIST => handle_list(s, sys, corr, plen),
         auth_wire::MSG_SECRET_ROTATE => handle_rotate(s, sys, corr, plen),
+        auth_wire::MSG_SECRET_DERIVE => handle_derive(s, sys, corr, plen),
         _ => {}
     }
 }
@@ -452,6 +455,73 @@ unsafe fn handle_get(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: u
             v[..n].copy_from_slice(&value[..n]);
             reply_value(s, sys, corr, auth_wire::ST_OK, id, &ver[..ver_len], &v[..n]);
         }
+        None => {
+            s.decrypt_failures = s.decrypt_failures.saturating_add(1);
+            reply_value(s, sys, corr, auth_wire::ST_DECRYPT_FAILED, id, &[], &[]);
+        }
+    }
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hmac(HashAlg::Sha256, key, message, &mut out);
+    out
+}
+
+/// `MSG_SECRET_DERIVE` = `[corr u32][id f8][context f16]` →
+/// `MSG_SECRET_VALUE` whose value is the secret's derivation for the
+/// context (`secret_derive.rs`); the secret itself is never returned.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn handle_derive(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: usize) {
+    s.get_ops = s.get_ops.saturating_add(1);
+    let mut r = PayloadReader::new(&s.msg_buf[..plen]);
+    let _ = r.u32();
+    let (Ok(id_field), Ok(context)) = (r.field8(), r.field16()) else {
+        reply_value(s, sys, corr, auth_wire::ST_MALFORMED, &[], &[], &[]);
+        return;
+    };
+    if id_field.len() > MAX_ID_LEN || context.len() > secret_derive::CONTEXT_MAX {
+        reply_value(s, sys, corr, auth_wire::ST_MALFORMED, &[], &[], &[]);
+        return;
+    }
+    let mut id = [0u8; MAX_ID_LEN];
+    id[..id_field.len()].copy_from_slice(id_field);
+    let id = &id[..id_field.len()];
+    let mut ctx = [0u8; secret_derive::CONTEXT_MAX];
+    ctx[..context.len()].copy_from_slice(context);
+    let ctx = &ctx[..context.len()];
+    let Some(idx) = find_record(s, id) else {
+        reply_value(s, sys, corr, auth_wire::ST_NOT_FOUND, id, &[], &[]);
+        return;
+    };
+    if !s.has_kek {
+        reply_value(s, sys, corr, auth_wire::ST_NO_KEY, id, &[], &[]);
+        return;
+    }
+    let mut sealed = [0u8; SLOT_LEN];
+    let sealed_len = usize::from(s.records[idx].len);
+    sealed[..sealed_len].copy_from_slice(&s.records[idx].data[..sealed_len]);
+    let mut ver = [0u8; MAX_VER_LEN];
+    let mut ver_len = 0usize;
+    let mut value = [0u8; MAX_VALUE_LEN];
+    let opened = match secret_record::RecordView::parse(&sealed[..sealed_len]) {
+        Ok(view) => {
+            ver_len = view.version_id.len().min(MAX_VER_LEN);
+            ver[..ver_len].copy_from_slice(&view.version_id[..ver_len]);
+            view.open_into(aead_open, &s.kek, &mut value).ok()
+        }
+        Err(_) => None,
+    };
+    let derived = opened.and_then(|n| secret_derive::derive(hmac_sha256, &value[..n], ctx));
+    // The opened secret leaves no copy behind.
+    value.fill(0);
+    match derived {
+        Some(d) => reply_value(s, sys, corr, auth_wire::ST_OK, id, &ver[..ver_len], &d),
         None => {
             s.decrypt_failures = s.decrypt_failures.saturating_add(1);
             reply_value(s, sys, corr, auth_wire::ST_DECRYPT_FAILED, id, &[], &[]);

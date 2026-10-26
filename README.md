@@ -71,8 +71,13 @@ The fragments are `b64`, `jwk`, `jose`, `ids`, `pkce`, `dpop`,
 - **Device certificates** — the durable enrollment anchor, presented only
   to `/token`.
 - **SPIFFE identities** — a P-256 mTLS leaf and the cert-bound JWT-SVID
-  that pairs with it. See
+  that pairs with it, for devices, workloads, services, and control-plane
+  hosts and operators. See
   [docs/identity-provisioning.md](docs/identity-provisioning.md).
+- **Control-plane authority** — signed control acts, key-custody transfer
+  grants and private attachment grants, all verifiable offline. Kagi keeps
+  only what makes them single-use or revocable. See
+  [docs/architecture/control-acts.md](docs/architecture/control-acts.md).
 - **Workload tokens** — audience-scoped, no proof-of-possession binding,
   for service accounts.
 - **Wrapped data keys** — kagi holds the key-encryption key and hands
@@ -126,10 +131,33 @@ CA deployment.
 - **e2ee_state_endpoint** — endpoint state that can only move forward, so
   a restore or a failover cannot reuse a generation.
 - **certificate_endpoint** — an X.509 leaf for a subject key, in the PKI
-  deployment.
+  deployment: a device, or — when the graph admits the class — a host or
+  operator identity.
+- **control_act_mint** / **control_act_verify** — sign a control act
+  (`KCAC`) for an authenticated host, operator or workload, and verify one
+  offline; Wormhole stores its digest as a route record's provenance.
+- **transfer_grant** — short, single-use key-custody transfer grants
+  (`KTGR`) for moving one connection's live TLS secrets to one attested
+  standby, voided wholesale by an unsafe-recovery invalidation.
+- **custody_authority** — the continuity authority in a Fluxor
+  `TRANSPORT_CONTINUITY` provider's own graph: decides the provider's
+  custody checks as `KTGR` grants (an enrolled standby's attested
+  recipient, hardware custody, single use in the ledger) and relays its
+  token checks to Clustor's session directory.
+- **attachment_authorize** — private producer/consumer attachment
+  publications and grants (`KATT`), by exact tenant and by trust domain —
+  this instance's, or a federated one pinned by keyset record.
+- **service_dns_sign** — signs Wormhole's `service_dns` projection
+  (`KSDN`) verbatim for the region controller the graph pins to that
+  service, so a DNS front end answers only from regions Kagi vouched for.
+- **scope_mint** — least-privilege operation scopes (`KSCP`) for
+  failure-domain, prefix and address, service-chain, DR and fence
+  operations: one kind per scope, never more than the actor's class may
+  hold, shaped as Wormhole's `ScopedGrant`.
 
-`token_mint`, `token_verify`, `mint_admission`, `authcode` and `storage_key`
-are typed operations: providers of the workspace exchange contract that
+`token_mint`, `token_verify`, `mint_admission`, `authcode`, `storage_key`,
+`control_act_mint`, `control_act_verify`, `transfer_grant`,
+`attachment_authorize`, `service_dns_sign` and `scope_mint` are typed operations: providers of the workspace exchange contract that
 another project's pipeline drives with one request and reads one typed
 answer from. Their exchange rules and every byte of their request and
 answer bodies are in

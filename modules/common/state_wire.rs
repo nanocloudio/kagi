@@ -92,6 +92,16 @@ pub const NS_STORAGE_AUDIT: u8 = 12;
 /// Storage-key attachment renewal chains: per attachment, the latest
 /// renewal, advanced by compare-and-swap.
 pub const NS_STORAGE_ATTACHMENT: u8 = 13;
+/// Key-custody transfer grants: per flow and nonce, a grant's single-use
+/// state (issued → consumed | expired), advanced by compare-and-swap, and the
+/// deployment's recovery generation, which an unsafe recovery advances to
+/// void every outstanding grant at once.
+pub const NS_TRANSFER_GRANT: u8 = 14;
+/// Private attachments: per producer tenant and service, the revocation
+/// generation `attachment_revoke` advances. The publications and grants
+/// themselves are not stored here; they travel with the acts they
+/// authorise.
+pub const NS_ATTACHMENT: u8 = 15;
 
 /// The prefix a namespace maps to under the provider's keyspace.
 ///
@@ -114,12 +124,30 @@ pub const fn namespace_prefix(ns: u8) -> Option<&'static str> {
         NS_STORAGE_TICKET => Some("kagi/sk/ticket/"),
         NS_STORAGE_AUDIT => Some("kagi/sk/audit/"),
         NS_STORAGE_ATTACHMENT => Some("kagi/sk/attach/"),
+        NS_TRANSFER_GRANT => Some("kagi/transfer-grants/"),
+        NS_ATTACHMENT => Some("kagi/attachments/"),
         _ => None,
     }
 }
 
 /// The longest prefix above, so a caller can size a key buffer.
-pub const MAX_PREFIX: usize = 16;
+pub const MAX_PREFIX: usize = 21;
+
+const _: () = {
+    let mut ns = 0u8;
+    loop {
+        if let Some(prefix) = namespace_prefix(ns) {
+            assert!(
+                prefix.len() <= MAX_PREFIX,
+                "a namespace prefix is longer than MAX_PREFIX"
+            );
+        }
+        if ns == u8::MAX {
+            break;
+        }
+        ns += 1;
+    }
+};
 /// The longest caller-supplied key this wire carries.
 pub const MAX_KEY: usize = 128;
 /// The largest record value.
@@ -545,6 +573,8 @@ pub const fn requires_linearized(ns: u8) -> bool {
             | NS_STORAGE_SET
             | NS_STORAGE_TICKET
             | NS_STORAGE_ATTACHMENT
+            | NS_TRANSFER_GRANT
+            | NS_ATTACHMENT
     )
 }
 
@@ -578,6 +608,13 @@ pub const fn requires_linearized(ns: u8) -> bool {
 ///   volume, and losing a ticket's consumption lets it recover twice.
 /// - **`NS_STORAGE_ATTACHMENT`** holds each attachment's latest renewal.
 ///   Losing an advance lets a superseded link of the chain be renewed again.
+/// - **`NS_TRANSFER_GRANT`** makes a key-custody transfer single-use and
+///   holds the recovery generation that voids outstanding grants. Losing a
+///   consume lets one grant move live TLS secrets twice; losing a
+///   generation advance revives grants an unsafe recovery voided.
+/// - **`NS_ATTACHMENT`** holds each attached service's revocation
+///   generation. Losing an advance re-admits grants under a publication the
+///   producer revoked.
 /// - **`NS_STORAGE_AUDIT`** is append-only under unique keys, so it needs
 ///   no linearization, but an entry that does not survive is a release
 ///   nobody can account for: it is durable like the grants it records.
@@ -615,7 +652,9 @@ pub const fn min_fence_replicated(ns: u8) -> u8 {
         | NS_STORAGE_SET
         | NS_STORAGE_TICKET
         | NS_STORAGE_AUDIT
-        | NS_STORAGE_ATTACHMENT => fence::REPLICATED_DURABLE,
+        | NS_STORAGE_ATTACHMENT
+        | NS_TRANSFER_GRANT
+        | NS_ATTACHMENT => fence::REPLICATED_DURABLE,
         _ => fence::LOCAL_DURABLE,
     }
 }

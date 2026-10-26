@@ -40,10 +40,33 @@ relying parties can write prefix-scoped authorisation policy:
 | `device` | `spiffe://<td>/device/<tenant>/<device>` | email-bound device enrollment | `tenant` = `generate_tenant_id` (HKDF over trimmed/lowercased email); `device` = `derive_device_id` (RFC 7638 thumbprint of the device key) |
 | `ns` | `spiffe://<td>/ns/<namespace>/sa/<name>` | Kubernetes / workload service accounts (H4) | `identifiers::workload::generate_workload_subject` (domain-separated HKDF); matches the SPIFFE-on-k8s convention and the existing `CN=system:serviceaccount:<ns>:<sa>` DN |
 | `svc` | `spiffe://<td>/svc/<service>/<id>` | platform nodes / services | assigned by the provisioner at admission (e.g. `svc/sector/node-abc`) |
+| `host` | `spiffe://<td>/host/<host_id>` | control-plane hosts: route publishers, fence agents, anchor hosts | `host_id` is the deployment's fixed 16-byte host identity, 32 lowercase hex digits; it is independent of boot incarnation (a boot nonce is not an identity) and is what a control act and a transfer grant name a host by |
+| `operator` | `spiffe://<td>/operator/<operator_id>` | human and automation operators of the control plane | `operator_id` is a fixed 16-byte operator identity, rendered the same way |
 
 `ns` follows the established SPIRE k8s registration path verbatim, so nanocloud
-interops with off-the-shelf SPIFFE tooling. `device` and `svc` are reserved
-class words; a service may not be named `device`, `ns`, or `svc`.
+interops with off-the-shelf SPIFFE tooling. `device`, `svc`, `host` and
+`operator` are reserved class words; a service may not be named `device`,
+`ns`, `svc`, `host` or `operator`.
+
+The rules of this contract do not change with the two control-plane classes:
+`belongs_to` is a structural check only (scheme, trust domain, a reserved
+class — and for `host`/`operator`, a well-formed 32-hex-digit id), never a
+policy decision, and one kagi instance owns exactly one trust domain. What
+is new is that every class now has one 16-byte id (`spiffe::parse`): a host
+or operator carries it in the path, and a device, workload or service id is
+the first 16 bytes of `SHA-256(name)`. That is the actor id a signed control
+act (`docs/architecture/control-acts.md`) carries beside its class byte, so
+Wormhole can compare actors as fixed bytes.
+
+`certificate_endpoint` composes all of them from its own trust domain and the
+request's `class` (`device` when absent; `host` with `host_id`; `operator`
+with `operator_id`). Which classes an authority mints is its graph's
+`issue_classes` parameter — `device` alone when unset, because a host or
+operator leaf is what authorises an ownership-changing act and a PKI
+endpoint that would mint one for any caller is a control plane with no
+admission. Every leaf carrying a SPIFFE SAN has `clientAuth` and
+`serverAuth`, so a host presents its leaf on either end of a mutually
+authenticated control link.
 
 ### SVID — the pinning proof
 
@@ -201,7 +224,9 @@ must be denied; the registry denies it once, at the source.
 | --- | --- |
 | Device certificate | JWT-form `cty=dc+jwt`, `sub=tenant_<id>` — `enrollment_endpoint` |
 | X.509 leaf with a SPIFFE SAN | `certificate_endpoint`, under a P-256 CA, with `modules/common/der.rs` emitting the profile |
-| Identity naming | `modules/common/spiffe.rs` |
+| Identity naming | `modules/common/spiffe.rs` — device, workload, service, host and operator classes |
+| Host and operator leaves | `certificate_endpoint`, when the graph's `issue_classes` admits them |
+| Signed control acts, transfer grants, attachment grants, `service_dns` projections, operation scopes | `control_act_mint`, `transfer_grant`, `attachment_authorize`, `service_dns_sign`, `scope_mint` — see [architecture/control-acts.md](architecture/control-acts.md) |
 | Access token | `cnf`/DPoP bound — `token_endpoint` → `mint_admission` → `token_mint` |
 | Trust domain | `__TRUST_DOMAIN__` in `configs/pki.yaml` |
 

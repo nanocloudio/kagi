@@ -26,6 +26,25 @@
 //! Consumers still go through the encode/decode helpers rather than raw
 //! offsets — not because the layout is unstable, but because the helpers
 //! are where the length and range checks live.
+//!
+//! ## Type-id allocation
+//!
+//! `MESSAGE_TYPES` below stops at 0x5F: `state_wire` owns 0x60–0x71. Above
+//! it, each service profile declares its own `msg` block, so a module
+//! reading several of these off one port never sees two meanings of one
+//! number:
+//!
+//! | Range | Owner |
+//! |---|---|
+//! | 0x01–0x5F | this table |
+//! | 0x60–0x71 | `state_wire` (the security-state ledger) |
+//! | 0x80–0x87 | `storage_key_service::msg` |
+//! | 0x90–0x93, 0x9E | `control_act::msg` (verify, mint, audit) |
+//! | 0x94–0x95 | `transfer_grant::msg` (request, reply) |
+//! | 0x96–0x97 | `attachment_grant::msg` (request, reply) |
+//! | 0x98–0x99 | `service_dns::msg` (request, reply) |
+//! | 0x9A–0x9B | `operation_scope::msg` (request, reply) |
+//! | 0xC0– | the lattice adapter |
 
 #![allow(
     dead_code,
@@ -70,6 +89,11 @@ message_types! {
     MSG_SECRET_PUT = 0x02;
     MSG_SECRET_LIST = 0x03;
     MSG_SECRET_ROTATE = 0x04;
+    /// `[corr u32][id f8][context f16]` → `MSG_SECRET_VALUE` carrying
+    /// `HMAC-SHA256(secret, "kagi/secret-derive.v1" ‖ context)` — a value
+    /// derived for one context, the secret itself never leaving the store
+    /// (`secret_derive.rs`).
+    MSG_SECRET_DERIVE = 0x05;
 
     // secret_store replies
     MSG_SECRET_VALUE = 0x11;

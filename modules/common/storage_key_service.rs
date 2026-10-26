@@ -169,6 +169,9 @@ pub struct Stats {
     pub replayed: u32,
     pub audit_failed: u32,
     pub busy: u32,
+    /// Control requests whose audited actor is a verified mTLS SVID rather
+    /// than the name the request wrote.
+    pub authenticated_actor: u32,
 }
 
 impl Stats {
@@ -179,6 +182,7 @@ impl Stats {
         replayed: 0,
         audit_failed: 0,
         busy: 0,
+        authenticated_actor: 0,
     };
 }
 
@@ -371,7 +375,18 @@ struct Op {
     cursor: u32,
     audit: sk::Audit,
     refusal: Option<Refusal>,
+    /// The verified peer identity the request arrived with: the SHA-256 of
+    /// the mTLS client leaf's key, as the exchange's `peer` carries it.
+    /// Empty when the request came over a link nothing authenticated.
+    peer: [u8; PEER_LEN],
+    peer_len: u8,
 }
+
+/// The one peer identity this service records: a 32-byte SVID.
+pub const PEER_LEN: usize = 32;
+/// The prefix an authenticated actor is audited under, so an audit reader
+/// tells `svid:<hex>` from a name the caller merely wrote.
+pub const SVID_ACTOR_PREFIX: &[u8] = b"svid:";
 
 const NO_FACTS: sk::DeviceFacts = sk::DeviceFacts {
     active: false,
@@ -406,6 +421,8 @@ impl Op {
             cursor: 0,
             audit: sk::Audit::new(0, 0, [0; 16], 0),
             refusal: None,
+            peer: [0; PEER_LEN],
+            peer_len: 0,
         }
     }
 
@@ -437,6 +454,8 @@ impl Op {
         self.cursor = 0;
         self.audit = sk::Audit::new(0, 0, [0; 16], 0);
         self.refusal = None;
+        self.peer = [0; PEER_LEN];
+        self.peer_len = 0;
     }
 
     fn body(&self) -> &[u8] {
@@ -846,8 +865,30 @@ impl Service {
         self.ops.iter().filter(|o| o.live).count()
     }
 
-    /// A `REQUEST` payload arrived from `caller`.
+    /// A `REQUEST` payload arrived from `caller` over a link nothing
+    /// authenticated: [`Service::on_request_from`] with no peer.
     pub fn on_request<H: Host>(&mut self, host: &mut H, caller: &Caller, payload: &[u8]) {
+        self.on_request_from(host, caller, &[], payload);
+    }
+
+    /// A `REQUEST` payload arrived from `caller`, whose link authenticated
+    /// `peer`: the exchange's verified peer identity (the SVID, `SHA-256`
+    /// of the mTLS client leaf's key), empty when there was none.
+    ///
+    /// The control verbs end in an `actor` the caller writes, which proves
+    /// nothing. When a verified SVID is present the audit entry names the
+    /// actor as `svid:<hex>` instead — the identity the transport
+    /// established, not the one the request claimed — and the change is
+    /// counted in `Stats::authenticated_actor`. A peer of any other length
+    /// is not an SVID and is ignored, which leaves the request exactly as
+    /// unauthenticated as before rather than less.
+    pub fn on_request_from<H: Host>(
+        &mut self,
+        host: &mut H,
+        caller: &Caller,
+        peer: &[u8],
+        payload: &[u8],
+    ) {
         let Self {
             cfg,
             next_corr,
@@ -899,6 +940,13 @@ impl Service {
         op.live = true;
         op.code = code;
         op.caller = *caller;
+        if peer.len() == PEER_LEN {
+            op.peer.copy_from_slice(peer);
+            op.peer_len = u8::try_from(PEER_LEN).unwrap_or(0);
+            if !op.proven() {
+                cx.stats.authenticated_actor = cx.stats.authenticated_actor.saturating_add(1);
+            }
+        }
         op.icorr = *next_corr;
         *next_corr = next_corr.wrapping_add(1).max(1);
         op.req[..body.len()].copy_from_slice(body);
@@ -2311,6 +2359,15 @@ fn audit_names(op: &Op) -> (Name, Name) {
     if walked.is_some() {
         if let Some(a) = r.f8() {
             who.set(a);
+        }
+    }
+    if usize::from(op.peer_len) == PEER_LEN {
+        // The transport authenticated the caller: that, not the name it
+        // wrote, is who asked.
+        let mut named = [0u8; SVID_ACTOR_PREFIX.len() + 2 * PEER_LEN];
+        named[..SVID_ACTOR_PREFIX.len()].copy_from_slice(SVID_ACTOR_PREFIX);
+        if sk::hex_into(&op.peer, &mut named[SVID_ACTOR_PREFIX.len()..]).is_some() {
+            who.set(&named);
         }
     }
     (device, who)

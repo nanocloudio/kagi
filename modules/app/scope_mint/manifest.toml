@@ -1,0 +1,54 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one `operation_scope::msg::REQUEST` envelope and each
+# answer body one `REPLY` envelope: the signed KSCP scope, or a typed
+# refusal. The actor is established from the cert-bound identity carrier the
+# request carries, and holds at most its class's ceiling.
+# Layouts: docs/architecture/control-acts.md.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
+# The OPERATION_SCOPE signing key, in the MSG_KEY_ADD shape every kagi module
+# takes: a vault label, never key material.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The certificate authority's public key: the anchor an actor's leaf chains
+# to.
+[[ports]]
+name = "ca_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The signing key's public half, as a VERIFY MSG_KEY_ADD, for every relying
+# party that checks a scope.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 512
+max_record = 512
+
+[observability]
+metrics = ["scope_minted", "scope_refused", "scope_unauthenticated", "scope_no_key"]

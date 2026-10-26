@@ -31,7 +31,11 @@
 //!
 //! The control verbs on `request_in` carry no authentication of their own:
 //! the port is a control-plane port and belongs behind the same admission
-//! as the rest of the control surface. Attach, recover and renew requests
+//! as the rest of the control surface. When that admission is mTLS, the
+//! exchange arrives with the client's verified SVID as its `peer`, and the
+//! audit trail names `svid:<hex>` as the actor instead of the name the
+//! request wrote (`Service::on_request_from`); the first time it does, this
+//! module logs it. Attach, recover and renew requests
 //! authenticate themselves, with a proof by the enrolled device key.
 
 #![no_std]
@@ -67,6 +71,8 @@ mod auth_wire;
 mod b64;
 #[path = "../../common/chan.rs"]
 mod chan;
+#[path = "../../common/exchange_peer.rs"]
+mod exchange_peer;
 #[path = "../../common/issuer_key.rs"]
 mod issuer_key;
 #[path = "../../common/jose.rs"]
@@ -144,6 +150,10 @@ struct ModuleState {
 
     /// Requests being collected until their body is whole.
     requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    /// The verified peer each collecting exchange arrived with.
+    peers: exchange_peer::Peers<MAX_EXCHANGES>,
+    /// Whether the switch to SVID-named actors has been logged.
+    logged_svid_actor: u8,
     /// The one answer, credit or refusal owed to `response_out`. Nothing new
     /// is read while it is held.
     outbox: ExchangeOutbox,
@@ -438,6 +448,8 @@ pub extern "C" fn module_new(
         s.in_requests = in_chan;
         s.out_responses = out_chan;
         s.requests = Collector::new();
+        s.peers = exchange_peer::Peers::new();
+        s.logged_svid_actor = 0;
         s.outbox = ExchangeOutbox::new();
         s.in_key = dev_channel_port(sys, 0, 1);
         s.out_ledger = dev_channel_port(sys, 1, 1);
@@ -494,6 +506,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             buf,
             service,
             requests,
+            peers,
+            logged_svid_actor,
             outbox,
             record,
             out,
@@ -548,6 +562,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             worked = true;
+            peers.note(record.get(..n as usize).unwrap_or(&[]));
             let outcome = requests.accept(record.get(..n as usize).unwrap_or(&[]));
             // One record owes at most one thing: a body grant, a refusal, or
             // (once whole) an answer.
@@ -570,12 +585,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let body_len = request.body.len();
             buf[..body_len].copy_from_slice(request.body);
             requests.release(at);
+            let peer = peers.take(&id);
             if let Some(status) = refused {
                 answer_status(&mut host, &id, status);
                 continue;
             }
             match typed_exchange::message(&buf[..body_len]) {
-                Some((svc::msg::REQUEST, payload)) => service.on_request(&mut host, &id.0, payload),
+                Some((svc::msg::REQUEST, payload)) => {
+                    let svid: &[u8] = match &peer {
+                        Some(svid) => svid,
+                        None => &[],
+                    };
+                    service.on_request_from(&mut host, &id.0, svid, payload);
+                    if *logged_svid_actor == 0 && service.stats.authenticated_actor > 0 {
+                        *logged_svid_actor = 1;
+                        let line = b"[storage-key] control actor audited as the verified mTLS SVID";
+                        dev_log(sys, 3, line.as_ptr(), line.len());
+                    }
+                }
                 _ => answer_status(&mut host, &id, x::status::BAD_REQUEST),
             }
         }

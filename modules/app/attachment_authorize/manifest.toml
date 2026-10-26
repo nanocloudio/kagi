@@ -1,0 +1,77 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+# Where its ledger runs: each attached service's revocation generation is
+# the ledger's, so it runs on the runtimes `security_state` does.
+hardware_targets = ["bcm2712", "linux"]
+
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one `attachment_grant::msg::REQUEST` envelope (a
+# producer's publication, a consumer's request, `attachment_revoke`) and each
+# answer body one `REPLY` envelope carrying a signed KATT record or a typed
+# refusal. Callers authenticate with a cert-bound carrier.
+# Layouts: docs/architecture/control-acts.md.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
+# The ATTACHMENT_GRANT signing key, by vault label.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# This instance's certificate authority's public key: the anchor its own
+# trust domain's leaves chain to.
+[[ports]]
+name = "ca_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The security-state ledger: `kagi/attachments/`.
+[[ports]]
+name = "ledger_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# Pinned federated trust domains: VERIFY MSG_KEY_ADD whose issuer is the
+# domain's name and whose key is its CA key; MSG_KEY_REMOVE unpins. A
+# control-plane keyset record, never a fetch.
+[[ports]]
+name = "federation_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 2048
+
+[[ports]]
+name = "ledger_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+
+# The grant key's public half, as a VERIFY MSG_KEY_ADD, for every party that
+# checks a publication or grant offline.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 512
+max_record = 512
+
+[observability]
+metrics = ["attachment_published", "attachment_granted", "attachment_revoked", "attachment_refused"]

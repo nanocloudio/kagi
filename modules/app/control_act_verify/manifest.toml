@@ -1,0 +1,35 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one `control_act::msg::VERIFY_REQ` envelope (a signed
+# KCAC record and the declaring payload it covers) and each answer body one
+# `VERIFY_RESP` envelope carrying the typed verdict; the exchange id is the
+# correlation. Layouts: docs/architecture/control-acts.md.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
+# The issuer's CONTROL_ACT verifying keyset: MSG_KEY_ADD / ACTIVATE / RETIRE
+# / REMOVE / KEYSET_SNAPSHOT, an operator input.
+[[ports]]
+name = "verify_key"
+direction = "input"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["act_ok", "act_refused", "act_malformed", "no_key_errors"]

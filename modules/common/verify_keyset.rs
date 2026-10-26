@@ -136,6 +136,34 @@ impl Keyset {
         })
     }
 
+    /// The `(suite, public)` a signed record's `(issuer, kid)` names under
+    /// `profile_id`, the shape `Record::verify` in `transfer_grant.rs`,
+    /// `attachment_grant.rs`, `service_dns.rs`, `operation_scope.rs` and
+    /// `control_act.rs` asks its `lookup` for.
+    ///
+    /// Confined to the one profile the record belongs to. [`Keyset::select`]
+    /// reads a JOSE `kid` alone, which is right for a verifier that holds
+    /// one profile; a relying party holding several — a vault host that
+    /// checks transfer grants beside the access tokens it is called with —
+    /// would otherwise check a `KTGR` under whichever key happened to share
+    /// its `kid`, and a key's profile is the whole of what separates a grant
+    /// from a token. A key past its removal deadline is not answered.
+    #[must_use]
+    pub fn record_key(
+        &self,
+        issuer: &[u8],
+        profile_id: u16,
+        kid: &[u8],
+        now_unix_secs: u64,
+    ) -> Option<(u16, &[u8])> {
+        let i = self.find(issuer, profile_id, kid)?;
+        let k = self.keys.get(i)?;
+        if k.remove_after_unix != 0 && now_unix_secs >= k.remove_after_unix {
+            return None;
+        }
+        Some((k.suite, k.pubkey_bytes()))
+    }
+
     /// The active key for a profile, for callers that must pick one
     /// without a credential to read a `kid` from.
     #[must_use]

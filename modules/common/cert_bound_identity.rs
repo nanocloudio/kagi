@@ -177,7 +177,9 @@ fn frame_cert_msg(certs: &[&[u8]], out: &mut [u8; CERT_MSG_MAX]) -> Option<usize
         out[at + 1] = (n >> 8) as u8;
         out[at + 2] = n as u8;
         at += 3;
-        out[at..at + n].copy_from_slice(cert);
+        for (d, s) in out[at..].iter_mut().zip(cert.iter()) {
+            *d = *s;
+        }
         at += n;
         out[at] = 0;
         out[at + 1] = 0;
@@ -298,7 +300,13 @@ pub fn verify(
         jti_len: jti.len(),
         expires_at: exp,
     };
-    out.spiffe[..iss.len()].copy_from_slice(iss);
-    out.jti[..jti.len()].copy_from_slice(jti);
+    // Copied element-wise: the lengths are bounded above, but a module has
+    // no panic handler to link a length-mismatch path against.
+    for (d, s) in out.spiffe.iter_mut().zip(iss) {
+        *d = *s;
+    }
+    for (d, s) in out.jti.iter_mut().zip(jti) {
+        *d = *s;
+    }
     Ok(out)
 }

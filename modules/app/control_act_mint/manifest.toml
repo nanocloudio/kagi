@@ -1,0 +1,62 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# A typed operation: the PROVIDER side of the workspace exchange contract.
+# Each request body is one `control_act::msg::MINT_REQ` envelope and each
+# answer body one `MINT_RESP` envelope (the signed KCAC record, or a typed
+# refusal). The actor is established from the cert-bound identity carrier
+# the request carries, never from a field the caller writes. Layouts:
+# docs/architecture/control-acts.md.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
+# The CONTROL_ACT signing key, in the MSG_KEY_ADD shape every kagi module
+# takes: a vault label, never key material.
+[[ports]]
+name = "signing_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The certificate authority's public key, as the VERIFY MSG_KEY_ADD
+# `certificate_endpoint` announces: the anchor an actor's leaf chains to.
+[[ports]]
+name = "ca_key"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# The signing key's public half, as a VERIFY MSG_KEY_ADD, for every
+# `control_act_verify` in the deployment.
+[[ports]]
+name = "key_announce"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 512
+max_record = 512
+
+# One KCAA audit entry per decision, minted or refused. Kagi keeps none of
+# them: the deployment's audit sink does.
+[[ports]]
+name = "audit_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+
+[observability]
+metrics = ["act_minted", "act_refused", "act_unauthenticated", "act_no_key"]
