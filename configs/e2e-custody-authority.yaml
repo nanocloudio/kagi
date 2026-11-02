@@ -8,6 +8,10 @@
 #   mux ch2 ⇄ custody_authority.token_out / token_in   Clustor's session directory
 #   custody_authority.grant_out → mux ch3              every KTGR granted (0x4B)
 #   custody_authority.ledger_out / ledger_in ⇄ security_state
+#   mux ch4 → custody_authority.ca_key                 the CA's key (VERIFY MSG_KEY_ADD)
+#   mux ch5 → custody_authority.cert_in                host certificates ([0x5C][len][leaf ‖ issuer])
+#   ready_http (__HTTP_PORT__) POST /custody/ready → custody_authority.request_in
+#                                                      CUSTODY_READY (0xA0 / 0xA1)
 #
 # The suite (tests/harness/tests/custody_authority_e2e.rs) plays the provider
 # and the directory over the websocket control carrier. The standby host
@@ -27,6 +31,7 @@ modules:
   - name: custody_authority
     host: "51515151515151515151515151515151"
     iss: "__ISSUER__"
+    trust_domain: "__TRUST_DOMAIN__"
     posture: development
     ttl_ms: 30000
     dest0: "d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7:045b36890dacbd7c9a96bb74a1ee28b3d2d75b72e09a20ef25cf8e6fd8a9f0350d0e14bed8d4682a34d83538bdff5b96e89a6666ec0db5745d02fa1210072df75a"
@@ -36,7 +41,7 @@ modules:
 
   - name: mux
     type: remote_channel
-    channels: "OctetStream:tlv16:4096;OctetStream:tlv16:512;OctetStream:tlv16:4096;OctetStream:tlv16:4096"
+    channels: "OctetStream:tlv16:4096;OctetStream:tlv16:512;OctetStream:tlv16:4096;OctetStream:tlv16:4096;OctetStream:tlv16:512;OctetStream:tlv16:4096"
     require_peer: 0
 
   - name: ws
@@ -52,10 +57,22 @@ modules:
         body: "ok"
         content_type: "text/plain"
 
+  - name: ready_http
+    type: http
+    port: __HTTP_PORT__
+    host_tcp: 1
+    routes:
+      - path: "/custody/ready"
+        app: true
+
 wiring:
   - from: linux_net.net_out
     to: http.net_in
   - from: http.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: ready_http.net_in
+  - from: ready_http.net_out
     to: linux_net.net_in
 
   - from: ws.tx_out
@@ -91,3 +108,13 @@ wiring:
     to: security_state.requests
   - from: security_state.replies
     to: custody_authority.ledger_in
+
+  - from: mux.ch4_rx
+    to: custody_authority.ca_key
+  - from: mux.ch5_rx
+    to: custody_authority.cert_in
+
+  - from: ready_http.request_out
+    to: custody_authority.request_in
+  - from: custody_authority.response_out
+    to: ready_http.response_in

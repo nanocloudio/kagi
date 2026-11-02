@@ -142,8 +142,15 @@ CA deployment.
 - **custody_authority** — the continuity authority in a Fluxor
   `TRANSPORT_CONTINUITY` provider's own graph: decides the provider's
   custody checks as `KTGR` grants (an enrolled standby's attested
-  recipient, hardware custody, single use in the ledger) and relays its
-  token checks to Clustor's session directory.
+  recipient, hardware custody, single use in the ledger), relays its
+  token checks to Clustor's session directory, and answers `CUSTODY_READY`
+  — per standby, enrolled, the tier its evidence proved, grant-ready,
+  holding a live host certificate — before a transfer is planned.
+- **carrier_mint** — the holder's half of a cert-bound identity carrier:
+  ES256 carriers signed with its own vault-born key, certified over the
+  `identity_req` / `identity_cert` seam Fluxor's `tls` uses, for a
+  requester such as Wormhole's `dns_sign_relay` to present to
+  `service_dns_sign`.
 - **attachment_authorize** — private producer/consumer attachment
   publications and grants (`KATT`), by exact tenant and by trust domain —
   this instance's, or a federated one pinned by keyset record.
@@ -151,13 +158,17 @@ CA deployment.
   (`KSDN`) verbatim for the region controller the graph pins to that
   service, so a DNS front end answers only from regions Kagi vouched for.
 - **scope_mint** — least-privilege operation scopes (`KSCP`) for
-  failure-domain, prefix and address, service-chain, DR and fence
-  operations: one kind per scope, never more than the actor's class may
-  hold, shaped as Wormhole's `ScopedGrant`.
+  traffic-dial, failure-domain, prefix and address, service-chain, DR and
+  fence operations: one kind per scope, never more than the actor's class
+  may hold, shaped as Wormhole's `ScopedGrant`.
+- **rsc_verify** — BYOIP ownership evidence: an RPKI Signed Checklist
+  (RFC 9323) under the trust anchor and the tenant's CA chain, every link
+  against its issuer's CRL, as Wormhole's `OwnershipEvidence` for one
+  tenant's claim to one prefix.
 
 `token_mint`, `token_verify`, `mint_admission`, `authcode`, `storage_key`,
 `control_act_mint`, `control_act_verify`, `transfer_grant`,
-`attachment_authorize`, `service_dns_sign` and `scope_mint` are typed operations: providers of the workspace exchange contract that
+`attachment_authorize`, `service_dns_sign`, `scope_mint`, `rsc_verify` and `custody_authority` (`CUSTODY_READY`) are typed operations: providers of the workspace exchange contract that
 another project's pipeline drives with one request and reads one typed
 answer from. Their exchange rules and every byte of their request and
 answer bodies are in

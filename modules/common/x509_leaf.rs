@@ -120,6 +120,15 @@ fn tlv(b: &[u8]) -> Option<(Tlv<'_>, &[u8])> {
     Some((Tlv { tag, contents }, &b[end..]))
 }
 
+/// The length of the DER element at the front of `b`, header included: how
+/// a concatenation of certificates (`leaf DER ‖ issuer DER ‖ …`, the
+/// enrolment path's chain) is split.
+#[must_use]
+pub fn element_len(b: &[u8]) -> Option<usize> {
+    let (_, rest) = tlv(b)?;
+    Some(b.len() - rest.len())
+}
+
 /// Read one element and require its tag.
 fn expect(b: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
     let (t, rest) = tlv(b)?;

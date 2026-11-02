@@ -6,8 +6,9 @@
 //! imported-prefix, service-chain and failure-domain operations with
 //! least-privilege scopes" and to "authorize route/fence/ownership acts
 //! without becoming their state store". Attachments have their own profile
-//! (`KATT`). This is the rest: failure-domain operations, prefix and address
-//! operations, service-chain operations, DR intents and fences.
+//! (`KATT`). This is the rest: traffic-dial operations, failure-domain
+//! operations, prefix and address operations, service-chain operations, DR
+//! intents and fences.
 //!
 //! A scope is shaped to be checked where Wormhole already checks scope. Its
 //! object, level, region, cell, data locality and recovery generation are
@@ -24,7 +25,9 @@
 //! - **Operations are a subset of the class's ceiling** ([`ceiling`]). A
 //!   class's ceiling is the most any member of it may ever hold for a kind,
 //!   whatever a policy says: a host may confirm its own zone's fence and
-//!   nothing else; a workload may declare its own tenant's chains; a
+//!   nothing else; a workload may declare its own tenant's chains; an
+//!   operator starts a manual dial, a scheduler (service class) a scheduled
+//!   one, and either pauses, resumes, reverts or aborts it; a
 //!   controller (service class) may act automatically within what operators
 //!   admitted — evacuate on evidence, fail a region over, allocate and
 //!   advertise inside admitted space, confirm fences as a fence provider; an
@@ -34,8 +37,8 @@
 //! - **Levels are fixed per kind** ([`level_permits`]): a DR intent acts on
 //!   the global tier and is global; a regional fence is global, a zone fence
 //!   is a cell's or a region's, and a fence scope holds one of the two, never
-//!   both; failure-domain and chain operations are a cell's or a region's;
-//!   prefixes are a region's or the global root's.
+//!   both; dial, failure-domain and chain operations are a cell's or a
+//!   region's; prefixes are a region's or the global root's.
 //! - **Short.** At most [`MAX_WINDOW_MS`]; a controller re-mints.
 //!
 //! Which actor holds which scope for which object is the deployment's
@@ -86,9 +89,11 @@ pub type VerifyFn = fn(u16, &[u8], &[u8], &[u8]) -> bool;
 pub const MAGIC: [u8; 4] = *b"KSCP";
 pub const VERSION: u8 = 1;
 
-/// Scope kinds, numbered as Wormhole's `scoped_kind`. Wormhole's dial,
-/// attachment and egress-identity kinds (1, 2, 4) are not this profile's.
+/// Scope kinds, numbered as Wormhole's `scoped_kind`. Wormhole's
+/// attachment and egress-identity kinds (2, 4) are not this profile's.
 pub mod kind {
+    /// Traffic-dial operations on a service (Wormhole's `dial_controller`).
+    pub const DIAL: u8 = 1;
     pub const CHAIN: u8 = 3;
     pub const PREFIX: u8 = 5;
     pub const FAILURE_DOMAIN: u8 = 6;
@@ -97,13 +102,17 @@ pub mod kind {
 
     #[must_use]
     pub const fn valid(k: u8) -> bool {
-        matches!(k, CHAIN | PREFIX | FAILURE_DOMAIN | DR_INTENT | FENCE)
+        matches!(
+            k,
+            DIAL | CHAIN | PREFIX | FAILURE_DOMAIN | DR_INTENT | FENCE
+        )
     }
 
     /// Short stable token, for an operator-facing log line.
     #[must_use]
     pub const fn text(k: u8) -> &'static [u8] {
         match k {
+            DIAL => b"dial",
             CHAIN => b"chain",
             PREFIX => b"prefix",
             FAILURE_DOMAIN => b"failure-domain",
@@ -119,6 +128,25 @@ pub mod level {
     pub const CELL: u8 = 1;
     pub const REGION: u8 = 2;
     pub const GLOBAL: u8 = 3;
+}
+
+/// Traffic-dial operations (§10.8): a `DialOperation` on one service's
+/// dial, run by Wormhole's `dial_controller` and journalled in its
+/// catalogue's status stream.
+pub mod dial {
+    /// Starting an operation from the service's current dial toward a
+    /// target: a manual change, or one a schedule fires.
+    pub const START: u32 = 1 << 0;
+    /// Holding an operation in flight at its current generation.
+    pub const PAUSE: u32 = 1 << 1;
+    /// Resuming a paused operation.
+    pub const RESUME: u32 = 1 << 2;
+    /// Reverting: publishing the operation's start shares as a new, higher
+    /// generation (a dark launch taken back).
+    pub const REVERT: u32 = 1 << 3;
+    /// Abandoning an operation where it stands.
+    pub const ABORT: u32 = 1 << 4;
+    pub const ALL: u32 = START | PAUSE | RESUME | REVERT | ABORT;
 }
 
 /// Failure-domain operations (§14.5).
@@ -200,6 +228,9 @@ pub mod class {
 #[must_use]
 pub const fn ceiling(scope_kind: u8, actor_class: u8) -> u32 {
     match (scope_kind, actor_class) {
+        // A manual dial is an operator's; a scheduled one is the
+        // scheduler's (a service), which runs the same verbs.
+        (kind::DIAL, class::OPERATOR | class::SERVICE) => dial::ALL,
         (kind::FAILURE_DOMAIN, class::OPERATOR) => {
             failure_domain::EVACUATE
                 | failure_domain::PRACTICE
@@ -232,7 +263,7 @@ pub const fn level_permits(scope_kind: u8, ops: u32, at: u8) -> bool {
             fence::CONFIRM => at == level::CELL || at == level::REGION,
             _ => false,
         },
-        kind::FAILURE_DOMAIN | kind::CHAIN => at == level::CELL || at == level::REGION,
+        kind::DIAL | kind::FAILURE_DOMAIN | kind::CHAIN => at == level::CELL || at == level::REGION,
         kind::PREFIX => at == level::REGION || at == level::GLOBAL,
         _ => false,
     }

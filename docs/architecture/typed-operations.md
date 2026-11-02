@@ -18,6 +18,8 @@ answer, and never sees a key, a signature or a claim it did not ask for.
 | `attachment_authorize` | `attachment_grant::msg::REQUEST` 0x96 | `REPLY` 0x97 |
 | `service_dns_sign` | `service_dns::msg::REQUEST` 0x98 | `REPLY` 0x99 |
 | `scope_mint` | `operation_scope::msg::REQUEST` 0x9A | `REPLY` 0x9B |
+| `rsc_verify` | `rsc_verify::msg::REQUEST` 0x9C | `REPLY` 0x9D |
+| `custody_authority` | `custody_authority_service::ready::REQUEST` 0xA0 (`CUSTODY_READY`) | `REPLY` 0xA1 |
 
 Each is a PROVIDER of the workspace exchange contract (fluxor's
 `contracts/exchange.rs`; `docs/architecture/exchange.md` in fluxor): it
@@ -73,7 +75,8 @@ verdict means "this request does not say anything I can act on".
 Body bounds: `token_verify`, `control_act_verify`, `control_act_mint`,
 `transfer_grant` and `attachment_authorize` 8192 bytes; `token_mint`,
 `mint_admission` and `authcode` 4099 (a 4096-byte payload and its
-envelope); `storage_key` 2052.
+envelope); `storage_key` 2052; `custody_authority` 1024 (and two exchanges
+collected at once, not four).
 
 ## Field encodings
 
@@ -518,6 +521,157 @@ refusal. The actor is the carrier's; the ttl is clamped to an hour.
 7 EXPIRED, 8 NOT_YET_VALID, 9 BAD_SIGNATURE, 10 UNKNOWN_KEY,
 11 NO_ISSUER_KEY, 12 NO_CLOCK, 13 REPLAYED, 14 OUT_OF_SCOPE (a relying
 party's `Scope::authorizes`, never on this wire).
+
+## rsc_verify
+
+BYOIP ownership evidence: whether a tenant holds the prefix it asks to
+import, proven with an RPKI Signed Checklist (RSC, RFC 9323) under the trust
+anchor and the tenant's resource holder's CA chain, every link checked
+against its issuer's current CRL (`modules/common/rpki.rs`), whose checklist
+signs the SHA-256 of the import's challenge
+(`wormhole-ownership.v1` ‖ tenant 16 ‖ family u8 (4 or 6) ‖ address 16, IPv4
+in the last four ‖ length u8). The answer is Wormhole's
+`OwnershipEvidence`, field for field; its `address_core` admits an import
+only with `verified`. The decision is `modules/common/rsc_verify.rs`; the
+module keeps no key and runs on the SDK's SHA-256 and RSA (PKCS#1 v1.5,
+sha256WithRSAEncryption only).
+
+Ports: `request_in` in[0], `response_out` out[0]. No params. Validity is
+judged on the trusted wall clock (`CertificateValidity`).
+
+One exchange record carries at most 8,192 bytes — less than an anchor, a
+chain, their CRLs and a checklist together — so the operation is two
+requests. `CACHE` puts one certificate or CRL (at most 4,096 bytes) in a
+bounded cache of 12, the oldest giving way, and answers its SHA-256;
+`VERIFY` names the anchor, up to four CAs and up to five CRLs by those
+digests and carries the checklist. The cache decides nothing: the relying
+party pins its anchor by naming its digest in every `VERIFY`, and an object
+not cached (or evicted) answers `NOT_CACHED` and is put again.
+
+```text
+REQUEST 0x9C  [op u8][body]
+  CACHE  1    [der f16]
+  VERIFY 2    [anchor 32][n u8][ca 32]×n[m u8][crl 32]×m[tenant 16]
+              [family u8][addr 16][len u8][rsc f16]
+REPLY 0x9D    [op u8][status u8][refusal u8][body]
+  CACHE       [digest 32]
+  VERIFY      [holder 16][family u8][addr 16][len u8][digest 32][verified u8]
+```
+
+The evidence's digest is the SHA-256 of the checklist accepted. A refusal
+carries its body zeroed, `verified` 0.
+
+Status: 0 OK, 1 MALFORMED, 2 NOT_CACHED, 3 REFUSED, 4 NO_CLOCK,
+5 NOT_CACHEABLE. Refusal (with REFUSED): the signed object's own below 0x40
+— 1 MALFORMED, 2 ALGORITHM, 3 ANCHOR_SIGNATURE, 4 EXPIRED,
+5 ISSUER_SIGNATURE, 6 NOT_CA, 7 SHAPE, 8 ATTRIBUTES, 9 SIGNER_SIGNATURE,
+10 RESOURCES, 11 NO_CRL, 12 STALE_CRL, 13 REVOKED, 14 CHAIN — then the
+checklist's: 0x40 SHAPE, 0x41 RESOURCES (outside the EE certificate's),
+0x42 NOT_COVERED (no block covers the claim), 0x43 NOT_CHALLENGED (the
+checklist does not sign this tenant's claim to this prefix).
+
+Not done, each a stated limit: fetching (the caller hands in every object;
+Wormhole's RRDP side), manifests, AS resources, address ranges that are not
+prefixes, CRL scope semantics. Driven by `tests/rsc_verify.rs`
+(`configs/rsc-verify.yaml`).
+
+## custody_authority: CUSTODY_READY
+
+Whether hosts could take over a Service's traffic now — the question a
+zone evacuation's KEYS proof asks before it moves anything (Wormhole's
+`zone_evacuation_controller`). Served by `custody_authority`, the module
+that decides the transfers themselves, because it is the one that holds the
+facts: which standbys are enrolled, the grant key, the ledger the grants'
+single-use state lives in, and — from the transfers it decided — what each
+standby's own evidence proved. Codes 0xA0 / 0xA1: 0x9E is `control_act`'s
+`AUDIT`, so the next free request/reply pair is used.
+
+Ports (beside the custody ones): `request_in` in[6], `response_out` out[4];
+`ca_key` in[4] (the CA's key, a VERIFY `MSG_KEY_ADD`); `cert_in` in[5] —
+host identity certificates as the enrolment path delivers them to each
+host's Fluxor `tls` (`identity_cert`, `[0x5C][len u16 LE][leaf DER ‖ issuer
+DER ‖ …]`), fanned to the authority as well. Param `trust_domain` (15),
+required when `cert_in` is wired (and then `ca_key` must be too).
+
+```text
+REQUEST 0xA0  [service 16][n u8][host 16 × n]              n in 1..=32, exactly 17 + 16·n bytes
+REPLY   0xA1  [status u8][n u8]
+              ([host 16][enrolled u8][tier u8][grant_ready u8][cert_ready u8][not_after u64]) × n
+```
+
+Rows are in the request's order, 28 bytes each; the longest reply is 898
+bytes. Status: 0 OK, 1 MALFORMED (not exactly that layout, `n` 0 or past 32
+— answered at once, `n` 0), 2 BUSY (two questions already wait on the
+ledger — `n` 0). Every field is something this authority observed; what it
+has not observed reads not-ready, never ready:
+
+| Field | 1 / value when |
+|---|---|
+| `enrolled` | the host is one of the graph's `dest0`..`dest7` — a standby a continuity key may move to. The graph's own `host` (every transfer's source) is not. |
+| `tier` | the vault tier (`key_vault::tier`: 0 software, 1 process-hw, 2 device-hw) the host's own attested evidence proved in a custody check that verified here; 0xFF until one has, or when the evidence was possession-only. |
+| `grant_ready` | enrolled, the `TRANSFER_GRANT` key open, a trusted clock, the posture admitting the key's vault, and the ledger answering a read (`kagi/transfer-grants/generation`) made for this question within 2 s. The evidence floor (`min_tier`, `allow_possession`) is checked at the transfer itself, from that transfer's evidence: compare `tier` with the policy beforehand. |
+| `cert_ready` | a certificate for the host (`spiffe://<trust_domain>/host/<id>`), signed by the CA on `ca_key`, has arrived on `cert_in` and is inside its window on the trusted clock. Of two, the later-expiring is kept. |
+| `not_after` | that certificate's notAfter, Unix seconds; 0 when none is held. |
+
+The question is answered when the ledger answers its read, or 2 s after
+asked (then `grant_ready` 0). It grants nothing and consumes nothing.
+
+`service` does not narrow any answer today: a continuity grant is per flow,
+and the certificate a host serves every Service with is its own identity
+leaf (Fluxor `tls` under `identity_label`). Kagi issues no Service-scoped
+leaf; the field names the Service the requester is planning for. Facts are
+kept for the hosts this authority enrolls (8); any other host's row is all
+not-ready.
+
+## carrier_mint (not a typed operation)
+
+`carrier_mint` is the holder's half of a certificate-bound identity carrier
+— what a requester presents inside `service_dns_sign`'s or `scope_mint`'s
+`carrier` field. It is listed here because its output is those operations'
+input. It holds its own vault-born P-256 key (vault keys are namespaced by
+module type and owner-only, so it cannot sign with `tls`'s) and gets it
+certified on the seam Fluxor's `tls` uses:
+
+| Port | Dir | Frame |
+|---|---|---|
+| `identity_cert` in[0] | in | `[0x5C][len u16 LE][leaf DER ‖ issuer DER ‖ …]` — taken only when the leaf is P-256, certifies this key and names a `spiffe://` URI of at most 96 bytes (and, with `spiffe` set, that one) |
+| `carrier_out` out[0] | out | `[len u16 LE][compact JWS]`, at most 4608 bytes |
+| `identity_req` out[1] | out | `[0x5B][len u16 LE = 65][SEC1 point]`, every second until a chain is taken, then at two thirds of its lifetime |
+
+Params: `identity_label` (1, required, ≤ 64), `audience` (2, required —
+the relying party's `audience`, e.g. `kagi:service-dns`), `lifetime_s` (3,
+1..=300, default 60), `period_ms` (4, 1000..=300000, default 15000),
+`spiffe` (5, optional).
+
+The carrier is exactly what `cert_bound_identity::verify` admits:
+
+```text
+header  {"alg":"ES256","typ":"JWT","x5c":["<standard base64 of the leaf DER>"]}
+claims  {"iss":"<leaf SAN>","sub":"<leaf SAN>","aud":"<audience>","iat":N,"exp":N,"jti":"<b64url 16 CSPRNG bytes>"}
+JWS     b64url(header) "." b64url(claims) "." b64url(r‖s)
+```
+
+`x5c` carries the leaf alone — the verifier validates a chain of one
+against its configured anchor. The signature is the vault's `SIGN` (DIGEST
+mode) over SHA-256 of the signing input, its 64-byte low-S `r‖s` the
+segment. `exp` is `iat + lifetime_s`, never past the leaf's notAfter; `iat`
+is the trusted wall clock (`Decision::CredentialWindow`), and with no
+trusted clock, or outside the leaf's window, nothing is minted.
+
+Supply: one carrier when a chain is taken, then one every `period_ms`. Each
+is single use (the relying party keeps its `jti`); one the port will not
+take is retried until half its life has gone, then replaced. Wormhole's
+`dns_sign_relay` holds four and drops each after its `carrier_ttl_ms`: set
+`carrier_ttl_ms` ≤ `lifetime_s` × 1000 and `period_ms` ≤ `carrier_ttl_ms` /
+4 to keep it stocked (the defaults: 60 s, 15 s). There is no demand input:
+the relay has no demand output, and a steady period bounded this way keeps
+up to four live carriers waiting.
+
+Publisher pin on `service_dns_sign`: `host:<id>:<service>` for a leaf named
+`spiffe://<td>/host/<id>`, or `service:<id>:<service>` for a
+`spiffe://<td>/svc/…` leaf, `<id>` the first 16 bytes of SHA-256 of the
+whole SPIFFE name. Driven by `tests/carrier_mint.rs` and
+`tests/carrier_mint_e2e.rs` (`configs/e2e-carrier-mint.yaml`).
 
 ## Requesters inside kagi
 

@@ -10,7 +10,7 @@ records and the typed operations that decide them:
 | Transfer grant | `KTGR` | `TRANSFER_GRANT` (9) | moving one connection's live TLS secrets to one standby | `transfer_grant` |
 | Attachment publication / grant | `KATT` | `ATTACHMENT_GRANT` (10) | a private producer/consumer service attachment | `attachment_authorize` |
 | Service DNS projection | `KSDN` | `SERVICE_DNS` (11) | the regional answers a resolver may give for a service | `service_dns_sign` |
-| Operation scope | `KSCP` | `OPERATION_SCOPE` (12) | one actor's least-privilege authority over failure-domain, prefix, chain, DR or fence operations | `scope_mint` |
+| Operation scope | `KSCP` | `OPERATION_SCOPE` (12) | one actor's least-privilege authority over traffic-dial, failure-domain, prefix, chain, DR or fence operations | `scope_mint` |
 
 The charter these keep, from `.context/rfc_extensions.md` §7 and
 `wormhole/.context/reply_kagi_section_7_2.md`:
@@ -186,6 +186,15 @@ The provider's token checks (`0xC2`, the per-flow emission token) are
 relayed whole to Clustor's session directory and its verdicts (`0xC3`)
 back, so one module is the provider's whole authority.
 
+Before a transfer is planned, the same module answers `CUSTODY_READY`
+(REQUEST 0xA0 / REPLY 0xA1, a typed operation on `request_in` /
+`response_out`): per host, whether it is enrolled, the tier its own
+evidence last proved here, whether a grant is issuable now (key, clock,
+posture, and the ledger answering a read made for the question) and
+whether it holds a live host certificate from the CA on `ca_key`
+(delivered on `cert_in`). Layout and every field's rule:
+[typed-operations.md](typed-operations.md#custody_authority-custody_ready).
+
 The grant key's custody role is `KeyRole::TransferGrant`, issuer-grade:
 `PROCESS_HW` in production, refused at construction below it.
 
@@ -292,6 +301,7 @@ authority for **one kind** of operation on **one object**:
 
 | Kind | Operations | Levels |
 |---|---|---|
+| `DIAL` 1 | `START`, `PAUSE`, `RESUME`, `REVERT`, `ABORT` (a service's traffic dial, run by Wormhole's `dial_controller`) | cell, region |
 | `CHAIN` 3 | `DECLARE`, `REPLACE`, `DRAIN_STAGE`, `FAILOVER_STAGE` | cell, region |
 | `PREFIX` 5 | `IMPORT`, `ALLOCATE`, `ADVERTISE`, `WITHDRAW`, `RDNS` | region, global |
 | `FAILURE_DOMAIN` 6 | `EVACUATE`, `PRACTICE`, `RESTORE`, `AUTOMATIC`, `ABORT` | cell, region |
@@ -303,8 +313,8 @@ whatever policy says, and is checked at mint and again at every verify:
 
 | Class | May hold |
 |---|---|
-| operator | evacuate, practice, restore and abort intents; every prefix operation; every chain operation; every DR intent; **no fence** — confirmation comes only from the admitted fence provider |
-| service (a controller) | automatic evacuation on evidence and abort; allocate, advertise, withdraw and reverse DNS inside admitted space (never an import); every chain operation; DR failover and drain (never a recovery mark, restore or policy); both fence confirmations, as a fence provider |
+| operator | every dial operation; evacuate, practice, restore and abort intents; every prefix operation; every chain operation; every DR intent; **no fence** — confirmation comes only from the admitted fence provider |
+| service (a controller) | every dial operation (a scheduled one); automatic evacuation on evidence and abort; allocate, advertise, withdraw and reverse DNS inside admitted space (never an import); every chain operation; DR failover and drain (never a recovery mark, restore or policy); both fence confirmations, as a fence provider |
 | host | its own zone's fence confirmation, nothing else |
 | workload | declaring and replacing its own tenant's chains, nothing else |
 | device | nothing |

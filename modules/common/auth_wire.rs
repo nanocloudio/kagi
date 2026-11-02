@@ -44,6 +44,8 @@
 //! | 0x96–0x97 | `attachment_grant::msg` (request, reply) |
 //! | 0x98–0x99 | `service_dns::msg` (request, reply) |
 //! | 0x9A–0x9B | `operation_scope::msg` (request, reply) |
+//! | 0x9C–0x9D | `rsc_verify::msg` (request, reply) |
+//! | 0xA0–0xA1 | `custody_authority_service::ready` (`CUSTODY_READY` request, reply) |
 //! | 0xC0– | the lattice adapter |
 
 #![allow(

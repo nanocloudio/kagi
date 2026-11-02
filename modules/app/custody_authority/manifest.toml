@@ -81,5 +81,44 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 4096
 
+# The CA's public key (a VERIFY `MSG_KEY_ADD`): the anchor a host
+# certificate on `cert_in` must chain to.
+[[ports]]
+name = "ca_key"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 512
+
+# Host identity certificates, as the enrolment path delivers them to each
+# host's Fluxor `tls` (`identity_cert`): `[0x5C][len u16 LE][leaf DER ‖
+# issuer DER ‖ …]`. Taken when the leaf is the CA's and names an enrolled
+# host (`spiffe://<trust_domain>/host/<id>`). Optional: unwired, every
+# CUSTODY_READY row answers cert_ready 0, not_after 0.
+[[ports]]
+name = "cert_in"
+index = 5
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 4096
+
+# CUSTODY_READY (REQUEST 0xA0 / REPLY 0xA1): a PROVIDER of the workspace
+# exchange contract. Layouts: docs/architecture/typed-operations.md.
+[[ports]]
+name = "request_in"
+index = 6
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+max_record = 8192
+
+[[ports]]
+name = "response_out"
+index = 4
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+max_record = 8192
+
 [observability]
-metrics = ["custody_granted", "custody_refused", "custody_replayed", "tokens_relayed"]
+metrics = ["custody_granted", "custody_refused", "custody_replayed", "tokens_relayed", "certs_taken", "certs_refused", "ready_answered"]

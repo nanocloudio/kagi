@@ -15,13 +15,23 @@
 //!   clock, no key or a silent ledger refuse.
 //! - a **token check** (`0xC2 [token]`) goes to Clustor's session directory
 //!   on `token_out` and its verdict (`0xC3`) back from `token_in`.
+//! - **`CUSTODY_READY`** (`custody_authority_service::ready`, REQUEST 0xA0 /
+//!   REPLY 0xA1) is a typed operation on `request_in` / `response_out`: for
+//!   up to 32 hosts, whether each is enrolled here, the custody tier its
+//!   attested evidence last proved, whether a grant could be issued to it
+//!   now — the grant key open, a trusted clock, the ledger answering a read
+//!   made for the question within two seconds, the posture admitting the
+//!   grant key's vault — and whether it holds a live identity certificate
+//!   the CA on `ca_key` signed, delivered on `cert_in` (the enrolment path's
+//!   `[0x5C][len][leaf ‖ issuer]` frames), with its notAfter.
 //!
 //! Params: `host` (1, 32 hex: this host, the source of every transfer
 //! checked here), `iss` (2), `allow_possession` (3, default 0), `min_tier`
 //! (4, default 1 = `PROCESS_HW`), `posture` (5: development | production;
 //! undeclared refuses to construct), `ttl_ms` (6, default 30000),
 //! `dest0`..`dest7` (7..14: `<host id 32 hex>:<identity key 130 hex>`, the
-//! standby hosts a key may move to).
+//! standby hosts a key may move to), `trust_domain` (15: the SPIFFE trust
+//! domain host certificates name; required when `cert_in` is wired).
 
 #![no_std]
 #![allow(
@@ -62,6 +72,8 @@ mod issuer_key;
 mod key_custody;
 #[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
 mod key_vault;
+#[path = "../../common/spiffe.rs"]
+mod spiffe;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
 #[path = "../../common/storage_key.rs"]
@@ -70,13 +82,26 @@ mod storage_key;
 mod time_policy;
 #[path = "../../common/transfer_grant.rs"]
 mod transfer_grant;
+#[path = "../../common/typed_exchange.rs"]
+mod typed_exchange;
+#[path = "../../common/x509_leaf.rs"]
+mod x509_leaf;
 
-use custody_authority_service::{self as ca, Authority};
+use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use custody_authority_service::{self as ca, ready, Authority};
 use transfer_grant as tg;
 
 const STEP_DID_WORK: i32 = 2;
 const MAX_FIELD: usize = 64;
 const MSG_BUF: usize = 2048;
+/// Exchanges being collected at once.
+const MAX_EXCHANGES: usize = 2;
+const MAX_TARGET: usize = 256;
+const MAX_HEADERS: usize = 1024;
+/// Longest `CUSTODY_READY` request body: its envelope and 32 hosts fit.
+const MAX_REQUEST: usize = 1024;
+/// One `cert_in` frame: a leaf and its issuer.
+const CERT_INBOX: usize = 4096;
 
 const POSTURE_UNDECLARED: u8 = 0;
 const POSTURE_DEVELOPMENT: u8 = 1;
@@ -93,6 +118,10 @@ struct ModuleState {
     out_ledger: i32,
     out_token: i32,
     out_grant: i32,
+    in_ca_key: i32,
+    in_cert: i32,
+    in_requests: i32,
+    out_responses: i32,
 
     key: issuer_key::IssuerKey,
     key_pending: issuer_key::PendingRecord,
@@ -108,9 +137,23 @@ struct ModuleState {
     ttl_ms: u32,
     /// Enrolment params that did not parse: refused at construction.
     bad_dest: u8,
+    trust_domain: [u8; ca::TRUST_DOMAIN_MAX],
+    trust_domain_len: u8,
+    bad_trust_domain: u8,
 
     authority: Authority,
     buf: [u8; MSG_BUF],
+
+    /// `CUSTODY_READY` exchanges: the id each question slot answers, and
+    /// the reply waiting to go out in it.
+    ready_ids: [Option<ExchangeId>; ready::PROBES],
+    ready_reply: [[u8; ready::REPLY_MAX]; ready::PROBES],
+    ready_len: [u16; ready::PROBES],
+    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    outbox: ExchangeOutbox,
+    req_buf: [u8; x::RECORD_MAX],
+    out: [u8; x::RECORD_MAX],
+    cert_inbox: [u8; 3 + CERT_INBOX],
 }
 
 fn hex_nibble(c: u8) -> Option<u8> {
@@ -186,6 +229,15 @@ define_params! {
     12, dest5, str, 0 => |s, d, len| { enroll(s, d, len); };
     13, dest6, str, 0 => |s, d, len| { enroll(s, d, len); };
     14, dest7, str, 0 => |s, d, len| { enroll(s, d, len); };
+    15, trust_domain, str, 0 => |s, d, len| {
+        let t = str_param(d, len);
+        if t.len() > ca::TRUST_DOMAIN_MAX || t.len() > usize::from(u8::MAX) {
+            s.bad_trust_domain = 1;
+        } else {
+            s.trust_domain[..t.len()].copy_from_slice(t);
+            s.trust_domain_len = t.len() as u8;
+        }
+    };
 }
 
 fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
@@ -216,6 +268,8 @@ struct ModuleHost<'a> {
     out_ledger: i32,
     out_token: i32,
     out_grant: i32,
+    ready_reply: &'a mut [[u8; ready::REPLY_MAX]; ready::PROBES],
+    ready_len: &'a mut [u16; ready::PROBES],
 }
 
 /// One whole `[type][len][payload]` frame onto `ch`.
@@ -289,6 +343,24 @@ impl ca::Host for ModuleHost<'_> {
                     > 0
         }
     }
+
+    fn send_ready(&mut self, slot: usize, reply: &[u8]) -> bool {
+        // Held in the slot until the step loop can place it: an exchange
+        // answer is never dropped for want of room on the port.
+        let (Some(buf), Some(len)) = (self.ready_reply.get_mut(slot), self.ready_len.get_mut(slot))
+        else {
+            return false;
+        };
+        let Some(dst) = buf.get_mut(..reply.len()) else {
+            return false;
+        };
+        dst.copy_from_slice(reply);
+        #[expect(clippy::cast_possible_truncation, reason = "at most REPLY_MAX")]
+        {
+            *len = reply.len() as u16;
+        }
+        true
+    }
 }
 
 #[no_mangle]
@@ -337,6 +409,16 @@ pub unsafe extern "C" fn module_new(
         s.out_ledger = dev_channel_port(sys, 1, 1);
         s.out_token = dev_channel_port(sys, 1, 2);
         s.out_grant = dev_channel_port(sys, 1, 3);
+        s.in_ca_key = dev_channel_port(sys, 0, 4);
+        s.in_cert = dev_channel_port(sys, 0, 5);
+        s.in_requests = dev_channel_port(sys, 0, 6);
+        s.out_responses = dev_channel_port(sys, 1, 4);
+        s.trust_domain_len = 0;
+        s.bad_trust_domain = 0;
+        s.ready_ids = [None; ready::PROBES];
+        s.ready_len = [0; ready::PROBES];
+        s.requests = Collector::new();
+        s.outbox = ExchangeOutbox::new();
         s.key = issuer_key::IssuerKey::empty();
         s.key_pending = issuer_key::PendingRecord::empty();
         s.issuer_len = 0;
@@ -353,6 +435,13 @@ pub unsafe extern "C" fn module_new(
         if s.host_ok == 0 || s.issuer_len == 0 || s.bad_dest != 0 {
             let line =
                 b"[custody-authority] host (32 hex), iss and well-formed dest<n> are required";
+            dev_log(sys, 1, line.as_ptr(), line.len());
+            return -3;
+        }
+        if s.bad_trust_domain != 0
+            || (s.in_cert >= 0 && (s.trust_domain_len == 0 || s.in_ca_key < 0))
+        {
+            let line = b"[custody-authority] cert_in takes host certificates: it needs trust_domain (<= 128 bytes) and ca_key";
             dev_log(sys, 1, line.as_ptr(), line.len());
             return -3;
         }
@@ -392,6 +481,10 @@ pub unsafe extern "C" fn module_new(
             min_tier: s.min_tier,
         };
         cfg.ttl_ms = u64::from(s.ttl_ms);
+        // Construction is refused above unless the posture admits the
+        // grant key's vault, so a running authority states it.
+        cfg.posture_admits = true;
+        let _ = cfg.set_trust_domain(&s.trust_domain[..usize::from(s.trust_domain_len)]);
         let n = usize::from(s.issuer_len);
         cfg.issuer[..n].copy_from_slice(&s.issuer[..n]);
         cfg.issuer_len = n;
@@ -409,6 +502,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         drain_key(s, sys);
+        drain_ca_key(s, sys);
+        let mut worked = drain_certs(s, sys);
         let ModuleState {
             in_auth,
             in_ledger,
@@ -421,8 +516,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             sign_scratch,
             authority,
             buf,
+            ready_reply,
+            ready_len,
             ..
-        } = s;
+        } = &mut *s;
         let mut host = ModuleHost {
             sys,
             key,
@@ -431,8 +528,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             out_ledger: *out_ledger,
             out_token: *out_token,
             out_grant: *out_grant,
+            ready_reply,
+            ready_len,
         };
-        let mut worked = false;
         for _ in 0..4 {
             if *in_ledger < 0 || !chan::can_read(sys, *in_ledger) {
                 break;
@@ -467,12 +565,226 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             authority.on_provider(&mut host, t, buf.get(..usize::from(n)).unwrap_or(&[]));
         }
         authority.tick(&mut host);
+        worked |= serve_ready(s, sys);
         if worked {
             STEP_DID_WORK
         } else {
             0
         }
     }
+}
+
+/// The `CUSTODY_READY` exchanges: place answers that are ready, then take
+/// new questions while the port has room. True when anything moved.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live syscall table.
+unsafe fn serve_ready(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    if s.in_requests < 0 || s.out_responses < 0 {
+        return false;
+    }
+    let mut worked = false;
+    // Answers first: a question is taken only when its answer could leave.
+    for slot in 0..ready::PROBES {
+        if !s.outbox.flush(sys, s.out_responses, &s.out) {
+            return worked;
+        }
+        let n = usize::from(s.ready_len[slot]);
+        if n == 0 {
+            continue;
+        }
+        s.ready_len[slot] = 0;
+        if let Some(id) = s.ready_ids[slot].take() {
+            worked = true;
+            answer_ready(s, sys, &id, slot, n);
+        }
+    }
+    for _ in 0..2 {
+        if !s.outbox.flush(sys, s.out_responses, &s.out) || !chan::can_read(sys, s.in_requests) {
+            break;
+        }
+        let n = (sys.channel_read)(s.in_requests, s.req_buf.as_mut_ptr(), s.req_buf.len());
+        if n <= 0 {
+            break;
+        }
+        worked = true;
+        let outcome = {
+            let record = s.req_buf.get(..n as usize).unwrap_or(&[]);
+            s.requests.accept(record)
+        };
+        if let Some((id, bytes)) = s.requests.take_grant() {
+            if let Some(len) = x::write_credit(&id, bytes, &mut s.out) {
+                s.outbox.send(sys, s.out_responses, &s.out, len);
+            }
+        }
+        if let Some((id, why)) = s.requests.take_refusal() {
+            answer_status(s, sys, &id, why.status());
+        }
+        if let Ok(Some(at)) = outcome {
+            take_question(s, sys, at);
+        }
+    }
+    worked
+}
+
+/// One collected `CUSTODY_READY` request.
+///
+/// # Safety
+///
+/// As `serve_ready`.
+unsafe fn take_question(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
+    let Some(request) = s.requests.request(at) else {
+        return;
+    };
+    let id = request.id;
+    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let body_len = request.body.len();
+    let mut body = [0u8; MAX_REQUEST];
+    body[..body_len].copy_from_slice(request.body);
+    s.requests.release(at);
+    if let Some(status) = refused {
+        answer_status(s, sys, &id, status);
+        return;
+    }
+    let Some((ready::REQUEST, payload)) = typed_exchange::message(&body[..body_len]) else {
+        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        return;
+    };
+    let Some(slot) = s.ready_ids.iter().position(Option::is_none) else {
+        // Both slots wait on the ledger: BUSY, at once.
+        let mut env = [0u8; 3 + 2];
+        env[0] = ready::REPLY;
+        env[1..3].copy_from_slice(&2u16.to_le_bytes());
+        env[3..].copy_from_slice(&[ready::status::BUSY, 0]);
+        if let Some(n) = typed_exchange::write_answer(&id, &env, &mut s.out) {
+            s.outbox.send(sys, s.out_responses, &s.out, n);
+        }
+        return;
+    };
+    s.ready_ids[slot] = Some(id);
+    let ModuleState {
+        out_auth,
+        out_ledger,
+        out_token,
+        out_grant,
+        key,
+        sign_scratch,
+        authority,
+        ready_reply,
+        ready_len,
+        ..
+    } = &mut *s;
+    let mut host = ModuleHost {
+        sys,
+        key,
+        scratch: sign_scratch,
+        out_auth: *out_auth,
+        out_ledger: *out_ledger,
+        out_token: *out_token,
+        out_grant: *out_grant,
+        ready_reply,
+        ready_len,
+    };
+    authority.ready_request(&mut host, slot, payload);
+}
+
+/// Write the reply held in `slot` (`n` bytes) as `id`'s answer.
+///
+/// # Safety
+///
+/// As `serve_ready`; the outbox is clear.
+unsafe fn answer_ready(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    id: &ExchangeId,
+    slot: usize,
+    n: usize,
+) {
+    let reply = &s.ready_reply[slot][..n];
+    let Ok(len) =
+        auth_wire::write_envelope(ready::REPLY, reply, &mut s.out[typed_exchange::ANSWER_AT..])
+    else {
+        answer_status(s, sys, id, x::status::FAILED);
+        return;
+    };
+    if let Some(total) = typed_exchange::seal_answer(id, len, &mut s.out) {
+        s.outbox.send(sys, s.out_responses, &s.out, total);
+    }
+}
+
+/// Answer with a status alone.
+///
+/// # Safety
+///
+/// As `serve_ready`.
+unsafe fn answer_status(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, status: u16) {
+    if let Some(n) = typed_exchange::write_status(id, status, &mut s.out) {
+        s.outbox.send(sys, s.out_responses, &s.out, n);
+    }
+}
+
+/// Take the CA's public key from a VERIFY `MSG_KEY_ADD` on `ca_key`: the
+/// anchor a host certificate must chain to. The latest one is the anchor.
+///
+/// # Safety
+///
+/// Caller holds an exclusive `&mut ModuleState` and a live syscall table.
+unsafe fn drain_ca_key(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_ca_key < 0 {
+        return;
+    }
+    for _ in 0..4 {
+        if !chan::can_read(sys, s.in_ca_key) {
+            break;
+        }
+        let mut buf = [0u8; 512];
+        let (msg_type, plen) = chan::channel_read_msg(sys, s.in_ca_key, &mut buf);
+        if msg_type != auth_wire::MSG_KEY_ADD {
+            continue;
+        }
+        let Ok(rec) = auth_wire::KeyRecord::decode_add(&buf[..usize::from(plen)]) else {
+            continue;
+        };
+        if rec.key_use != auth_wire::key_use::VERIFY {
+            continue;
+        }
+        let mut anchor = [0u8; 2 + 65];
+        if let Some(n) = x509_leaf::write_anchor(rec.suite, rec.key_ref, &mut anchor) {
+            let _ = s.authority.config.set_anchor(&anchor[..n]);
+        }
+    }
+}
+
+/// Take host certificates off `cert_in`. True when a frame was read.
+///
+/// # Safety
+///
+/// As `drain_ca_key`.
+unsafe fn drain_certs(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    if s.in_cert < 0 {
+        return false;
+    }
+    let mut worked = false;
+    for _ in 0..2 {
+        let (msg_type, copied, pl) = net_read_frame_sized(
+            sys,
+            s.in_cert,
+            s.cert_inbox.as_mut_ptr(),
+            s.cert_inbox.len(),
+        );
+        if msg_type == 0 {
+            break;
+        }
+        worked = true;
+        if msg_type != 0x5C || copied != pl {
+            s.authority.stats.certs_refused = s.authority.stats.certs_refused.saturating_add(1);
+            continue;
+        }
+        let chain = &s.cert_inbox[3..3 + pl];
+        let _ = s.authority.on_cert(verify_suite, sha256_into, chain);
+    }
+    worked
 }
 
 /// Take the TRANSFER_GRANT signing key from a `MSG_KEY_ADD`.

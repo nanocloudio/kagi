@@ -23,6 +23,18 @@
 //!   (`session_directory` answers it from its committed registries). It is
 //!   relayed whole on `token_out` and its verdict (`0xC3`) back, so one
 //!   module is the provider's whole authority.
+//!
+//! And one question before a transfer is planned:
+//!
+//! - **Could these hosts take over now?** (`CUSTODY_READY`, [`ready`]): per
+//!   host, whether it is enrolled here, the custody tier its own attested
+//!   evidence last proved to this authority, whether a grant could be
+//!   issued to it now (grant key open, trusted clock, the ledger answering a
+//!   read made for this question, the posture admitting the grant key's
+//!   vault), and whether it holds a live identity certificate this
+//!   deployment's CA issued (delivered on the enrolment path, checked
+//!   against the CA's key). Every fact is one this authority observed; one
+//!   it has not observed answers not-ready, never ready.
 
 #![allow(
     dead_code,
@@ -30,11 +42,13 @@
 )]
 
 use crate::auth_wire;
+use crate::spiffe;
 use crate::state_wire;
 use crate::transfer_grant::{
     self as tg, CustodyCheck, EnrolledHost, Grant, Policy, Refusal, CUSTODY_VERDICT_LEN,
     MSG_CUSTODY_CHECK, MSG_CUSTODY_VERDICT,
 };
+use crate::x509_leaf;
 
 /// The ledger client id this authority writes under (the transfer-grant
 /// service's: the two share the `kagi/transfer-grants/` namespace and its
@@ -55,6 +69,83 @@ pub const MSG_KTGR_RECORD: u8 = 0x4B;
 
 const MAX_KEY: usize = 80;
 
+/// `CUSTODY_READY`: whether hosts could take over a Service's traffic now —
+/// enrolled, their proven custody tier, a grant issuable to them, a live
+/// identity certificate (`docs/architecture/typed-operations.md`).
+pub mod ready {
+    /// `[service 16][n u8][host 16 × n]`.
+    pub const REQUEST: u8 = 0xA0;
+    /// `[status u8][n u8]` then per host `[host 16][enrolled u8][tier u8]
+    /// [grant_ready u8][cert_ready u8][not_after u64]`.
+    pub const REPLY: u8 = 0xA1;
+    /// Hosts one question may name.
+    pub const MAX_HOSTS: usize = 32;
+    /// One host's row.
+    pub const ROW_LEN: usize = 16 + 4 + 8;
+    /// The longest reply.
+    pub const REPLY_MAX: usize = 2 + MAX_HOSTS * ROW_LEN;
+    /// Questions waiting on the ledger at once; one more is answered BUSY.
+    pub const PROBES: usize = 2;
+    /// How long the ledger has to answer before it is reported unreachable.
+    pub const TIMEOUT_MS: u64 = 2_000;
+    /// A tier no attested evidence has proven.
+    pub const TIER_UNKNOWN: u8 = 0xFF;
+    pub mod status {
+        pub const OK: u8 = 0;
+        /// Not `17 + 16·n` bytes, or `n` outside `1..=MAX_HOSTS`.
+        pub const MALFORMED: u8 = 1;
+        /// [`super::PROBES`] questions already wait on the ledger.
+        pub const BUSY: u8 = 2;
+    }
+}
+
+/// A host's identity certificate, as this authority last took it.
+#[derive(Clone, Copy)]
+pub struct HeldCert {
+    pub not_before: u64,
+    pub not_after: u64,
+}
+
+/// What this authority has observed of one enrolled host.
+#[derive(Clone, Copy)]
+pub struct Observed {
+    /// The tier the host's own attested evidence proved in a custody check
+    /// that verified here; [`ready::TIER_UNKNOWN`] until one has.
+    pub tier: u8,
+    pub cert: Option<HeldCert>,
+}
+
+impl Observed {
+    const NONE: Self = Self {
+        tier: ready::TIER_UNKNOWN,
+        cert: None,
+    };
+}
+
+#[derive(Clone, Copy)]
+struct Probe {
+    live: bool,
+    corr: u32,
+    slot: usize,
+    deadline_ms: u64,
+    n: usize,
+    hosts: [[u8; 16]; ready::MAX_HOSTS],
+}
+
+impl Probe {
+    const EMPTY: Self = Self {
+        live: false,
+        corr: 0,
+        slot: 0,
+        deadline_ms: 0,
+        n: 0,
+        hosts: [[0; 16]; ready::MAX_HOSTS],
+    };
+}
+
+/// Longest trust domain held.
+pub const TRUST_DOMAIN_MAX: usize = 128;
+
 /// What the authority needs from wherever it runs.
 pub trait Host {
     /// Wall-clock Unix milliseconds; 0 when no trustworthy clock exists.
@@ -72,6 +163,9 @@ pub trait Host {
     fn send_token(&mut self, frame: &[u8]) -> bool;
     /// One signed grant record (audit).
     fn send_grant(&mut self, record: &[u8]) -> bool;
+    /// The `CUSTODY_READY` reply payload for the question the host asked in
+    /// `slot` ([`Authority::ready_request`]).
+    fn send_ready(&mut self, slot: usize, reply: &[u8]) -> bool;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -82,6 +176,9 @@ pub struct Stats {
     pub tokens_relayed: u32,
     pub verdicts_relayed: u32,
     pub busy: u32,
+    pub certs_taken: u32,
+    pub certs_refused: u32,
+    pub ready_answered: u32,
 }
 
 mod stage {
@@ -127,6 +224,16 @@ pub struct Config {
     pub ttl_ms: u64,
     pub issuer: [u8; tg::MAX_ID],
     pub issuer_len: usize,
+    /// The trust domain host identities are named in.
+    pub trust_domain: [u8; TRUST_DOMAIN_MAX],
+    pub trust_domain_len: usize,
+    /// The CA's key, as `x509_leaf::anchor` reads it; empty until one is
+    /// delivered, and while empty no certificate is taken.
+    pub anchor: [u8; 2 + 65],
+    pub anchor_len: usize,
+    /// Whether the deployment's posture admits the grant key's vault tier
+    /// (`key_custody::permits(TransferGrant, …)`).
+    pub posture_admits: bool,
 }
 
 impl Config {
@@ -146,7 +253,43 @@ impl Config {
             ttl_ms: tg::TRANSFER_GRANT_TTL_MS,
             issuer: [0; tg::MAX_ID],
             issuer_len: 0,
+            trust_domain: [0; TRUST_DOMAIN_MAX],
+            trust_domain_len: 0,
+            anchor: [0; 2 + 65],
+            anchor_len: 0,
+            posture_admits: false,
         }
+    }
+
+    /// Set the trust domain; `false` when it does not fit.
+    pub fn set_trust_domain(&mut self, td: &[u8]) -> bool {
+        let Some(dst) = self.trust_domain.get_mut(..td.len()) else {
+            return false;
+        };
+        dst.copy_from_slice(td);
+        self.trust_domain_len = td.len();
+        true
+    }
+
+    /// Set the CA's key (`[suite u16 LE][public]`); `false`, and nothing
+    /// changed, when it is not one `x509_leaf::anchor` reads.
+    pub fn set_anchor(&mut self, anchor: &[u8]) -> bool {
+        if x509_leaf::anchor(anchor).is_none() {
+            return false;
+        }
+        let Some(dst) = self.anchor.get_mut(..anchor.len()) else {
+            return false;
+        };
+        dst.copy_from_slice(anchor);
+        self.anchor_len = anchor.len();
+        true
+    }
+
+    fn enrolled(&self, id: &[u8; 16]) -> Option<usize> {
+        self.hosts
+            .get(..self.host_count)?
+            .iter()
+            .position(|h| h.id == *id)
     }
 
     /// Enroll a standby host; `false` when the table is full.
@@ -169,6 +312,9 @@ pub struct Authority {
     next_corr: u32,
     ops: [Op; MAX_OPS],
     pub stats: Stats,
+    /// Per enrolled host (the index of `config.hosts`).
+    pub observed: [Observed; MAX_HOSTS],
+    probes: [Probe; ready::PROBES],
 }
 
 impl Authority {
@@ -185,7 +331,12 @@ impl Authority {
                 tokens_relayed: 0,
                 verdicts_relayed: 0,
                 busy: 0,
+                certs_taken: 0,
+                certs_refused: 0,
+                ready_answered: 0,
             },
+            observed: [Observed::NONE; MAX_HOSTS],
+            probes: [Probe::EMPTY; ready::PROBES],
         }
     }
 
@@ -241,7 +392,7 @@ impl Authority {
             return;
         }
         let cfg = self.config;
-        let grant = match tg::decide_custody_check(
+        let decided = tg::decide_custody_check(
             sha,
             host.verify(),
             &cfg.policy,
@@ -250,7 +401,17 @@ impl Authority {
             &check,
             cfg.ttl_ms,
             now,
-        ) {
+        );
+        // The standby's evidence verified: the tier it proved is a fact
+        // about that host whatever the ledger does next.
+        if let Ok(g) = &decided {
+            if let Some(i) = cfg.enrolled(&g.destination) {
+                if let Some(o) = self.observed.get_mut(i) {
+                    o.tier = g.proven_tier;
+                }
+            }
+        }
+        let grant = match decided {
             Ok(g) => g,
             Err(r) => {
                 refuse(host, &mut self.stats, r);
@@ -299,6 +460,17 @@ impl Authority {
         if reply.client != STATE_CLIENT {
             return;
         }
+        if let Some(i) = self
+            .probes
+            .iter()
+            .position(|p| p.live && p.corr == reply.correlation)
+        {
+            // The ledger answered a read: reachable, unless it said it is
+            // not.
+            let reachable = matches!(reply.status, auth_wire::ST_OK | auth_wire::ST_NOT_FOUND);
+            self.answer_probe(host, i, reachable);
+            return;
+        }
         let issuer = self.config.issuer;
         let issuer_len = self.config.issuer_len;
         let Some(op) = self
@@ -320,7 +492,8 @@ impl Authority {
         }
     }
 
-    /// Refuse every check whose ledger stage outlived its deadline.
+    /// Refuse every check whose ledger stage outlived its deadline, and
+    /// answer every readiness question the ledger left unanswered.
     pub fn tick<H: Host>(&mut self, host: &mut H) {
         let now = host.now_ms();
         for op in &mut self.ops {
@@ -328,6 +501,161 @@ impl Authority {
                 finish(host, op, &mut self.stats, Err(Refusal::LedgerUnavailable));
             }
         }
+        for i in 0..ready::PROBES {
+            let p = self.probes[i];
+            if p.live && now != 0 && now > p.deadline_ms {
+                self.answer_probe(host, i, false);
+            }
+        }
+    }
+
+    /// A chain from the enrolment path (`identity_cert`'s payload: `leaf
+    /// DER ‖ issuer DER ‖ …`). Taken when the leaf is one the CA signed and
+    /// names an enrolled host (`spiffe://<trust domain>/host/<id>`); the
+    /// later-expiring of two certificates for one host is kept. True when
+    /// taken.
+    pub fn on_cert(&mut self, verify: tg::VerifyFn, sha: tg::Sha256Fn, chain: &[u8]) -> bool {
+        let taken = self.take_cert(verify, sha, chain);
+        if taken {
+            self.stats.certs_taken = self.stats.certs_taken.saturating_add(1);
+        } else {
+            self.stats.certs_refused = self.stats.certs_refused.saturating_add(1);
+        }
+        taken
+    }
+
+    fn take_cert(&mut self, verify: tg::VerifyFn, sha: tg::Sha256Fn, chain: &[u8]) -> bool {
+        let cfg = &self.config;
+        let Some((suite, public)) =
+            x509_leaf::anchor(cfg.anchor.get(..cfg.anchor_len).unwrap_or(&[]))
+        else {
+            return false;
+        };
+        let Some(leaf) = x509_leaf::element_len(chain)
+            .and_then(|n| chain.get(..n))
+            .and_then(x509_leaf::parse)
+        else {
+            return false;
+        };
+        if !x509_leaf::signed_by(&leaf, verify, suite, public) || leaf.not_after <= leaf.not_before
+        {
+            return false;
+        }
+        let td = cfg.trust_domain.get(..cfg.trust_domain_len).unwrap_or(&[]);
+        let Some(who) = spiffe::parse(sha, leaf.san_uri, td) else {
+            return false;
+        };
+        if who.class != spiffe::Class::Host {
+            return false;
+        }
+        let Some(i) = cfg.enrolled(&who.id) else {
+            return false;
+        };
+        let Some(o) = self.observed.get_mut(i) else {
+            return false;
+        };
+        if o.cert.is_some_and(|c| c.not_after > leaf.not_after) {
+            // An older certificate delivered late changes nothing.
+            return true;
+        }
+        o.cert = Some(HeldCert {
+            not_before: leaf.not_before,
+            not_after: leaf.not_after,
+        });
+        true
+    }
+
+    /// Whether a `CUSTODY_READY` question could be taken now: the slot it
+    /// would wait in, `None` when [`ready::PROBES`] already wait.
+    #[must_use]
+    pub fn ready_slot(&self) -> Option<usize> {
+        self.probes.iter().position(|p| !p.live)
+    }
+
+    /// A `CUSTODY_READY` request payload, asked in `slot` (from
+    /// [`Self::ready_slot`]). Answered through [`Host::send_ready`] — at
+    /// once when it does not decode or no slot is free, otherwise when the
+    /// ledger answers the read made for it, or [`ready::TIMEOUT_MS`] after.
+    pub fn ready_request<H: Host>(&mut self, host: &mut H, slot: usize, payload: &[u8]) {
+        let Some(hosts) = decode_ready(payload) else {
+            let reply = [ready::status::MALFORMED, 0];
+            let _ = host.send_ready(slot, &reply);
+            return;
+        };
+        if self.probes.get(slot).is_none_or(|p| p.live) {
+            let reply = [ready::status::BUSY, 0];
+            let _ = host.send_ready(slot, &reply);
+            return;
+        }
+        let mut probe = Probe::EMPTY;
+        probe.live = true;
+        probe.slot = slot;
+        probe.corr = self.next_corr;
+        self.next_corr = self.next_corr.wrapping_add(1).max(1);
+        probe.deadline_ms = host.now_ms().saturating_add(ready::TIMEOUT_MS);
+        probe.n = hosts.len() / 16;
+        for (dst, src) in probe.hosts.iter_mut().zip(hosts.chunks_exact(16)) {
+            dst.copy_from_slice(src);
+        }
+        self.probes[slot] = probe;
+        // The ledger is asked now, for this question: reachability is what
+        // it does, not what it did.
+        let sent = send(
+            host,
+            state_wire::MSG_STATE_GET,
+            &state_wire::get(
+                probe.corr,
+                STATE_CLIENT,
+                state_wire::NS_TRANSFER_GRANT,
+                tg::GENERATION_KEY,
+            ),
+        );
+        if !sent {
+            self.answer_probe(host, slot, false);
+        }
+    }
+
+    fn answer_probe<H: Host>(&mut self, host: &mut H, i: usize, ledger: bool) {
+        let Some(p) = self.probes.get(i).copied() else {
+            return;
+        };
+        if !p.live {
+            return;
+        }
+        self.probes[i] = Probe::EMPTY;
+        let now_ms = host.now_ms();
+        let key = host.issuer_suite() != 0;
+        let mut reply = [0u8; ready::REPLY_MAX];
+        reply[0] = ready::status::OK;
+        #[expect(clippy::cast_possible_truncation, reason = "at most MAX_HOSTS")]
+        {
+            reply[1] = p.n as u8;
+        }
+        let cfg = &self.config;
+        let anchored = x509_leaf::anchor(cfg.anchor.get(..cfg.anchor_len).unwrap_or(&[])).is_some();
+        for (row, id) in reply[2..]
+            .chunks_exact_mut(ready::ROW_LEN)
+            .zip(p.hosts.iter().take(p.n))
+        {
+            let at = cfg.enrolled(id);
+            let seen = at
+                .and_then(|i| self.observed.get(i).copied())
+                .unwrap_or(Observed::NONE);
+            let enrolled = at.is_some();
+            let grant_ready = enrolled && key && now_ms != 0 && ledger && cfg.posture_admits;
+            let unix_secs = now_ms / 1000;
+            let cert_ready = seen.cert.is_some_and(|c| {
+                anchored && now_ms != 0 && c.not_before <= unix_secs && unix_secs < c.not_after
+            });
+            row[..16].copy_from_slice(id);
+            row[16] = u8::from(enrolled);
+            row[17] = seen.tier;
+            row[18] = u8::from(grant_ready);
+            row[19] = u8::from(cert_ready);
+            row[20..28].copy_from_slice(&seen.cert.map_or(0, |c| c.not_after).to_le_bytes());
+        }
+        self.stats.ready_answered = self.stats.ready_answered.saturating_add(1);
+        let _ = host.send_ready(p.slot, &reply[..2 + p.n * ready::ROW_LEN]);
     }
 }
 
@@ -335,6 +663,17 @@ impl Default for Authority {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The host ids a `CUSTODY_READY` request names (`16·n` bytes), when it is
+/// exactly `[service 16][n u8][host 16 × n]` with `n` in `1..=MAX_HOSTS`.
+#[must_use]
+pub fn decode_ready(payload: &[u8]) -> Option<&[u8]> {
+    let n = usize::from(*payload.get(16)?);
+    if n == 0 || n > ready::MAX_HOSTS || payload.len() != 17 + 16 * n {
+        return None;
+    }
+    payload.get(17..)
 }
 
 fn frame(out: &mut [u8], msg_type: u8, payload: &[u8]) -> usize {

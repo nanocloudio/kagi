@@ -1,0 +1,47 @@
+version = "0.1.0"
+# A carrier's iat/exp, its lifetime and the renewal are wall-clock durations.
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+edition = "2021"
+hardware_targets = ["bcm2712", "linux"]
+
+# carrier_mint — the holder's half of a certificate-bound identity carrier
+# (modules/common/cert_bound_identity.rs is the relying party's): ES256
+# compact JWSs signed in the vault with this module's own vault-born P-256
+# key, its leaf in `x5c`, for a relying party that cannot see the holder's
+# TLS identity (Kagi's `service_dns_sign` behind Wormhole's
+# `dns_sign_relay`). The key is certified on the seam Fluxor's `tls` uses:
+# `identity_req` out, `identity_cert` in.
+
+# `[0x5C][len u16 LE][leaf DER ‖ issuer DER ‖ …]` (net_proto framed), from
+# the enrolment path. Taken only when the leaf certifies this key.
+[[ports]]
+name = "identity_cert"
+direction = "input"
+content_type = "OctetStream"
+required = true
+buffer_size = 4096
+
+# `[len u16 LE][compact JWS]`, each at most 4608 bytes: one on
+# certification, then one every `period_ms`. Wire to the consumer's carrier
+# input (Wormhole `dns_sign_relay.carrier_in`).
+[[ports]]
+name = "carrier_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 16384
+
+# `[0x5B][len u16 LE = 65][SEC1 point]`: the key to certify, every second
+# until a chain is taken and again at two thirds of its lifetime.
+[[ports]]
+name = "identity_req"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+required = true
+buffer_size = 512
+
+[observability]
+metrics = ["minted", "chains_taken", "chains_refused", "no_clock", "outside_window", "stale", "sign_failed"]

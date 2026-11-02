@@ -148,6 +148,17 @@ implementation in `tests/harness/src/jwt_svid.rs`: chain the `x5c` leaf to the t
 `iss == sub == leaf SAN`, and derive the same `svid`. This mirrors sector's
 `jwt_gate`, so a kagi-issued leaf's JWT-SVID and a kagi verifier agree.
 
+When the holder is itself a graph — a control-plane node whose identity key
+was born in its vault, such as the region controller Wormhole's
+`dns_sign_relay` signs for — the module `carrier_mint` is the holder's
+signer: it opens its own P-256 key by `identity_label`, has it certified on
+the `identity_req` / `identity_cert` seam Fluxor's `tls` uses, and signs
+these carriers in the vault (`modules/common/carrier_mint.rs` writes them;
+`x5c` the leaf alone, `exp − iat` at most 300 s). Kagi's own modules verify
+them with `modules/common/cert_bound_identity.rs`. The key is the holder's,
+never one of kagi's issuer keys. See
+[architecture/typed-operations.md](architecture/typed-operations.md#carrier_mint-not-a-typed-operation).
+
 kagi also mints the **issuer-signed** SPIFFE JWT-SVID (the SPIRE workload-API
 shape — `jwt_svid::issue_issuer_signed`/`verify_issuer_signed`): a JWT kagi
 signs with its own key for a workload (`sub` = SPIFFE id, `aud` = audiences),
@@ -226,6 +237,7 @@ must be denied; the registry denies it once, at the source.
 | X.509 leaf with a SPIFFE SAN | `certificate_endpoint`, under a P-256 CA, with `modules/common/der.rs` emitting the profile |
 | Identity naming | `modules/common/spiffe.rs` — device, workload, service, host and operator classes |
 | Host and operator leaves | `certificate_endpoint`, when the graph's `issue_classes` admits them |
+| Cert-bound carriers for a vault-born holder | `carrier_mint` — the holder's own key, certified over `identity_req` / `identity_cert` |
 | Signed control acts, transfer grants, attachment grants, `service_dns` projections, operation scopes | `control_act_mint`, `transfer_grant`, `attachment_authorize`, `service_dns_sign`, `scope_mint` — see [architecture/control-acts.md](architecture/control-acts.md) |
 | Access token | `cnf`/DPoP bound — `token_endpoint` → `mint_admission` → `token_mint` |
 | Trust domain | `__TRUST_DOMAIN__` in `configs/pki.yaml` |
