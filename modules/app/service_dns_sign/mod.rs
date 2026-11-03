@@ -1,4 +1,4 @@
-//! Service DNS sign — sign a Wormhole `service_dns` projection (`KSDN`) for
+//! Service DNS sign — sign a traffic-fabric `service_dns` projection (`KSDN`) for
 //! the publisher the graph pins to its service.
 //!
 //! A typed operation: a PROVIDER of the workspace exchange contract on

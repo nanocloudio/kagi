@@ -1,4 +1,4 @@
-//! Transfer grant — key-custody transfer grants (`KTGR`) for Wormhole's
+//! Transfer grant — key-custody transfer grants (`KTGR`) for the traffic fabric's
 //! paired-anchor TLS continuity (RFC §12.5.5, §15.4).
 //!
 //! The decisions are `modules/common/transfer_grant_service.rs`; this module

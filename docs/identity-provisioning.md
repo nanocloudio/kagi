@@ -56,7 +56,7 @@ is new is that every class now has one 16-byte id (`spiffe::parse`): a host
 or operator carries it in the path, and a device, workload or service id is
 the first 16 bytes of `SHA-256(name)`. That is the actor id a signed control
 act (`docs/architecture/control-acts.md`) carries beside its class byte, so
-Wormhole can compare actors as fixed bytes.
+a traffic fabric can compare actors as fixed bytes.
 
 `certificate_endpoint` composes all of them from its own trust domain and the
 request's `class` (`device` when absent; `host` with `host_id`; `operator`
@@ -149,7 +149,7 @@ implementation in `tests/harness/src/jwt_svid.rs`: chain the `x5c` leaf to the t
 `jwt_gate`, so a kagi-issued leaf's JWT-SVID and a kagi verifier agree.
 
 When the holder is itself a graph — a control-plane node whose identity key
-was born in its vault, such as the region controller Wormhole's
+was born in its vault, such as the region controller the traffic fabric's
 `dns_sign_relay` signs for — the module `carrier_mint` is the holder's
 signer: it opens its own P-256 key by `identity_label`, has it certified on
 the `identity_req` / `identity_cert` seam Fluxor's `tls` uses, and signs

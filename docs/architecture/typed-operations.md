@@ -149,8 +149,14 @@ payload is exactly 56 bytes.
 
 `verify_err`: 0 OK, 1 MALFORMED, 2 NO_KEY, 3 UNKNOWN_KID, 4 BAD_SIGNATURE,
 5 EXPIRED, 6 SUITE_MISMATCH, 7 WRONG_AUDIENCE, 8 WRONG_ISSUER,
-9 WRONG_PROFILE, 10 INSUFFICIENT_ASSURANCE, 11 NO_CLOCK. With no key loaded
-every request is answered NO_KEY before its payload is decoded.
+9 WRONG_PROFILE, 10 INSUFFICIENT_ASSURANCE, 11 NO_CLOCK, 12 UNKNOWN_ISSUER.
+With no key loaded every request is answered NO_KEY before its payload is
+decoded. The key is selected by the credential's `(iss, kid)`, never by
+`kid` alone: a credential whose `iss` names an issuer with no key held is
+UNKNOWN_ISSUER, and one whose issuer is known but has no such `kid` is
+UNKNOWN_KID. Keys of different issuers may share a `kid`; each verifies
+only its own issuer's credentials. Where `expected_profile` is set, a key
+of that profile is preferred among those sharing the `(iss, kid)`.
 
 ## mint_admission
 
@@ -326,7 +332,7 @@ public half of each signing key, as a VERIFY `MSG_KEY_ADD`). Param: `posture`
 | 3 | `profile_id` | u16 |
 | 5 | `kid` | f8 — empty = the profile's ACTIVE key |
 | 6+k | `ttl_seconds` | u32 |
-| 10+k | `iss` | f16 |
+| 10+k | `iss` | f16 — empty = any issuer; the minted `iss` is the signing key's |
 | 12+k+i | `sub` | f16 |
 | 14+k+i+s | `aud` | f16 |
 | 16+k+i+s+a | `scope` | f16 |
@@ -395,7 +401,7 @@ A fixed 124 bytes: `[status u8][kind u8][actor class u8][target kind u8]
 [actor 16][tenant 16][service 16][target 16][operation 16]
 [expected epoch u64][record digest 32]`. `status` 0 is OK, otherwise a
 `control_act::Refusal` code; a refusal carries every later field zero (it
-does not decode otherwise). `record digest` is what a Wormhole route record
+does not decode otherwise). `record digest` is what a traffic-fabric route record
 stores as `provenance_digest`.
 
 ### `MINT_REQ` 0x92
@@ -494,7 +500,7 @@ lowercase hex digits. A publisher param that does not parse refuses to
 construct; a graph pinning none signs for nobody.
 
 `REQUEST` 0x98 payload: `[projection f16][carrier f16]` — the projection is
-Wormhole's unsigned 224-byte `region_ctl.v1` 0xB6 record, its trailing 32
+the traffic fabric's unsigned 224-byte `region_ctl.v1` 0xB6 record, its trailing 32
 bytes zero. `REPLY` 0x99 payload: `[status u8][record f16]` — the signed
 `KSDN` record (`[KSDN][version][reserved 3][projection 224][issuer f8][kid
 f8][suite u16][signature f16]`), empty on every refusal.
@@ -529,8 +535,8 @@ import, proven with an RPKI Signed Checklist (RSC, RFC 9323) under the trust
 anchor and the tenant's resource holder's CA chain, every link checked
 against its issuer's current CRL (`modules/common/rpki.rs`), whose checklist
 signs the SHA-256 of the import's challenge
-(`wormhole-ownership.v1` ‖ tenant 16 ‖ family u8 (4 or 6) ‖ address 16, IPv4
-in the last four ‖ length u8). The answer is Wormhole's
+(`fabric-ownership.v1` ‖ tenant 16 ‖ family u8 (4 or 6) ‖ address 16, IPv4
+in the last four ‖ length u8). The answer is the traffic fabric's
 `OwnershipEvidence`, field for field; its `address_core` admits an import
 only with `verified`. The decision is `modules/common/rsc_verify.rs`; the
 module keeps no key and runs on the SDK's SHA-256 and RSA (PKCS#1 v1.5,
@@ -571,14 +577,14 @@ checklist's: 0x40 SHAPE, 0x41 RESOURCES (outside the EE certificate's),
 checklist does not sign this tenant's claim to this prefix).
 
 Not done, each a stated limit: fetching (the caller hands in every object;
-Wormhole's RRDP side), manifests, AS resources, address ranges that are not
+the traffic fabric's RRDP side), manifests, AS resources, address ranges that are not
 prefixes, CRL scope semantics. Driven by `tests/rsc_verify.rs`
 (`configs/rsc-verify.yaml`).
 
 ## custody_authority: CUSTODY_READY
 
 Whether hosts could take over a Service's traffic now — the question a
-zone evacuation's KEYS proof asks before it moves anything (Wormhole's
+zone evacuation's KEYS proof asks before it moves anything (the traffic fabric's
 `zone_evacuation_controller`). Served by `custody_authority`, the module
 that decides the transfers themselves, because it is the one that holds the
 facts: which standbys are enrolled, the grant key, the ledger the grants'
@@ -660,7 +666,7 @@ trusted clock, or outside the leaf's window, nothing is minted.
 
 Supply: one carrier when a chain is taken, then one every `period_ms`. Each
 is single use (the relying party keeps its `jti`); one the port will not
-take is retried until half its life has gone, then replaced. Wormhole's
+take is retried until half its life has gone, then replaced. The traffic fabric's
 `dns_sign_relay` holds four and drops each after its `carrier_ttl_ms`: set
 `carrier_ttl_ms` ≤ `lifetime_s` × 1000 and `period_ms` ≤ `carrier_ttl_ms` /
 4 to keep it stocked (the defaults: 60 s, 15 s). There is no demand input:

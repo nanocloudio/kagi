@@ -1,13 +1,13 @@
 //! The signed control act: provenance for an ownership-changing request.
 //!
-//! Wormhole's control plane changes who owns what — a route generation, a
+//! A traffic fabric's control plane changes who owns what — a route generation, a
 //! VIP, a flow's anchor, a private attachment — on the say-so of a host, an
 //! operator or a workload. Its RFC (§15.1) requires every such request to
 //! carry its actor, scope, operation id, target, expected epoch and a
-//! signed, auditable provenance, and (§9.4) requires the record Wormhole
+//! signed, auditable provenance, and (§9.4) requires the record the traffic fabric
 //! materialises to retain that provenance as a 32-byte digest. This fragment
 //! is the signed artefact behind both: Kagi signs the act for an actor it
-//! has authenticated, Wormhole verifies it offline against Kagi's published
+//! has authenticated, the traffic fabric verifies it offline against Kagi's published
 //! keyset at ingestion, and the route record carries [`record_digest`] as its
 //! `provenance_digest`.
 //!
@@ -51,7 +51,7 @@
 //! The declaration digest binds the act to exactly one declaring payload —
 //! the `WHR1` route record a publish carries, the attachment publication,
 //! the fence confirmation — so an act cannot be lifted onto another payload
-//! of the same kind. Wormhole checks it against the payload it ingests. The
+//! of the same kind. The traffic fabric checks it against the payload it ingests. The
 //! policy digest names the policy object the actor was admitted under, for
 //! the audit trail; this fragment carries it and does not interpret it.
 //!
@@ -190,7 +190,7 @@ pub const FIXED_LEN: usize = 176;
 /// Longest issuer identifier or kid a record carries.
 pub const MAX_ID: usize = 64;
 /// Longest signature: Ed25519 and ES256 are both 64 bytes. An act travels
-/// inside a Wormhole control request and is named by its digest, so a suite
+/// inside a traffic-fabric control request and is named by its digest, so a suite
 /// whose signature is kilobytes is not an act suite.
 pub const MAX_SIGNATURE: usize = 64;
 /// The largest record this profile produces.
@@ -604,7 +604,7 @@ impl<'a> Record<'a> {
     }
 }
 
-/// SHA-256 of a whole record: what Wormhole stores as a route record's
+/// SHA-256 of a whole record: what the traffic fabric stores as a route record's
 /// `provenance_digest`, and how the audit trail names the act.
 #[must_use]
 pub fn record_digest(sha: Sha256Fn, record: &[u8]) -> [u8; 32] {
@@ -614,7 +614,7 @@ pub fn record_digest(sha: Sha256Fn, record: &[u8]) -> [u8; 32] {
 }
 
 /// SHA-256 of a declaring payload: what an act's declaration digest is
-/// computed over. Plain SHA-256 of the exact bytes, so Wormhole can compute
+/// computed over. Plain SHA-256 of the exact bytes, so the traffic fabric can compute
 /// it over the `WHR1` record it ingests with nothing but a hash.
 #[must_use]
 pub fn declaration_digest(sha: Sha256Fn, declaration: &[u8]) -> [u8; 32] {

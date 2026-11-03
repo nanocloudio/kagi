@@ -889,6 +889,13 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, 
 
     let kid_bytes = s.keys[slot].kid;
     let kid = &kid_bytes[..usize::from(s.keys[slot].kid_len)];
+    // The `iss` is the signing key's issuer, always. A verifier selects a
+    // key by `(iss, kid)`, so a token whose `iss` was not its key's issuer
+    // would name a key that did not sign it. A request naming an issuer
+    // only reaches here when `select_key` found a key of that issuer, so
+    // this is what it asked for; one naming none gets the key's.
+    let issuer_bytes = s.keys[slot].issuer;
+    let issuer = &issuer_bytes[..usize::from(s.keys[slot].issuer_len)];
     // The JOSE `alg` is derived from the suite, not chosen alongside it —
     // a header naming an algorithm the signature was not made with is the
     // whole class of algorithm-confusion bug.
@@ -896,7 +903,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, 
     let built = (|| -> Result<usize, jose::JoseError> {
         let h_len = jose::write_header(jws_alg, kid, &mut header)?;
         let access = jose::AccessClaims {
-            iss: req.iss,
+            iss: issuer,
             sub: req.sub,
             aud: req.aud,
             scope: req.scope,

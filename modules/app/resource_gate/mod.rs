@@ -632,15 +632,17 @@ unsafe fn admit(
     // The order, the failure directions and the position of the replay record
     // are the fragment's contract, so every module that authenticates a
     // presented credential performs them identically.
-    // Which key signed the token is the token's own claim, in its header.
-    // Looked up, never guessed: an unknown kid is refused rather than
-    // checked against whatever key is loaded.
+    // Which key signed the token is the token's own claim: its `iss` and
+    // the `kid` in its header. Looked up by both, never guessed: an unknown
+    // issuer or kid is refused rather than checked against whatever key is
+    // loaded, and one issuer's key never answers for another's token.
     let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
     let mut pubkey = [0u8; verify_keyset::MAX_PUBKEY_LEN];
     let mut pubkey_len = 0usize;
     let mut key_suite = 0u16;
-    if let Some(kid_len) = device_auth::credential_kid(token, &mut kid) {
-        if let Some(k) = s.keyset.select(&kid[..kid_len], now) {
+    let mut iss = [0u8; verify_keyset::MAX_ISSUER_LEN];
+    if let Some((iss_len, kid_len)) = device_auth::credential_key_name(token, &mut iss, &mut kid) {
+        if let Ok(k) = s.keyset.select(&iss[..iss_len], &kid[..kid_len], now) {
             pubkey_len = k.pubkey_bytes().len();
             pubkey[..pubkey_len].copy_from_slice(k.pubkey_bytes());
             key_suite = k.suite;

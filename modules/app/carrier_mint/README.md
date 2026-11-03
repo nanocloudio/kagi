@@ -3,7 +3,7 @@
 The holder's half of a certificate-bound identity carrier
 (`modules/common/cert_bound_identity.rs` is the relying party's). A graph that
 must authenticate to a Kagi relying party which cannot see its TLS identity —
-Wormhole's `dns_sign_relay` calling `service_dns_sign`, for one — presents a
+the traffic fabric's `dns_sign_relay` calling `service_dns_sign`, for one — presents a
 carrier: an ES256 compact JWS signed with its leaf's own key, the leaf in
 `x5c`, naming that relying party for at most five minutes. This module mints
 them from a key born in its own vault and keeps the consumer stocked.
@@ -65,12 +65,12 @@ at once.
 Metrics: `minted`, `chains_taken`, `chains_refused`, `no_clock`,
 `outside_window`, `stale`, `sign_failed`.
 
-## Wiring it for Wormhole
+## Wiring it for a traffic fabric
 
 ```yaml
 - name: controller_carriers
   type: carrier_mint
-  identity_label: "wormhole/region-controller/identity"
+  identity_label: "fabric/region-controller/identity"
   audience: "kagi:service-dns"         # = service_dns_sign's audience
   lifetime_s: 60
   period_ms: 15000

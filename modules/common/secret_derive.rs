@@ -1,7 +1,7 @@
 //! Values derived from a stored secret for one context
 //! (`secret_store`'s `MSG_SECRET_DERIVE`).
 //!
-//! A secret item that several hosts must hold alike — Wormhole's route seed
+//! A secret item that several hosts must hold alike — the traffic fabric's route seed
 //! secret, which every director's flow hash for a route is keyed by — is
 //! provisioned into each host's store once (`MSG_SECRET_PUT`, the same
 //! value everywhere) and never read back whole: a consumer asks for the
@@ -41,19 +41,19 @@ pub fn derive(hmac: HmacFn, secret: &[u8], context: &[u8]) -> Option<[u8; DERIVE
     Some(hmac(secret, &msg[..DOMAIN.len() + context.len()]))
 }
 
-/// The secret item Wormhole's route builders share: provisioned under this
+/// The secret item the traffic fabric's route builders share: provisioned under this
 /// id on every host that builds a route's table.
-pub const ROUTE_SEED_ID: &[u8] = b"wormhole/route-seed";
+pub const ROUTE_SEED_ID: &[u8] = b"fabric/route-seed";
 
 /// The context a route's seed secret is derived for:
-/// `"wh-route-seed.v1" ‖ service_id ‖ hash_seed_ref` — the route's service
+/// `"fabric-route-seed.v1" ‖ service_id ‖ hash_seed_ref` — the route's service
 /// and the seed reference its record names, so two routes never share a
 /// seed and a reference rotated in the catalogue rotates the seed.
 #[must_use]
-pub fn route_seed_context(service_id: &[u8; 16], hash_seed_ref: &[u8; 16]) -> [u8; 48] {
-    let mut c = [0u8; 48];
-    c[..16].copy_from_slice(b"wh-route-seed.v1");
-    c[16..32].copy_from_slice(service_id);
-    c[32..48].copy_from_slice(hash_seed_ref);
+pub fn route_seed_context(service_id: &[u8; 16], hash_seed_ref: &[u8; 16]) -> [u8; 52] {
+    let mut c = [0u8; 52];
+    c[..20].copy_from_slice(b"fabric-route-seed.v1");
+    c[20..36].copy_from_slice(service_id);
+    c[36..52].copy_from_slice(hash_seed_ref);
     c
 }

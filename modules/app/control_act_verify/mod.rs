@@ -6,7 +6,7 @@
 //! `control_act::msg::VERIFY_REQ` envelope (`[record f16][declaration f16]`)
 //! and each answer body one `VERIFY_RESP` envelope carrying the typed
 //! verdict (`control_act::Verdict`): the act's actor, scope, target,
-//! operation id, expected epoch and the record digest Wormhole stores as its
+//! operation id, expected epoch and the record digest the traffic fabric stores as its
 //! `provenance_digest`. Every verdict, refusals included, is a 200 exchange.
 //!
 //! Verifying keys arrive on `verify_key` as `MSG_KEY_ADD` records of the

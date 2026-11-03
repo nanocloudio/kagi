@@ -290,28 +290,50 @@ pub fn authenticate<'b>(
     })
 }
 
-/// The `kid` a credential names, copied into `out`; returns its length.
+/// The key a credential names — the issuer its `iss` claims and the `kid`
+/// in its header — copied into `iss_out` and `kid_out`; returns both
+/// lengths.
 ///
 /// The credential says which key signed it, and that is a claim to be
 /// looked up, not a fact to be trusted: the caller resolves it against a
-/// keyset and refuses an unknown one. What this must never become is a
-/// hint — "use this key if we have it, otherwise any key" — which is what a
-/// `kid` that nothing indexes by amounts to.
+/// keyset (`verify_keyset::Keyset::select`) and refuses an unknown one.
+/// What this must never become is a hint — "use this key if we have it,
+/// otherwise any key" — which is what a `kid` that nothing indexes by
+/// amounts to. And a `kid` is only a name within its issuer: resolved
+/// alone, it lets one issuer's key answer for another that shares the
+/// name, so the issuer is read and resolved with it.
 ///
-/// `None` when the credential is not a compact JWS, its header does not
-/// base64-decode, it carries no `kid`, or the `kid` does not fit `out`.
-/// Every one of those is a credential this caller cannot resolve a key
-/// for, so they collapse to one answer.
-pub fn credential_kid(credential: &[u8], out: &mut [u8]) -> Option<usize> {
+/// Both are read before the signature is checked, which is safe for the
+/// one use they have: choosing the key. A forged `iss` can only select the
+/// key of the issuer it names, and that key will not verify a signature
+/// the forger made.
+///
+/// `None` when the credential is not a compact JWS, its header or payload
+/// does not base64-decode within [`MAX_SEGMENT`], it carries no `kid` or no
+/// `iss`, or either does not fit its buffer. Every one of those is a
+/// credential this caller cannot resolve a key for, so they collapse to
+/// one answer.
+pub fn credential_key_name(
+    credential: &[u8],
+    iss_out: &mut [u8],
+    kid_out: &mut [u8],
+) -> Option<(usize, usize)> {
     let jws = jose::Jws::split(credential)?;
     let mut header_json = [0u8; 512];
     let n = b64::decode(jws.header_b64, &mut header_json)?;
     let kid = jose::claim_str(&header_json[..n], b"kid")?;
-    if kid.is_empty() || kid.len() > out.len() {
+    if kid.is_empty() || kid.len() > kid_out.len() {
         return None;
     }
-    out[..kid.len()].copy_from_slice(kid);
-    Some(kid.len())
+    let mut payload_json = [0u8; MAX_SEGMENT];
+    let p = b64::decode(jws.payload_b64, &mut payload_json)?;
+    let iss = jose::claim_str(&payload_json[..p], b"iss")?;
+    if iss.is_empty() || iss.len() > iss_out.len() {
+        return None;
+    }
+    kid_out[..kid.len()].copy_from_slice(kid);
+    iss_out[..iss.len()].copy_from_slice(iss);
+    Some((iss.len(), kid.len()))
 }
 
 /// Verify a JWS under a known issuer key.

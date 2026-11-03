@@ -135,7 +135,7 @@ CA deployment.
   operator identity.
 - **control_act_mint** / **control_act_verify** — sign a control act
   (`KCAC`) for an authenticated host, operator or workload, and verify one
-  offline; Wormhole stores its digest as a route record's provenance.
+  offline; the traffic fabric stores its digest as a route record's provenance.
 - **transfer_grant** — short, single-use key-custody transfer grants
   (`KTGR`) for moving one connection's live TLS secrets to one attested
   standby, voided wholesale by an unsafe-recovery invalidation.
@@ -149,21 +149,21 @@ CA deployment.
 - **carrier_mint** — the holder's half of a cert-bound identity carrier:
   ES256 carriers signed with its own vault-born key, certified over the
   `identity_req` / `identity_cert` seam Fluxor's `tls` uses, for a
-  requester such as Wormhole's `dns_sign_relay` to present to
+  requester such as the traffic fabric's `dns_sign_relay` to present to
   `service_dns_sign`.
 - **attachment_authorize** — private producer/consumer attachment
   publications and grants (`KATT`), by exact tenant and by trust domain —
   this instance's, or a federated one pinned by keyset record.
-- **service_dns_sign** — signs Wormhole's `service_dns` projection
+- **service_dns_sign** — signs the traffic fabric's `service_dns` projection
   (`KSDN`) verbatim for the region controller the graph pins to that
   service, so a DNS front end answers only from regions Kagi vouched for.
 - **scope_mint** — least-privilege operation scopes (`KSCP`) for
   traffic-dial, failure-domain, prefix and address, service-chain, DR and
   fence operations: one kind per scope, never more than the actor's class
-  may hold, shaped as Wormhole's `ScopedGrant`.
+  may hold, shaped as the traffic fabric's `ScopedGrant`.
 - **rsc_verify** — BYOIP ownership evidence: an RPKI Signed Checklist
   (RFC 9323) under the trust anchor and the tenant's CA chain, every link
-  against its issuer's CRL, as Wormhole's `OwnershipEvidence` for one
+  against its issuer's CRL, as the traffic fabric's `OwnershipEvidence` for one
   tenant's claim to one prefix.
 
 `token_mint`, `token_verify`, `mint_admission`, `authcode`, `storage_key`,

@@ -7,7 +7,7 @@ hardware_targets = ["bcm2712", "linux"]
 
 # A typed operation: the PROVIDER side of the workspace exchange contract.
 # Each request body is one `service_dns::msg::REQUEST` envelope (an unsigned
-# Wormhole `service_dns` projection and the publisher's cert-bound carrier)
+# the traffic fabric's `service_dns` projection and the publisher's cert-bound carrier)
 # and each answer body one `REPLY` envelope: the signed KSDN record, or a
 # typed refusal. Only a publisher the graph pins to the projection's service
 # is signed for. Layouts: docs/architecture/control-acts.md.

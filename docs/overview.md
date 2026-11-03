@@ -29,7 +29,7 @@ door; this page indexes the doc set.
   the wire protocol between modules, the key lifecycle, and how a fragment
   runs byte-identically on-target, in wasm, and in the host suites.
 - [architecture/control-acts.md](architecture/control-acts.md) — Kagi's
-  half of Wormhole's load-balancer RFC: signed control acts whose digest a
+  half of the traffic fabric's load-balancer RFC: signed control acts whose digest a
   route record carries as its provenance, key-custody transfer grants for
   paired-anchor TLS continuity, private attachment authorisation by trust
   domain, signed `service_dns` projections, least-privilege operation

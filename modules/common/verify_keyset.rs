@@ -1,9 +1,11 @@
 //! A verification keyset: the consumer half of the key lifecycle.
 //!
 //! Five modules verify kagi-issued credentials without being the token
-//! verifier — `resource_gate`, `wellknown_endpoint`, `keypackage_endpoint`,
-//! `e2ee_state_endpoint` and `token_endpoint`. All five hold the whole
-//! keyset here rather than a single key, and index it by `kid`.
+//! verifier — `resource_gate`, `keypackage_endpoint`, `e2ee_state_endpoint`,
+//! `mint_admission` and `authcode`. All five hold the whole
+//! keyset here rather than a single key, and index it by the credential's
+//! `(iss, kid)` — never by `kid` alone, which would let one issuer's key
+//! answer for another issuer that happened to share the name.
 //!
 //! Both properties are load-bearing. A module holding one key and
 //! overwriting it on delivery makes rotation destructive: the instant a
@@ -78,6 +80,11 @@ impl Key {
     }
 
     #[must_use]
+    pub fn issuer_bytes(&self) -> &[u8] {
+        &self.issuer[..usize::from(self.issuer_len)]
+    }
+
+    #[must_use]
     pub fn kid_bytes(&self) -> &[u8] {
         &self.kid[..usize::from(self.kid_len)]
     }
@@ -86,6 +93,15 @@ impl Key {
     pub fn pubkey_bytes(&self) -> &[u8] {
         &self.pubkey[..usize::from(self.pubkey_len)]
     }
+}
+
+/// Why [`Keyset::select`] found no key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyMiss {
+    /// No key at all is held for the issuer the credential claims.
+    UnknownIssuer,
+    /// The issuer is known, but none of its selectable keys has this `kid`.
+    UnknownKid,
 }
 
 /// The keyset itself.
@@ -112,27 +128,50 @@ impl Keyset {
         self.keys.iter().position(|k| {
             k.live
                 && k.profile_id == profile_id
-                && &k.issuer[..usize::from(k.issuer_len)] == issuer
+                && k.issuer_bytes() == issuer
                 && k.kid_bytes() == kid
         })
     }
 
-    /// The key a credential names, by the `kid` in its JOSE header.
+    /// The key a credential names: the issuer its `iss` claims, and the
+    /// `kid` in its JOSE header under that issuer.
     ///
-    /// An unknown `kid` is `None` and the credential is refused. It is NOT
-    /// checked against some other key: falling back to "whatever is
-    /// loaded" is what makes the `kid` decorative, and it lets a
-    /// credential signed by a key this module never trusted be accepted
-    /// whenever the header is ignored.
+    /// Both halves are load-bearing. A `kid` is a name an issuer gives its
+    /// own keys, not a global one: a keyset holding more than one issuer —
+    /// a cell that verifies a provisioned issuer beside its own mint — would
+    /// otherwise check a credential claiming issuer A under issuer B's key
+    /// whenever the two shared a `kid`, and B could then sign as A. Two
+    /// issuers using the same `kid` coexist; each credential is checked only
+    /// under the key its own issuer published.
+    ///
+    /// An unknown issuer or `kid` is refused. It is NOT checked against
+    /// some other key: falling back to "whatever is loaded" is what makes
+    /// the `kid` decorative, and it lets a credential signed by a key this
+    /// module never trusted be accepted whenever the header is ignored.
     ///
     /// A key past its removal deadline is not selectable even while it is
     /// still in the table, so an operator who set a deadline gets it.
-    #[must_use]
-    pub fn select(&self, kid: &[u8], now_unix_secs: u64) -> Option<&Key> {
-        self.keys.iter().find(|k| {
-            k.live
-                && !(k.remove_after_unix != 0 && now_unix_secs >= k.remove_after_unix)
-                && k.kid_bytes() == kid
+    pub fn select(&self, issuer: &[u8], kid: &[u8], now_unix_secs: u64) -> Result<&Key, KeyMiss> {
+        if issuer.is_empty() {
+            return Err(KeyMiss::UnknownIssuer);
+        }
+        let mut issuer_known = false;
+        for k in &self.keys {
+            if !k.live || k.issuer_bytes() != issuer {
+                continue;
+            }
+            issuer_known = true;
+            if k.remove_after_unix != 0 && now_unix_secs >= k.remove_after_unix {
+                continue;
+            }
+            if k.kid_bytes() == kid {
+                return Ok(k);
+            }
+        }
+        Err(if issuer_known {
+            KeyMiss::UnknownKid
+        } else {
+            KeyMiss::UnknownIssuer
         })
     }
 
@@ -142,8 +181,8 @@ impl Keyset {
     /// `control_act.rs` asks its `lookup` for.
     ///
     /// Confined to the one profile the record belongs to. [`Keyset::select`]
-    /// reads a JOSE `kid` alone, which is right for a verifier that holds
-    /// one profile; a relying party holding several — a vault host that
+    /// reads a JOSE `(iss, kid)` across profiles, which is right for a
+    /// verifier that holds one profile; a relying party holding several — a vault host that
     /// checks transfer grants beside the access tokens it is called with —
     /// would otherwise check a `KTGR` under whichever key happened to share
     /// its `kid`, and a key's profile is the whole of what separates a grant

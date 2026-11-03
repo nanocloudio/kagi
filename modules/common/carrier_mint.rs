@@ -63,7 +63,7 @@ pub const AUDIENCE_MAX: usize = 128;
 pub const LIFETIME_MAX_SECS: u64 = 300;
 /// The `jti`: 128 bits of the caller's CSPRNG.
 pub const JTI_LEN: usize = 16;
-/// The longest compact JWS a consumer takes (Wormhole's `dns_sign_relay`
+/// The longest compact JWS a consumer takes (the traffic fabric's `dns_sign_relay`
 /// `carrier_in`: 4608 bytes).
 pub const CARRIER_MAX: usize = 4608;
 /// The longest claims set written: three strings bounded above, two

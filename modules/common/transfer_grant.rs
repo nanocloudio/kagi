@@ -2,7 +2,7 @@
 //! the minimum live TLS continuity secrets of one connection to one admitted
 //! standby, once.
 //!
-//! Wormhole's RFC §12.5.5 pairs a primary anchor with a standby. The standby
+//! The traffic-fabric RFC §12.5.5 pairs a primary anchor with a standby. The standby
 //! creates an attested, non-exportable recipient handle; the primary vault
 //! wraps the continuity secret set directly to that recipient
 //! (`KEY_WRAP`, destination-bound `FXKW` blobs) — but only against a

@@ -1,19 +1,19 @@
 //! The signed `service_dns` projection (`KSDN`): the regional answers a DNS
 //! front end may give for a service, under Kagi's signature.
 //!
-//! Wormhole's RFC §11.10 and §21 Phase 9 give a service without global
+//! The traffic-fabric RFC §11.10 and §21 Phase 9 give a service without global
 //! anycast a `service_dns` projection: the set of regional addresses, their
 //! health and weights, bound to the global and DR generations the region
 //! controller derived it under. The controller publishes it unsigned
-//! (`region_ctl.v1` record 0xB6, `upstream_core.rs` in Wormhole); Nanocloud's
+//! (`region_ctl.v1` record 0xB6); Nanocloud's
 //! `service_dns` composes answers from it only once a signature it trusts
 //! covers it, and fails closed otherwise. This is that signature.
 //!
-//! Kagi signs the projection **verbatim**: the record carries Wormhole's 224
-//! bytes unchanged, and the consumer hands those same bytes to Wormhole's
+//! Kagi signs the projection **verbatim**: the record carries the traffic fabric's 224
+//! bytes unchanged, and the consumer hands those same bytes to the traffic fabric's
 //! `dns_answers` once [`Record::verify`] has passed. Kagi restates the layout
 //! only to refuse what it will not sign — it never re-encodes a field — so
-//! there is one encoding of a projection and it is Wormhole's.
+//! there is one encoding of a projection and it is the producer's.
 //!
 //! Kagi decides two things and stores nothing:
 //!
@@ -33,7 +33,7 @@
 //! verify with this file alone. SHA-256 and signature verification are
 //! injected.
 //!
-//! # The projection (Wormhole's `region_ctl.v1` 0xB6, 224 bytes)
+//! # The projection (the traffic fabric's `region_ctl.v1` 0xB6, 224 bytes)
 //!
 //! | Off | Len | Field |
 //! | --- | --- | --- |
@@ -90,7 +90,7 @@ pub const P_ANSWERS: usize = 64;
 /// Where the projection's own trailing field begins: reserved, zero.
 pub const P_TRAILER: usize = 192;
 
-/// Address families, as Wormhole's `NetAddr` numbers them.
+/// Address families, as the traffic fabric's `NetAddr` numbers them.
 pub mod family {
     pub const V4: u8 = 4;
     pub const V6: u8 = 6;
@@ -315,7 +315,7 @@ pub struct Projection {
 }
 
 impl Projection {
-    /// Read the 224 bytes exactly as Wormhole's `ServiceDnsProjection::decode`
+    /// Read the 224 bytes exactly as the traffic fabric's `ServiceDnsProjection::decode`
     /// admits them, and refuse a nonzero trailer: a projection that arrives
     /// carrying anything in the old inline-signature slot is not one the
     /// controller emitted.

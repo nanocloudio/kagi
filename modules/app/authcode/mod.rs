@@ -673,13 +673,16 @@ unsafe fn handle_authorize(
         return;
     };
 
-    // Look the credential's key up by the kid it names.
+    // Look the credential's key up by the issuer and kid it names.
     let mut pubkey = [0u8; verify_keyset::MAX_PUBKEY_LEN];
     let mut pubkey_len = 0usize;
     let mut key_suite = 0u16;
     let mut kid = [0u8; verify_keyset::MAX_KID_LEN];
-    if let Some(kl) = device_auth::credential_kid(req.credential, &mut kid) {
-        if let Some(k) = s.keyset.select(&kid[..kl], now) {
+    let mut iss = [0u8; verify_keyset::MAX_ISSUER_LEN];
+    if let Some((iss_len, kl)) =
+        device_auth::credential_key_name(req.credential, &mut iss, &mut kid)
+    {
+        if let Ok(k) = s.keyset.select(&iss[..iss_len], &kid[..kl], now) {
             pubkey_len = k.pubkey_bytes().len();
             pubkey[..pubkey_len].copy_from_slice(k.pubkey_bytes());
             key_suite = k.suite;

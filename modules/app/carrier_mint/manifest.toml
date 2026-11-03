@@ -10,7 +10,7 @@ hardware_targets = ["bcm2712", "linux"]
 # (modules/common/cert_bound_identity.rs is the relying party's): ES256
 # compact JWSs signed in the vault with this module's own vault-born P-256
 # key, its leaf in `x5c`, for a relying party that cannot see the holder's
-# TLS identity (Kagi's `service_dns_sign` behind Wormhole's
+# TLS identity (Kagi's `service_dns_sign` behind the traffic fabric's
 # `dns_sign_relay`). The key is certified on the seam Fluxor's `tls` uses:
 # `identity_req` out, `identity_cert` in.
 
@@ -25,7 +25,7 @@ buffer_size = 4096
 
 # `[len u16 LE][compact JWS]`, each at most 4608 bytes: one on
 # certification, then one every `period_ms`. Wire to the consumer's carrier
-# input (Wormhole `dns_sign_relay.carrier_in`).
+# input (a traffic fabric's `dns_sign_relay.carrier_in`).
 [[ports]]
 name = "carrier_out"
 direction = "output"

@@ -85,6 +85,17 @@ caught up. `RETIRE` stops signing and keeps verifying; its
 `REMOVE` is the compromise path — immediate and unconditional.
 `KEYSET_SNAPSHOT` is how a verifier that just started reaches current state.
 
+A verifier selects the key a credential names by `(issuer, kid)` — the
+credential's `iss` claim and the `kid` in its header — never by `kid` alone.
+A `kid` is a name an issuer gives its own keys: two issuers in one keyset (a
+cell verifying a provisioned issuer beside its own mint) may both use it,
+and each credential is checked only under the key its own issuer published,
+so neither issuer can sign as the other and neither shadows the other. A
+credential claiming an issuer the keyset holds no key for is refused
+(`verify_err::UNKNOWN_ISSUER`); a known issuer without that `kid` is
+`UNKNOWN_KID`. Where a request names a profile, a key of that profile is
+preferred among those sharing the `(issuer, kid)`.
+
 ### Minting and verification
 
 | msg | dir | payload |
@@ -104,7 +115,9 @@ MINT_REQ:
 
 An empty `kid` selects the profile's active key, which is what a caller
 minting a fresh credential should ask for: pinning one would defeat
-rotation. `jkt` is length-checked against `thumbprint_alg`, so a thumbprint
+rotation. A non-empty `iss` confines the choice to that issuer's keys; the
+minted `iss` claim is always the signing key's issuer, since a verifier
+selects the key by `(iss, kid)`. `jkt` is length-checked against `thumbprint_alg`, so a thumbprint
 of any supported digest is expressible and only the right length is
 accepted. An empty `jkt` omits the `cnf` claim, which is how a token with no
 DPoP binding is minted. Up to `MAX_EXTRA_CLAIMS` (32) custom claims travel
@@ -231,9 +244,9 @@ the declared host capability surface.
 `HMAC-SHA256(secret, "kagi/secret-derive.v1" ‖ context)` for one context
 (`modules/common/secret_derive.rs`), the secret itself never leaving the
 store. A secret several hosts must hold alike is provisioned into each
-host's store once and read only that way: Wormhole's route seed secret
-(`wormhole/route-seed`), from which every route builder derives its route's
-seed secret for `"wh-route-seed.v1" ‖ service ‖ hash_seed_ref`, so the
+host's store once and read only that way: the traffic fabric's route seed secret
+(`fabric/route-seed`), from which every route builder derives its route's
+seed secret for `"fabric-route-seed.v1" ‖ service ‖ hash_seed_ref`, so the
 directors of a route agree per flow on every host.
 
 ## token_mint

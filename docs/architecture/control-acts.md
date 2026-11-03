@@ -1,7 +1,7 @@
 # Control acts, transfer grants, attachments, DNS projections and scopes
 
-Kagi's half of Wormhole's load-balancer RFC (`wormhole/.context/rfc_lb_vip.md`,
-§9.4, §11.10, §11.12, §12.5.5, §13.6, §15.1, §15.4, §22). Five signed
+Kagi's half of a traffic fabric's load-balancer RFC (§9.4, §11.10, §11.12,
+§12.5.5, §13.6, §15.1, §15.4, §22). Five signed
 records and the typed operations that decide them:
 
 | Record | Magic | Profile | Decides | Operation |
@@ -13,7 +13,7 @@ records and the typed operations that decide them:
 | Operation scope | `KSCP` | `OPERATION_SCOPE` (12) | one actor's least-privilege authority over traffic-dial, failure-domain, prefix, chain, DR or fence operations | `scope_mint` |
 
 The charter these keep, from `.context/rfc_extensions.md` §7 and
-`wormhole/.context/reply_kagi_section_7_2.md`:
+the traffic fabric's reply to its §7.2:
 
 - **Kagi initiates no fetch.** Every key a decision rests on — the issuer
   keysets, the CA that issued an actor's leaf, a federated trust domain's
@@ -101,20 +101,20 @@ leaves on `audit_out`. Kagi keeps neither.
 as `token_verify`), checks the window against its trusted clock and, when
 the declaring payload is presented, its digest; it answers a typed verdict
 `{status, kind, actor, scope, target, operation id, expected epoch, record
-digest}`. Wormhole may equally link `control_act.rs` and verify in-process:
+digest}`. The traffic fabric may equally link `control_act.rs` and verify in-process:
 the fragment injects SHA-256 and the signature check and mounts nothing.
 
 **Provenance digest.** `record_digest` — SHA-256 of the whole record, 32
-bytes — is what Wormhole's route record stores as `provenance_digest`
+bytes — is what the traffic fabric's route record stores as `provenance_digest`
 (§9.4). It names the act exactly: the record is deterministic for Ed25519,
 and `tests/harness/tests/control_act.rs` pins a digest vector so a layout or
 signing-input change is visible as a wire change. Per §9.4, a materialised
-record that retains the digest is not fresh authority: Wormhole verifies the
+record that retains the digest is not fresh authority: the traffic fabric verifies the
 act at ingestion and keeps its digest thereafter.
 
 What Kagi does not decide: whether the actor may act on that scope —
 whether this host is the admitted fence provider for that fault domain,
-whether this publisher owns that tenant's route. Those are Wormhole's and
+whether this publisher owns that tenant's route. Those are the traffic fabric's and
 Lattice's policies over the authenticated actor, scope and target the act
 binds. Kagi's guarantee is that the act names who really asked and for
 exactly what.
@@ -167,7 +167,7 @@ counter use.
 a flow's continuity key to the standby's attested recipient, on its
 `auth_req` port: `0xC4 [flow 16][epoch u32][challenge 32][evidence]`, the
 evidence Fluxor's (`[FXHA record 148][recipient 65][signer 65][sig_len]
-[sig]`) over the challenge the transfer chose (Wormhole's paired anchors
+[sig]`) over the challenge the transfer chose (the traffic fabric's paired anchors
 derive it from the flow, the pairing and both anchors). `custody_authority`
 is that authority as a module of the provider's graph: the source is the
 graph's own host (`host`), the standby hosts it may move a key to are
@@ -243,7 +243,7 @@ decisions so it stores neither:
 or of a federated domain **pinned via control-plane keyset records** — a
 VERIFY `MSG_KEY_ADD` on `federation_key` whose `issuer` is the domain's
 name and whose key is that domain's CA key (`MSG_KEY_REMOVE` unpins it).
-This is option 1 of the reply to Wormhole's §7.2, "pinned": no discovery,
+This is option 1 of the traffic fabric's reply to §7.2, "pinned": no discovery,
 no JWKS retrieval, nothing fetched, rotation a deployment action. A
 consumer proves membership by a leaf chaining to that domain's CA and
 naming a SPIFFE id in it; a leaf naming the domain from any other CA proves
@@ -252,11 +252,11 @@ nothing.
 **Revocation.** `attachment_revoke` — the producer side's act — advances the
 service's revocation generation in `kagi/attachments/<producer>-<service>`.
 Every publication and grant carries the generation it was signed under; a
-request under an earlier publication is `Revoked`, and Wormhole compares a
+request under an earlier publication is `Revoked`, and the traffic fabric compares a
 grant's generation with the revocation boundary Clustor commits so new
 connections stop at the new generation. What happens to existing
 connections (drain, reset, migrate; fail closed when undeclared) is
-Wormhole's policy.
+the traffic fabric's policy.
 
 **What the broker checks.** `Record::verify_as(kind::GRANT, …)`: the
 record verifies under the `ATTACHMENT_GRANT` key and is a grant. A
@@ -266,7 +266,7 @@ verifier's clock is refused (`WindowInvalid`), as a transfer grant is.
 
 ## Signed `service_dns` projections (`KSDN`) — §11.10, §21 Phase 9
 
-For a service without global anycast, Wormhole's region controller
+For a service without global anycast, the traffic fabric's region controller
 publishes a `service_dns` projection: the regional addresses, health and
 weights a DNS front end may answer with, bound to the global and DR
 generations it was derived under (`region_ctl.v1` record 0xB6, 224 bytes,
@@ -278,7 +278,7 @@ is that signature:
    identity, from its carrier as above, that a `publisher_N` param pins to
    the projection's service id — a controller signs for its own service and
    no other;
-2. **the projection is one a resolver may act on**: Wormhole's layout
+2. **the projection is one a resolver may act on**: the traffic fabric's layout
    exactly (reserved bytes and unused answers zero, families 4 or 6 with a
    canonical v4 address, health healthy or draining, a generation and a
    TTL), its trailing 32 bytes zero, valid for at most `MAX_VALID_MS`
@@ -287,8 +287,8 @@ is that signature:
 
 The record carries the 224 bytes **verbatim** after an 8-byte header, then
 the signer and signature: there is one encoding of a projection and it is
-Wormhole's, and the consumer hands the bytes `Record::verify` returned to
-Wormhole's `dns_answers`. Which regions it names is the controller's
+the producer's, and the consumer hands the bytes `Record::verify` returned to
+the traffic fabric's `dns_answers`. Which regions it names is the controller's
 decision; staleness against a generation the consumer has already seen is
 the consumer's check. Kagi keeps no per-service state.
 
@@ -301,7 +301,7 @@ authority for **one kind** of operation on **one object**:
 
 | Kind | Operations | Levels |
 |---|---|---|
-| `DIAL` 1 | `START`, `PAUSE`, `RESUME`, `REVERT`, `ABORT` (a service's traffic dial, run by Wormhole's `dial_controller`) | cell, region |
+| `DIAL` 1 | `START`, `PAUSE`, `RESUME`, `REVERT`, `ABORT` (a service's traffic dial, run by the traffic fabric's `dial_controller`) | cell, region |
 | `CHAIN` 3 | `DECLARE`, `REPLACE`, `DRAIN_STAGE`, `FAILOVER_STAGE` | cell, region |
 | `PREFIX` 5 | `IMPORT`, `ALLOCATE`, `ADVERTISE`, `WITHDRAW`, `RDNS` | region, global |
 | `FAILURE_DOMAIN` 6 | `EVACUATE`, `PRACTICE`, `RESTORE`, `AUTOMATIC`, `ABORT` | cell, region |
@@ -320,7 +320,7 @@ whatever policy says, and is checked at mint and again at every verify:
 | device | nothing |
 
 The record's object, level, region, cell, data locality and recovery
-generation are exactly the fields of Wormhole's `ScopedGrant`
+generation are exactly the fields of the traffic fabric's `ScopedGrant`
 (`scope_core.rs`) and its kind uses that file's `scoped_kind` numbers, so a
 verified scope becomes a `ScopedGrant` field for field and goes through
 `scope_admit` like every other portfolio object: a region removed by DR, or
@@ -331,7 +331,7 @@ actor, the same tenant, service and object. A scope is not a bearer token.
 
 Which actor holds which scope for which object is the deployment's policy
 (Lattice), named in the scope by digest as a control act names its policy.
-The recovery generation is the requester's statement, checked by Wormhole
+The recovery generation is the requester's statement, checked by the traffic fabric
 against the global manifest. A scope stands at most `MAX_WINDOW_MS` (one
 hour); a controller re-mints.
 
@@ -341,21 +341,22 @@ Every record names its signer `(issuer, kid)`. A relying party that holds
 keys for several profiles — a vault host that also verifies access tokens,
 a broker beside its control-act verifier — looks the signer up with
 `verify_keyset::Keyset::record_key(issuer, profile, kid, now)`, confined to
-the profile the record belongs to. `Keyset::select` reads a JOSE `kid`
-alone and would check a `KTGR` under any key sharing its kid; the profile
-is the whole of what separates a grant from a token.
+the profile the record belongs to. `Keyset::select` reads a JOSE
+`(iss, kid)` across profiles and would check a `KTGR` under the issuer's
+token key sharing its kid; the profile is the whole of what separates a
+grant from a token.
 
 ## What is not here
 
 - **Fence-provider admission, prefix allow-lists, route-leak limits**
-  (§15.1, §15.5) are Wormhole's policy over the authenticated act, not
+  (§15.1, §15.5) are the traffic fabric's policy over the authenticated act, not
   Kagi's. A scope bounds what a class may ever hold; which provider is
   admitted for which fault domain is still the deployment's.
 - **Prefix ownership evidence.** Whether a tenant holds an imported prefix
   is a fact about resource certificates and registries — RPKI relying-party
   validation, Nanocloud's — not about Kagi's identities. Kagi authorises
   *who may import* (`PREFIX`/`IMPORT`, an operator's alone); it does not
-  vouch for ownership, and does not issue Wormhole's `OwnershipEvidence`.
+  vouch for ownership, and does not issue the traffic fabric's `OwnershipEvidence`.
 - **Continuity-secret custody** is Fluxor's vault: Kagi never sees a TLS
   secret, and a grant is the only thing it adds to a wrap.
 - **The attachment directory** — which attachments exist, their accounting

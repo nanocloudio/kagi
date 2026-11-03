@@ -1931,7 +1931,7 @@ pub mod verify_err {
     pub const MALFORMED: u8 = 1;
     /// No key is loaded at all.
     pub const NO_KEY: u8 = 2;
-    /// The credential names a `kid` this verifier does not hold.
+    /// The credential names a `kid` its issuer's keys do not include.
     pub const UNKNOWN_KID: u8 = 3;
     /// The signature did not verify.
     pub const BAD_SIGNATURE: u8 = 4;
@@ -1951,6 +1951,12 @@ pub mod verify_err {
     /// available. Distinct from `EXPIRED`: "we cannot tell" and "we can
     /// tell, and it has" must never look the same.
     pub const NO_CLOCK: u8 = 11;
+    /// The credential's `iss` names an issuer this verifier holds no key
+    /// for. A key is selected by `(issuer, kid)`, never by `kid` alone, so
+    /// a credential claiming an issuer is checked only under that issuer's
+    /// keys. Distinct from `UNKNOWN_KID`: "nobody here vouches for that
+    /// issuer" and "that issuer has no such key" are different problems.
+    pub const UNKNOWN_ISSUER: u8 = 12;
 }
 
 /// What a verifier established. The reply to a [`VerifyRequest`].

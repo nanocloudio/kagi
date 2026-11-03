@@ -1,7 +1,7 @@
 //! Private producer/consumer attachments (`KATT`): the producer's signed
 //! publication, and the grant that admits one consumer to it.
 //!
-//! Wormhole's RFC §11.12 exposes one service identity across tenants without
+//! The traffic-fabric RFC §11.12 exposes one service identity across tenants without
 //! connecting their networks. The attachment identity is `(producer_tenant,
 //! service_id, consumer_tenant, attachment_id, attachment_generation)`, and
 //! Kagi authorises both halves: the producer's declaration and the
@@ -23,7 +23,7 @@
 //! Both carry the service's **revocation generation** at signing.
 //! `attachment_revoke` advances it in the ledger (`kagi/attachments/`) —
 //! the one piece of attachment state Kagi keeps — and Kagi refuses to grant
-//! under a publication from an older generation. Wormhole compares a
+//! under a publication from an older generation. The traffic fabric compares a
 //! grant's generation with the revocation boundary Clustor commits, so new
 //! connections stop at the new generation.
 //!

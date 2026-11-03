@@ -198,11 +198,17 @@ const CAPACITY: u32 = 1_000;
 const MAX_REVOCATIONS_PER_STEP: usize = 16;
 /// Longest device identifier accepted.
 const MAX_ID: usize = 128;
+/// Longest issuer a key record names (`KeyRecord` carries it as an f8).
+const MAX_ISSUER: usize = 64;
 
 /// One published key.
 ///
-/// `profile_id` is stored because the SLOT MATCH is by `(profile, kid)`
-/// and not by kid alone. A kid is unique within a profile and nothing
+/// `issuer` and `profile_id` are stored because the SLOT MATCH is by
+/// `(issuer, profile, kid)` and not by kid alone. A kid is a name an issuer
+/// gives its own keys: two issuers announcing on this channel may both use
+/// it, and matching without the issuer would let one issuer's key replace
+/// the other's — the shadowing the verifiers refuse by selecting on
+/// `(iss, kid)`. A kid is unique within a profile and nothing
 /// makes it unique across them — the mint and the enrolment endpoint
 /// announce under separate profiles, and a deployment whose key records
 /// reuse a kid between them is well-formed. Matching on kid alone would
@@ -216,6 +222,8 @@ const MAX_ID: usize = 128;
 /// relying party disambiguates by trying its kid's candidates.
 #[derive(Clone, Copy)]
 struct PublishedKey {
+    issuer: [u8; MAX_ISSUER],
+    issuer_len: u8,
     kid: [u8; MAX_KID],
     kid_len: u8,
     profile_id: u16,
@@ -232,6 +240,8 @@ struct PublishedKey {
 impl PublishedKey {
     const fn empty() -> Self {
         Self {
+            issuer: [0; MAX_ISSUER],
+            issuer_len: 0,
             kid: [0; MAX_KID],
             kid_len: 0,
             profile_id: 0,
@@ -549,11 +559,12 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
             },
             auth_wire::MSG_KEY_REMOVE => {
                 if let Ok(kr) = auth_wire::KeyRef::decode(payload) {
-                    // Same match as the add path: (profile, kid), so a
-                    // remove can never take down another profile's key
-                    // that merely shares the kid.
+                    // Same match as the add path: (issuer, profile, kid),
+                    // so a remove can never take down another issuer's or
+                    // another profile's key that merely shares the kid.
                     if let Some(i) = s.keys.iter().position(|k| {
                         k.live
+                            && &k.issuer[..usize::from(k.issuer_len)] == kr.issuer
                             && k.profile_id == kr.profile_id
                             && &k.kid[..usize::from(k.kid_len)] == kr.kid
                     }) {
@@ -591,12 +602,20 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
         let valid = publishable_key(suite, pubkey);
-        if !valid || kid.is_empty() || kid.len() > MAX_KID || pubkey.len() > MAX_PUBKEY_LEN {
+        if !valid
+            || kid.is_empty()
+            || kid.len() > MAX_KID
+            || pubkey.len() > MAX_PUBKEY_LEN
+            || rec.issuer.len() > MAX_ISSUER
+        {
             continue;
         }
 
         let slot = match s.keys.iter().position(|k| {
-            k.live && k.profile_id == rec.profile_id && &k.kid[..usize::from(k.kid_len)] == kid
+            k.live
+                && &k.issuer[..usize::from(k.issuer_len)] == rec.issuer
+                && k.profile_id == rec.profile_id
+                && &k.kid[..usize::from(k.kid_len)] == kid
         }) {
             Some(existing) => existing,
             None => {
@@ -611,13 +630,15 @@ unsafe fn drain_keys(s: &mut ModuleState, sys: &SyscallTable) {
 
         let mut key = PublishedKey::empty();
         key.profile_id = rec.profile_id;
+        key.issuer[..rec.issuer.len()].copy_from_slice(rec.issuer);
         key.kid[..kid.len()].copy_from_slice(kid);
         key.pubkey[..pubkey.len()].copy_from_slice(pubkey);
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "both lengths are bounded above"
+            reason = "all three lengths are bounded above"
         )]
         {
+            key.issuer_len = rec.issuer.len() as u8;
             key.kid_len = kid.len() as u8;
             key.pubkey_len = pubkey.len() as u16;
         }
@@ -633,18 +654,24 @@ fn fill_published(slot: &mut PublishedKey, rec: &auth_wire::KeyRecord<'_>) -> bo
         return false;
     }
     let valid = publishable_key(rec.suite, rec.key_ref);
-    if !valid || rec.kid.is_empty() || rec.kid.len() > MAX_KID || rec.key_ref.len() > MAX_PUBKEY_LEN
+    if !valid
+        || rec.kid.is_empty()
+        || rec.kid.len() > MAX_KID
+        || rec.key_ref.len() > MAX_PUBKEY_LEN
+        || rec.issuer.len() > MAX_ISSUER
     {
         return false;
     }
     *slot = PublishedKey::empty();
+    slot.issuer[..rec.issuer.len()].copy_from_slice(rec.issuer);
     slot.kid[..rec.kid.len()].copy_from_slice(rec.kid);
     slot.pubkey[..rec.key_ref.len()].copy_from_slice(rec.key_ref);
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "both lengths bounded immediately above"
+        reason = "all three lengths bounded immediately above"
     )]
     {
+        slot.issuer_len = rec.issuer.len() as u8;
         slot.kid_len = rec.kid.len() as u8;
         slot.pubkey_len = rec.key_ref.len() as u16;
     }

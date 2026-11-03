@@ -429,29 +429,62 @@ fn find_key(s: &ModuleState, issuer: &[u8], profile_id: u16, kid: &[u8]) -> Opti
     None
 }
 
-/// Select the key a token names, by the `kid` in its JOSE header.
+/// Select the key a token names: the issuer its `iss` claims, and the
+/// `kid` in its JOSE header under that issuer.
 ///
-/// An unknown kid returns `None` and the token is refused. It is NOT
-/// checked against some other key: falling back to "whatever key we have"
-/// is what makes a kid decorative, and it means a token signed by a key
-/// the verifier never trusted can still be accepted if the header is
+/// A `kid` is a name an issuer gives its own keys, not a global one. A
+/// keyset holding several issuers — a cell verifying a provisioned issuer
+/// beside its own mint — that selected by `kid` alone would check a token
+/// claiming issuer A under issuer B's key whenever the two shared a name,
+/// and B could sign as A. So the key is chosen among the claimed issuer's
+/// keys only, and two issuers using one `kid` coexist.
+///
+/// An unknown issuer or kid is refused (`UNKNOWN_ISSUER`, `UNKNOWN_KID`).
+/// It is NOT checked against some other key: falling back to "whatever key
+/// we have" is what makes a kid decorative, and it means a token signed by
+/// a key the verifier never trusted can still be accepted if the header is
 /// ignored.
+///
+/// Where the request names a profile, a key of that profile is preferred
+/// over one of another profile sharing the same `(issuer, kid)`; a match
+/// only in another profile is still returned, so the profile rule refuses
+/// it as `WRONG_PROFILE` rather than as an unknown key.
 ///
 /// A key past its removal deadline is not selectable even while it is
 /// still in the table, so an operator that set a deadline gets it.
-fn select_key(s: &ModuleState, kid: &[u8], now: u64) -> Option<usize> {
+fn select_key(
+    s: &ModuleState,
+    issuer: &[u8],
+    kid: &[u8],
+    profile: u16,
+    now: u64,
+) -> Result<usize, u8> {
+    if issuer.is_empty() {
+        return Err(auth_wire::verify_err::UNKNOWN_ISSUER);
+    }
+    let mut issuer_known = false;
+    let mut other_profile = None;
     for (i, k) in s.keys.iter().enumerate() {
-        if !k.live {
+        if !k.live || &k.issuer[..usize::from(k.issuer_len)] != issuer {
             continue;
         }
+        issuer_known = true;
         if k.remove_after_unix != 0 && now >= k.remove_after_unix {
             continue;
         }
-        if &k.kid[..usize::from(k.kid_len)] == kid {
-            return Some(i);
+        if &k.kid[..usize::from(k.kid_len)] != kid {
+            continue;
         }
+        if profile == auth_wire::suite::profile::NONE || k.profile_id == profile {
+            return Ok(i);
+        }
+        other_profile = other_profile.or(Some(i));
     }
-    None
+    match other_profile {
+        Some(i) => Ok(i),
+        None if issuer_known => Err(auth_wire::verify_err::UNKNOWN_KID),
+        None => Err(auth_wire::verify_err::UNKNOWN_ISSUER),
+    }
 }
 
 /// Verify the request the collector completed in slot `at`.
@@ -511,12 +544,24 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
 
-    // Which key signed this is the token's own claim, in its header. It is
-    // looked up, never guessed: an unknown kid fails closed rather than
-    // falling through to whatever key is loaded.
+    // Which key signed this is the token's own claim: the issuer its `iss`
+    // names and the `kid` in its header. It is looked up by both, never
+    // guessed: an unknown issuer or kid fails closed rather than falling
+    // through to whatever key is loaded, and one issuer's key never answers
+    // for a token claiming another. The payload is read before the
+    // signature is checked only to choose the key — a forged `iss` selects
+    // the key of the issuer it names, which will not verify the forgery.
     let mut header_json = [0u8; 512];
     let hdr_len = b64::decode(jws.header_b64, &mut header_json).unwrap_or(0);
     let kid = jose::claim_str(&header_json[..hdr_len], b"kid").unwrap_or(b"");
+    let mut payload_json = [0u8; MAX_CLAIMS_BYTES];
+    let Some(payload_len) = b64::decode(jws.payload_b64, &mut payload_json) else {
+        s.verify_malformed = s.verify_malformed.saturating_add(1);
+        refuse(s, sys, &id, auth_wire::verify_err::MALFORMED);
+        return;
+    };
+    let json = &payload_json[..payload_len];
+    let issuer = jose::claim_str(json, b"iss").unwrap_or(b"");
     // See `resource_gate`: a window check against a clock that reads 0
     // concludes "not yet expired" for every credential ever issued.
     let obs = dev_trusted_unix(sys);
@@ -525,10 +570,13 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         refuse(s, sys, &id, auth_wire::verify_err::NO_CLOCK);
         return;
     };
-    let Some(slot) = select_key(s, kid, now) else {
-        s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
-        refuse(s, sys, &id, auth_wire::verify_err::UNKNOWN_KID);
-        return;
+    let slot = match select_key(s, issuer, kid, req.expected_profile, now) {
+        Ok(slot) => slot,
+        Err(why) => {
+            s.verify_bad_sig = s.verify_bad_sig.saturating_add(1);
+            refuse(s, sys, &id, why);
+            return;
+        }
     };
 
     // The header's `alg` must agree with the suite the key was delivered
@@ -582,13 +630,6 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     // because it already had to: doing it here once, and handing back typed
     // fields, is what stops every consumer re-parsing attacker-controlled
     // JSON to decide who somebody is.
-    let mut payload_json = [0u8; MAX_CLAIMS_BYTES];
-    let Some(payload_len) = b64::decode(jws.payload_b64, &mut payload_json) else {
-        s.verify_malformed = s.verify_malformed.saturating_add(1);
-        refuse(s, sys, &id, auth_wire::verify_err::MALFORMED);
-        return;
-    };
-    let json = &payload_json[..payload_len];
     let iat = jose::claim_u64(json, b"iat").unwrap_or(0);
     let exp = jose::claim_u64(json, b"exp").unwrap_or(0);
     if !jose::within_window(now, iat, exp, CLOCK_SKEW_SECS) {
@@ -597,7 +638,6 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
 
-    let issuer = jose::claim_str(json, b"iss").unwrap_or(b"");
     let subject = jose::claim_str(json, b"sub").unwrap_or(b"");
     let audience = jose::claim_str(json, b"aud").unwrap_or(b"");
     let scope = jose::claim_str(json, b"scope").unwrap_or(b"");

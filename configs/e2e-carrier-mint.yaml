@@ -1,6 +1,6 @@
 # `carrier_mint` feeding a requester: the holder of a vault-born identity
 # minting the cert-bound carriers Kagi's `service_dns_sign` admits a
-# publisher on — the shape Wormhole's `dns_sign_relay` consumes them in.
+# publisher on — the shape the traffic fabric's `dns_sign_relay` consumes them in.
 #
 #   carrier_mint.identity_req  → mux ch0   [0x5B][len = 65][SEC1 point]: the
 #                                          minter's vault key, to certify
@@ -16,7 +16,7 @@
 # authority — it certifies whatever point arrives on ch0 as host
 # 5a5a…5a — and the requester: each carrier off ch2 goes into a REQUEST 0x98
 # beside a projection for service 3333…33, which `publisher_1` pins to that
-# host. In a Wormhole graph `carrier_out` is wired to
+# host. In a traffic-fabric graph `carrier_out` is wired to
 # `dns_sign_relay.carrier_in`, `identity_req` / `identity_cert` to the
 # cell's enrolment path, and the relay is the requester.
 #

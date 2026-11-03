@@ -175,8 +175,9 @@ fluxor SDK's crypto (sha256, hmac/hkdf, aes_gcm, p256, ed25519).
   back through the pipeline.
 - `token_mint` — JWS minting from a keyset indexed by
   `(issuer, profile_id, kid)`, in any implemented credential suite.
-- `token_verify` — the verification counterpart: signature first, then the
-  `iat`/`exp` window, replying with a typed identity.
+- `token_verify` — the verification counterpart: the key the credential's
+  `(iss, kid)` names, its signature, then the `iat`/`exp` window, replying
+  with a typed identity.
 - `authcode` — the OIDC authorization-code flow: `/authorize` issues a
   single-use code bound to a client and a PKCE challenge, and the exchange
   redeems it for an access token and an ID token.

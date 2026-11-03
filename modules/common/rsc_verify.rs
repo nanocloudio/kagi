@@ -9,7 +9,7 @@
 //! checklist proves one tenant's claim to one prefix and nothing else).
 //! Ported from Nanocloud's `_shared/ownership.rs`.
 //!
-//! [`verify`] gives Wormhole's `OwnershipEvidence` (its `address_core`'s
+//! [`verify`] gives the traffic fabric's `OwnershipEvidence` (its `address_core`'s
 //! import admission requires `verified`) only when, in order, each a refusal
 //! by name:
 //!
@@ -65,14 +65,14 @@ pub const OID_RSC: &[u8] = &[
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x30,
 ];
 const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-/// `wormhole-ownership.v1` ‖ tenant ‖ family ‖ address ‖ length.
-pub const CHALLENGE_LEN: usize = 21 + 16 + 1 + 16 + 1;
+/// `fabric-ownership.v1` ‖ tenant ‖ family ‖ address ‖ length.
+pub const CHALLENGE_LEN: usize = 19 + 16 + 1 + 16 + 1;
 
-/// Wormhole's address families.
+/// The traffic fabric's address families.
 pub const AF_INET: u8 = 4;
 pub const AF_INET6: u8 = 6;
 
-/// A prefix as Wormhole's `BgpPrefix` carries it: its family, its address
+/// A prefix as the traffic fabric's `BgpPrefix` carries it: its family, its address
 /// in sixteen bytes (IPv4 in the last four) and its length.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Claim {
@@ -106,7 +106,7 @@ impl Claim {
     }
 }
 
-/// Wormhole's `OwnershipEvidence`, field for field.
+/// The traffic fabric's `OwnershipEvidence`, field for field.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Evidence {
     pub holder: [u8; 16],
@@ -148,17 +148,17 @@ impl Refusal {
 }
 
 /// The document a tenant has its resource holder's CA list in an RSC to
-/// prove it holds `claim`: `wormhole-ownership.v1`, then the tenant, the
+/// prove it holds `claim`: `fabric-ownership.v1`, then the tenant, the
 /// family, the address (sixteen bytes, IPv4 in the last four) and the
-/// length — Wormhole's `ownership_challenge`, byte for byte.
+/// length — the traffic fabric's `ownership_challenge`, byte for byte.
 #[must_use]
 pub fn challenge(tenant: &[u8; 16], claim: &Claim) -> [u8; CHALLENGE_LEN] {
     let mut c = [0u8; CHALLENGE_LEN];
-    c[..21].copy_from_slice(b"wormhole-ownership.v1");
-    c[21..37].copy_from_slice(tenant);
-    c[37] = claim.family;
-    c[38..54].copy_from_slice(&claim.addr);
-    c[54] = claim.len;
+    c[..19].copy_from_slice(b"fabric-ownership.v1");
+    c[19..35].copy_from_slice(tenant);
+    c[35] = claim.family;
+    c[36..52].copy_from_slice(&claim.addr);
+    c[52] = claim.len;
     c
 }
 

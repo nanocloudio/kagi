@@ -2,7 +2,7 @@
 //! vault-born identity presents to a Kagi relying party.
 //!
 //! A relying party that cannot see the caller's TLS identity — Kagi's
-//! `service_dns_sign` behind Wormhole's `dns_sign_relay`, for one — admits a
+//! `service_dns_sign` behind the traffic fabric's `dns_sign_relay`, for one — admits a
 //! caller on a carrier (`cert_bound_identity.rs`): an ES256 compact JWS the
 //! caller signed with its leaf's own key, the leaf in `x5c`, naming that
 //! relying party for at most five minutes. This module is the caller's half.

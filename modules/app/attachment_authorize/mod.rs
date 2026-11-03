@@ -1,5 +1,5 @@
 //! Attachment authorize — private producer/consumer attachment acts
-//! (`KATT`) for Wormhole's service attachments (RFC §11.12).
+//! (`KATT`) for the traffic fabric's service attachments (RFC §11.12).
 //!
 //! The decisions are `modules/common/attachment_grant_service.rs`; this
 //! module is its host and a PROVIDER of the workspace exchange contract:
