@@ -40,7 +40,10 @@ sed -e 's/__WS_PORT__/9700/'          -e 's/__TOKEN_PORT__/8081/' \
 The control listener also needs `__CONTROL_CERT__`, `__CONTROL_KEY__`,
 `__CONTROL_TRUST__` and `__CONTROL_SVID__` — the issuer's own certificate
 and key, the trust anchor operator certificates are checked against, and the
-allowlisted operator identity. The enrolment mail path needs
+allowlisted operator identity. The first three are ABSOLUTE paths (PEM or
+DER) that `tls` reads at runtime and re-reads when they change, so a rotated
+certificate takes effect without a restart; until they read and parse, the
+listener refuses handshakes. The enrolment mail path needs
 `__SMTP_AUTHORITY__`, `__MAIL_FROM__` and `__MAIL_HELO__`.
 
 `__TENANT_SEED__` is the HKDF input behind every tenant identifier; changing
