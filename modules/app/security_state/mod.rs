@@ -1169,30 +1169,11 @@ unsafe fn head_object(s: &mut ModuleState, sys: &SyscallTable, key_len: usize) -
     (sys.provider_call)(-1, OBJECT_HEAD, s.arg_buf.as_mut_ptr(), arg_len)
 }
 
-/// Pull `size` and the etag out of a HEAD record.
-///
-/// Layout, from the contract:
-/// `[size u64][mtime u64][content_type_len u8][ct][etag_len u8][etag]`.
+/// Pull `size` and the etag out of a HEAD record, as the contract decodes it.
 fn parse_head(record: &[u8], etag_out: &mut [u8]) -> Option<(u64, usize)> {
-    if record.len() < 17 {
-        return None;
-    }
-    let size = u64::from_le_bytes([
-        record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7],
-    ]);
-    let ct_len = usize::from(record[16]);
-    let etag_len_at = 17usize.checked_add(ct_len)?;
-    if etag_len_at >= record.len() {
-        return None;
-    }
-    let etag_len = usize::from(record[etag_len_at]);
-    let etag_at = etag_len_at.checked_add(1)?;
-    let etag_end = etag_at.checked_add(etag_len)?;
-    if etag_end > record.len() || etag_len > etag_out.len() {
-        return None;
-    }
-    etag_out[..etag_len].copy_from_slice(&record[etag_at..etag_end]);
-    Some((size, etag_len))
+    let (head, _, etag, _) = abi::contracts::storage::object::range::decode_head(record)?;
+    etag_out.get_mut(..etag.len())?.copy_from_slice(etag);
+    Some((head.size, etag.len()))
 }
 
 /// Build the `storage.object::PUT` arg block.
@@ -1210,7 +1191,9 @@ fn encode_put_arg(
     etag: &[u8],
     fence_ptr: *mut u8,
 ) -> Option<usize> {
-    let total = 2 + key_len + 1 + CONTENT_TYPE.len() + 8 + 8 + 2 + etag.len() + 8 + 2;
+    let kept = abi::contracts::storage::object::Kept::none();
+    let total =
+        2 + key_len + 1 + CONTENT_TYPE.len() + 8 + 8 + 2 + etag.len() + kept.wire_len() + 8 + 2;
     if total > arg.len() || key_len > usize::from(u16::MAX) || etag.len() > 255 {
         return None;
     }
@@ -1241,6 +1224,7 @@ fn encode_put_arg(
     p += 2;
     arg[p..p + etag.len()].copy_from_slice(etag);
     p += etag.len();
+    p += kept.encode(&mut arg[p..])?;
     arg[p..p + 8].copy_from_slice(&(fence_ptr as u64).to_le_bytes());
     p += 8;
     #[allow(clippy::cast_possible_truncation, reason = "a fixed small constant")]
