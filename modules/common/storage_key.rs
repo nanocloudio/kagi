@@ -316,6 +316,9 @@ pub enum Refusal {
     /// The grant already retains [`MAX_RETAINED_EPOCHS`] earlier epochs: one
     /// is retired before the key rotates again.
     RetainedEpochsFull = 33,
+    /// The store's retention or legal hold on a record refuses the write. It
+    /// stands until the hold is lifted or the retention runs out.
+    Retained = 34,
 }
 
 impl Refusal {

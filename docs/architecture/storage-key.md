@@ -233,6 +233,12 @@ A retry after any partial run finds the erasure record, keeps it, and runs
 steps 2–4 again; a retry after a complete one does the same and answers the
 same record. Every attempt, refused or allowed, is audited, the actor named.
 
+A store's retention or legal hold on a record answers 34 retained. On the grant
+it stops step 1 and nothing changes. On a recovery set it stops step 2: the
+erasure record stands, so nothing is issued for the resource again, while the
+held set and the sets after it stay in the ledger and the custodians are not
+told. A retry once the hold ends finishes the erasure.
+
 A custodian admits an erase order only when `storage_key::admit_erase` holds:
 signed under its pinned storage-grant verification key, kind erasure, no
 items. It then refuses every later rewrap of a custody envelope for that

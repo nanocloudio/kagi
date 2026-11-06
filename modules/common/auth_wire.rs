@@ -270,6 +270,13 @@ pub const ST_CONFLICT: u8 = 8;
 /// ledger" must never look the same to a caller deciding whether to issue a
 /// credential.
 pub const ST_UNAVAILABLE: u8 = 9;
+/// `security_state`: the record's retention or legal hold refuses the write.
+///
+/// The ledger is up and decided, and asking again changes nothing until the
+/// hold is lifted or the retention runs out, which no caller here can bring
+/// about. So it is not `ST_UNAVAILABLE`, which sends an operator to a healthy
+/// store, and not `ST_CONFLICT`, which invites a re-read and a retry.
+pub const ST_RETAINED: u8 = 10;
 
 // ── Envelope ────────────────────────────────────────────────────────────
 

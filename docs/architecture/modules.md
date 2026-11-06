@@ -206,7 +206,9 @@ nothing this one holds.
 | `ENROL_AUTH_RESP` 0x54 | `[corr][status][auth_id f8][secret f8][expires_at u64]` |
 
 Statuses: `OK=0, NOT_FOUND=1, DECRYPT_FAILED=2, MALFORMED=3, NO_KEY=4,
-FULL=5, BAD_SIGNATURE=6, EXPIRED=7, CONFLICT=8, UNAVAILABLE=9`. The
+FULL=5, BAD_SIGNATURE=6, EXPIRED=7, CONFLICT=8, UNAVAILABLE=9, RETAINED=10`.
+`RETAINED` is the store's retention or legal hold refusing a ledger write: the
+ledger is up, and asking again changes nothing until the hold ends. The
 admission and OAuth families carry their own typed reasons (`admit_err`,
 `grant_err`, `authz_err`) so a refusal says which question was answered.
 

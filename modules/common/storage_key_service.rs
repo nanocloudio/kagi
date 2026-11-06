@@ -2674,6 +2674,7 @@ fn write_status(status: u8) -> Result<(), Refusal> {
     match status {
         auth_wire::ST_OK => Ok(()),
         auth_wire::ST_CONFLICT => Err(Refusal::Conflict),
+        auth_wire::ST_RETAINED => Err(Refusal::Retained),
         auth_wire::ST_NOT_FOUND => Err(Refusal::UnknownResource),
         auth_wire::ST_MALFORMED => Err(Refusal::Malformed),
         _ => Err(Refusal::LedgerUnavailable),

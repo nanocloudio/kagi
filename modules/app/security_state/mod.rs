@@ -169,6 +169,15 @@ define_params! {
         => |s, d, len| { s.backend = p_u8(d, len, 0, BACKEND_OBJECT); };
 }
 
+// `state_wire` decides on these without the SDK in reach; the two must agree.
+const _: () = {
+    use abi::kernel_abi::errno;
+    assert!(state_wire::EAGAIN == errno::EAGAIN);
+    assert!(state_wire::ENXIO == errno::ENXIO);
+    assert!(state_wire::EEXIST == errno::EEXIST);
+    assert!(state_wire::ERETAINED == errno::ERETAINED);
+};
+
 const BACKEND_OBJECT: u8 = 0;
 const BACKEND_LATTICE: u8 = 1;
 
@@ -345,6 +354,8 @@ struct ModuleState {
     state_delete: u32,
     state_conflict: u32,
     state_unavailable: u32,
+    /// Writes the store refused for an object's retention or legal hold.
+    state_retained: u32,
     /// Writes the provider took without deciding. A rising count is a slow
     /// store, not a broken one — it is the back-pressure made visible.
     state_pending: u32,
@@ -452,6 +463,7 @@ pub extern "C" fn module_new(
         s.state_delete = 0;
         s.state_conflict = 0;
         s.state_unavailable = 0;
+        s.state_retained = 0;
         s.state_pending = 0;
         s.state_read_pending = 0;
         s.state_malformed = 0;
@@ -1033,31 +1045,16 @@ unsafe fn issue_write(s: &mut ModuleState, sys: &SyscallTable, p: WritePending) 
 unsafe fn finish_write(s: &mut ModuleState, sys: &SyscallTable, p: WritePending, rc: i32) {
     let (corr, client, namespace, key_len) = (p.corr, p.client, p.namespace, p.key_len);
 
-    // `EEXIST` — the key was already there, so a create-only caller LOST.
-    // `EAGAIN` — the key moved under a compare-and-swap. Both mean "you did
-    // not win"; only the second is worth retrying after a re-read.
-    if rc == abi::kernel_abi::errno::EEXIST || rc == abi::kernel_abi::errno::EAGAIN {
-        s.state_conflict = s.state_conflict.saturating_add(1);
-        reply(s, sys, corr, client, auth_wire::ST_CONFLICT, &[], false);
-        return;
-    }
-    // A `DELETE` of a key that was not there is an absence, not a fault, and
-    // it checks no fence: there is no commit to have achieved one.
-    if p.is_delete {
-        let status = if rc == abi::kernel_abi::errno::ENXIO {
-            auth_wire::ST_NOT_FOUND
-        } else if rc < 0 {
-            s.state_unavailable = s.state_unavailable.saturating_add(1);
-            auth_wire::ST_UNAVAILABLE
-        } else {
-            auth_wire::ST_OK
-        };
+    if let Some(status) = state_wire::decided_write(rc, p.is_delete) {
+        match status {
+            auth_wire::ST_CONFLICT => s.state_conflict = s.state_conflict.saturating_add(1),
+            auth_wire::ST_RETAINED => s.state_retained = s.state_retained.saturating_add(1),
+            auth_wire::ST_UNAVAILABLE => {
+                s.state_unavailable = s.state_unavailable.saturating_add(1);
+            }
+            _ => {}
+        }
         reply(s, sys, corr, client, status, &[], false);
-        return;
-    }
-    if rc < 0 {
-        s.state_unavailable = s.state_unavailable.saturating_add(1);
-        reply(s, sys, corr, client, auth_wire::ST_UNAVAILABLE, &[], false);
         return;
     }
 

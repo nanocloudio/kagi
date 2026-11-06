@@ -507,6 +507,46 @@ pub const fn replay_claim_result(status: u8) -> ReplayClaim {
     }
 }
 
+// ── What a decided object write answers ─────────────────────────────────
+
+/// `EAGAIN` from a compare-and-swap: the key moved.
+pub const EAGAIN: i32 = -11;
+/// `ENXIO`: the key is absent.
+pub const ENXIO: i32 = -6;
+/// `EEXIST`: a create-only write found the key present.
+pub const EEXIST: i32 = -17;
+/// `ERETAINED`: the object's retention or legal hold refuses the change.
+pub const ERETAINED: i32 = -200;
+
+/// The status a write the `storage.object` provider decided is answered
+/// with, or `None` when it committed and the durability it achieved decides
+/// (a `PUT` checks its fence; a `DELETE` has no commit to have achieved one).
+///
+/// - `EEXIST` and `EAGAIN` mean the caller did not win: `ST_CONFLICT`. Only
+///   the second is worth retrying after a re-read.
+/// - `ERETAINED` means the store refused on purpose: `ST_RETAINED`.
+/// - `ENXIO` on a `DELETE` is an absence, not a fault: `ST_NOT_FOUND`.
+/// - Any other errno says only that nothing was recorded: `ST_UNAVAILABLE`.
+#[must_use]
+pub const fn decided_write(rc: i32, is_delete: bool) -> Option<u8> {
+    if rc == EEXIST || rc == EAGAIN {
+        return Some(crate::auth_wire::ST_CONFLICT);
+    }
+    if rc == ERETAINED {
+        return Some(crate::auth_wire::ST_RETAINED);
+    }
+    if is_delete && rc == ENXIO {
+        return Some(crate::auth_wire::ST_NOT_FOUND);
+    }
+    if rc < 0 {
+        return Some(crate::auth_wire::ST_UNAVAILABLE);
+    }
+    if is_delete {
+        return Some(crate::auth_wire::ST_OK);
+    }
+    None
+}
+
 // ── Durability requirements per state class (C2) ────────────────────────
 //
 // Every namespace above holds a different kind of security state, and they
