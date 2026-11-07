@@ -56,15 +56,15 @@ mod secret_record;
 use auth_wire::{PayloadReader, PayloadWriter};
 
 // FS opcodes (see target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs)
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_SEEK: u32 = abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = abi::registry::fs::WRITE;
 /// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
 /// contract; store-file creation needs the write tier.
-const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
 
 /// FS E_AGAIN: not now, nothing consumed (mount not up, data not yet
 /// cached, device busy). Distinct from a hard error (ENODEV/ENOSYS = no

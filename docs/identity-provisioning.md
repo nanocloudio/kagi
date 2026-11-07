@@ -112,7 +112,12 @@ This is **built**: `modules/common/spiffe.rs` names the identity,
 `modules/common/der.rs` emits the certificate, and
 `modules/app/certificate_endpoint` is the endpoint — `POST
 /pki/certificate` takes a subject public key and a SPIFFE identity and
-answers with the DER leaf plus its `spiffe_id`. It is its own deployment
+answers with the DER leaf plus its `spiffe_id`. The leaf lasts the
+request's `lifetime_s` (seconds), clamped to the graph's `min_lifetime_s` and
+`max_lifetime_s` (5 minutes and a year by default); a request naming none gets
+30 days, as before, and the answer says what was issued (`lifetime_s`). The
+caller chooses how long within the deployment's bounds, because how long a
+device may sit unpowered is the device's owner's to know. It is its own deployment
 (`configs/pki.yaml`), not part of the issuer graph: a CA is a different
 key and a different blast radius. The CA certificate is served at `GET
 /.well-known/ca.pem`. Enrollment accepts **both**

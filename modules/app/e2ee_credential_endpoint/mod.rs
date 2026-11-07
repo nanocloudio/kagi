@@ -71,8 +71,7 @@ mod issuer_key;
 mod jose;
 #[path = "../../common/jwk.rs"]
 mod jwk;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
 

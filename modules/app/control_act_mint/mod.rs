@@ -71,8 +71,7 @@ mod exchange_peer;
 mod issuer_key;
 #[path = "../../common/jose.rs"]
 mod jose;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/spiffe.rs"]
 mod spiffe;
 #[path = "../../common/time_policy.rs"]

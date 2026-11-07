@@ -40,8 +40,7 @@ mod auth_wire;
 mod chan;
 #[path = "../../common/storage_key_endpoint.rs"]
 mod endpoint;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
 #[path = "../../common/storage_key.rs"]

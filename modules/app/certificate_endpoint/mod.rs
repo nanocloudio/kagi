@@ -33,6 +33,14 @@
 //! its relying party requires a P-256 trust root, so an Ed25519-only
 //! authority could not serve that carrier at all.
 //!
+//! **How long a leaf lasts** is the request's `lifetime_s` (seconds), clamped
+//! to the graph's `min_lifetime_s`/`max_lifetime_s` (default 5 minutes and a
+//! year); a request that names none gets 30 days, what every caller before
+//! the field got. The answer carries the lifetime issued (`lifetime_s`). A
+//! lifetime is the caller's to ask because it is a property of the thing
+//! certified (an industrial sensor renews daily; a consumer device may be
+//! unpowered for weeks), and the bounds are the deployment's.
+//!
 //! `GET /pki/ca` answers with the authority's own self-signed certificate —
 //! the trust root a relying party chains to. Serving it is not a convenience:
 //! a CA whose certificate had to be copied out of band is a CA whose
@@ -81,8 +89,7 @@ mod der;
 mod issuer_key;
 #[path = "../../common/jose.rs"]
 mod jose;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/spiffe.rs"]
 mod spiffe;
 #[path = "../../common/time_policy.rs"]
@@ -94,8 +101,13 @@ const STEP_DID_WORK: i32 = 2;
 /// The exchange contract's method byte for `POST`.
 const METHOD_POST: u8 = x::METHOD_POST;
 
-/// How long an issued certificate is valid, in seconds.
+/// How long an issued certificate is valid, in seconds, when the request
+/// names no `lifetime_s`: what every caller before that field existed got.
 const CERTIFICATE_TTL_SECS: u64 = 30 * 24 * 3600;
+/// The bounds a requested lifetime is clamped to, unless the graph sets its
+/// own (`min_lifetime_s`, `max_lifetime_s`): five minutes, a year.
+const MIN_LIFETIME_SECS: u32 = 300;
+const MAX_LIFETIME_SECS: u32 = 365 * 24 * 3600;
 /// How long the authority's own certificate is valid. Longer than a leaf,
 /// because rotating a trust root is a deployment-wide event.
 const CA_TTL_SECS: u64 = 3650 * 24 * 3600;
@@ -159,6 +171,12 @@ struct ModuleState {
     /// A `signing_key` record whose key the vault could not open yet
     /// (`E_AGAIN`), handled again each step before any newer one.
     key_pending: issuer_key::PendingRecord,
+
+    /// The bounds a certificate's lifetime is clamped to, in seconds. Graph
+    /// parameters: the caller asks for a lifetime, the deployment decides how
+    /// short and how long one may be.
+    min_lifetime_s: u32,
+    max_lifetime_s: u32,
 
     /// Serial numbers, monotonic. Two certificates from one CA sharing a
     /// serial is what makes revocation ambiguous.
@@ -239,6 +257,14 @@ define_params! {
         {
             s.issue_classes_len = n as u16;
         }
+    };
+
+    7, min_lifetime_s, u32, 300 => |s, d, len| {
+        s.min_lifetime_s = p_u32(d, len, 0, MIN_LIFETIME_SECS);
+    };
+
+    8, max_lifetime_s, u32, 31536000 => |s, d, len| {
+        s.max_lifetime_s = p_u32(d, len, 0, MAX_LIFETIME_SECS);
     };
 
     2, trust_domain, str, 0 => |s, d, len| {
@@ -571,6 +597,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let mut ed25519_key = [0u8; 32];
     let mut p256_point = [0u8; 65];
     let mut dns = [0u8; MAX_DNS];
+    let lifetime: u64;
     let (subject_len, tenant_len, device_len, key_bytes, dns_len, class_len, fixed_len) = {
         let dns_len = json_string(body, b"dns", &mut dns);
         let subject_len = json_string(body, b"subject", &mut subject);
@@ -581,6 +608,11 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         // names its `host_id`, an operator its `operator_id`: 32 lowercase
         // hex digits, the deployment's fixed 16-byte identity for it.
         let class_len = json_string(body, b"class", &mut class_name);
+        lifetime = certificate_lifetime(
+            jose::claim_u64(body, b"lifetime_s"),
+            s.min_lifetime_s,
+            s.max_lifetime_s,
+        );
         let fixed_len = match &class_name[..class_len] {
             b"host" => json_string(body, b"host_id", &mut fixed_id),
             b"operator" => json_string(body, b"operator_id", &mut fixed_id),
@@ -794,7 +826,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
             subject_key,
             algorithm(s.key_suite),
             now,
-            now + CERTIFICATE_TTL_SECS,
+            now + lifetime,
             &san[..san_len],
             &dns[..dns_len],
             &ids,
@@ -888,7 +920,10 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let _ = put(&mut body, &mut at, &ca_b64[..ca_b64_len]);
     let _ = put(&mut body, &mut at, br#"","spiffe_id":""#);
     let _ = put(&mut body, &mut at, &san[..san_len]);
-    let _ = put(&mut body, &mut at, b"\"}");
+    let _ = put(&mut body, &mut at, br#"","lifetime_s":"#);
+    let mut digits = [0u8; 20];
+    let _ = put(&mut body, &mut at, decimal(lifetime, &mut digits));
+    let _ = put(&mut body, &mut at, b"}");
 
     respond(s, sys, &id, credit, 200, b"application/json", &body[..at]);
 }
@@ -1234,6 +1269,40 @@ fn decode_fixed_id(hex: &[u8]) -> Option<[u8; spiffe::ID_LEN]> {
         *slot = (digit(pair[0])? << 4) | digit(pair[1])?;
     }
     Some(out)
+}
+
+/// The lifetime a certificate is issued for: the request's `lifetime_s`, or
+/// [`CERTIFICATE_TTL_SECS`] when it names none, clamped to the graph's bounds.
+/// A bound set the wrong way round (`min` above `max`) clamps to `min`: the
+/// shorter certificate is the safe reading of a contradiction.
+fn certificate_lifetime(asked: Option<u64>, min: u32, max: u32) -> u64 {
+    let (min, max) = (u64::from(min), u64::from(max));
+    let want = asked.unwrap_or(CERTIFICATE_TTL_SECS);
+    if want > max {
+        if max < min {
+            min
+        } else {
+            max
+        }
+    } else if want < min {
+        min
+    } else {
+        want
+    }
+}
+
+/// `v` in decimal, written into `out`.
+fn decimal(mut v: u64, out: &mut [u8; 20]) -> &[u8] {
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    &out[at..]
 }
 
 fn json_string(body: &[u8], key: &[u8], out: &mut [u8]) -> usize {

@@ -94,12 +94,12 @@ use state_wire::StateRequest;
 // ── `storage.object` opcodes ────────────────────────────────────────────
 //
 // From `target/fluxor/fluxor-abi/sdk/contracts/storage/object.rs`.
-const OBJECT_PUT: u32 = 0x1420;
-const OBJECT_GET: u32 = 0x1421;
-const OBJECT_HEAD: u32 = 0x1422;
-const OBJECT_RANGE_GET: u32 = 0x1423;
-const OBJECT_DELETE: u32 = 0x1424;
-const OBJECT_CLOSE: u32 = 0x1425;
+const OBJECT_PUT: u32 = abi::registry::storage_object::PUT;
+const OBJECT_GET: u32 = abi::registry::storage_object::GET;
+const OBJECT_HEAD: u32 = abi::registry::storage_object::HEAD;
+const OBJECT_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
+const OBJECT_DELETE: u32 = abi::registry::storage_object::DELETE;
+const OBJECT_CLOSE: u32 = abi::registry::storage_object::CLOSE;
 
 /// `fence::WIRE_MAX_LEN` — the `ReplicatedDurable` variant is the widest.
 /// Whether this deployment has declared itself a replicated authority.

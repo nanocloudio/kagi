@@ -91,8 +91,7 @@ mod issuer_key;
 mod jose;
 #[path = "../../common/jwk.rs"]
 mod jwk;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/pkce.rs"]
 mod pkce;
 #[path = "../../common/state_wire.rs"]
@@ -590,7 +589,13 @@ unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_DIGITS]) -> Result<(
     // the loop cannot run away.
     for _ in 0..16 {
         let mut raw = [0u8; CODE_DIGITS * 2];
-        if (sys.provider_call)(-1, 0x0C3C, raw.as_mut_ptr(), raw.len()) < 0 {
+        if (sys.provider_call)(
+            -1,
+            abi::registry::kernel::RANDOM_FILL,
+            raw.as_mut_ptr(),
+            raw.len(),
+        ) < 0
+        {
             return Err(Refusal::NoEntropy);
         }
         for byte in raw {
@@ -1542,7 +1547,13 @@ unsafe fn start(s: &mut ModuleState, sys: &SyscallTable, body: &[u8]) -> Result<
         // count and `runtime/net.rs`'s own wrapper says it returns zero — so
         // this accepts either and refuses only the errno both agree on. A
         // predictable nonce is worse than no answer.
-        if (sys.provider_call)(-1, 0x0C3C, nonce_bytes.as_mut_ptr(), NONCE_BYTES) < 0 {
+        if (sys.provider_call)(
+            -1,
+            abi::registry::kernel::RANDOM_FILL,
+            nonce_bytes.as_mut_ptr(),
+            NONCE_BYTES,
+        ) < 0
+        {
             return Err(Refusal::NoEntropy);
         }
         nonce_len = b64::encode(&nonce_bytes, &mut nonce).ok_or(Refusal::Malformed)?;
@@ -1968,7 +1979,13 @@ unsafe fn mint_authorisation(s: &mut ModuleState, sys: &SyscallTable, corr: u32,
 
     // The transaction's nonce, drawn exactly as `/start` draws it.
     let mut nonce_bytes = [0u8; auth_wire::ENROL_AUTH_ID_BYTES];
-    if (sys.provider_call)(-1, 0x0C3C, nonce_bytes.as_mut_ptr(), nonce_bytes.len()) < 0 {
+    if (sys.provider_call)(
+        -1,
+        abi::registry::kernel::RANDOM_FILL,
+        nonce_bytes.as_mut_ptr(),
+        nonce_bytes.len(),
+    ) < 0
+    {
         reply_auth_refused(s, sys, corr, auth_wire::ST_UNAVAILABLE);
         return;
     }
@@ -2308,7 +2325,13 @@ unsafe fn begin_totp_register(
         return;
     }
     let mut raw = [0u8; TOTP_SECRET_BYTES];
-    if (sys.provider_call)(-1, 0x0C3C, raw.as_mut_ptr(), raw.len()) < 0 {
+    if (sys.provider_call)(
+        -1,
+        abi::registry::kernel::RANDOM_FILL,
+        raw.as_mut_ptr(),
+        raw.len(),
+    ) < 0
+    {
         refuse(s, sys, id, credit, Refusal::NoEntropy);
         return;
     }

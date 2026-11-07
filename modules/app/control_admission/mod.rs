@@ -99,7 +99,7 @@ use ws_admit::{
 /// `MSG_PEER_IDENTITY` in `fluxor/modules/foundation/tls/mod.rs`. What this
 /// gate needs from it is the session id, whether verification succeeded, and
 /// the peer's key fingerprint.
-const MSG_PEER_IDENTITY: u8 = 0x5A;
+const MSG_PEER_IDENTITY: u8 = abi::registry::msg::peer_identity::MSG_PEER_IDENTITY;
 /// Envelope header: type plus the u16 length.
 const PEER_ENVELOPE_HDR: usize = 3;
 /// Fixed part of the payload, before the fingerprint and principal.

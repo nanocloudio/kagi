@@ -70,8 +70,7 @@ mod issuer_key;
 mod jose;
 #[path = "../../common/key_custody.rs"]
 mod key_custody;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/operation_scope.rs"]
 mod operation_scope;
 #[path = "../../common/spiffe.rs"]

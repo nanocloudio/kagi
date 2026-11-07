@@ -84,8 +84,7 @@ mod b64;
 mod carrier_mint;
 #[path = "../../common/issuer_key.rs"]
 mod issuer_key;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/time_policy.rs"]
 mod time_policy;
 #[path = "../../common/x509_leaf.rs"]

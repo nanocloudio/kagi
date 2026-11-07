@@ -113,7 +113,7 @@ const PROOF_WINDOW_SECS: u64 = 300;
 /// This module's identity to the state ledger. Not an OAuth client id, and
 /// not a namespace — those are `state_wire::NS_OAUTH_*`.
 const STATE_CLIENT: u8 = 7;
-const CSPRNG_OP: u32 = 0x0C3C;
+const CSPRNG_OP: u32 = abi::registry::kernel::RANDOM_FILL;
 
 /// PKCE: only S256 is offered — `plain` is a downgrade a client can force.
 const PKCE_CHALLENGE_LEN: usize = 43; // base64url(SHA256) is 43 chars

@@ -70,8 +70,7 @@ mod custody_authority_service;
 mod issuer_key;
 #[path = "../../common/key_custody.rs"]
 mod key_custody;
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 #[path = "../../common/spiffe.rs"]
 mod spiffe;
 #[path = "../../common/state_wire.rs"]

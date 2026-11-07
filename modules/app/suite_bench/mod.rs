@@ -61,8 +61,7 @@ mod auth_wire;
 #[path = "../../common/issuer_key.rs"]
 mod issuer_key;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 
 /// The suites measured, in rotation order — every implemented singleton.
 /// The hybrid signs as its two halves, so it is priced by addition.
@@ -343,8 +342,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // it is the vault's own keygen/public path.
         if s.suite_idx == 0 && s.op == OP_SIGN {
             let mut rng_buf = [0u8; 64];
-            let rng_rc = (sys.provider_call)(-1, 0x0C3C, rng_buf.as_mut_ptr(), 8);
-            let rng32_rc = (sys.provider_call)(-1, 0x0C3C, rng_buf.as_mut_ptr(), 32);
+            let rng_rc = (sys.provider_call)(
+                -1,
+                abi::registry::kernel::RANDOM_FILL,
+                rng_buf.as_mut_ptr(),
+                8,
+            );
+            let rng32_rc = (sys.provider_call)(
+                -1,
+                abi::registry::kernel::RANDOM_FILL,
+                rng_buf.as_mut_ptr(),
+                32,
+            );
             let mut tier_buf = [0u8; 4];
             let tier_rc =
                 (sys.provider_call)(-1, key_vault::TIER, tier_buf.as_mut_ptr(), tier_buf.len());

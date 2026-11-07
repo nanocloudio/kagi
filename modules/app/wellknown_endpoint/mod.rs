@@ -427,7 +427,12 @@ pub extern "C" fn module_new(
         // A predictable salt would let two issuers' documents be compared; an
         // unavailable CSPRNG is not a reason to refuse to serve, so a zero
         // salt stands and the document is simply less private.
-        let _ = (sys.provider_call)(-1, 0x0C3C, s.salt.as_mut_ptr(), 8);
+        let _ = (sys.provider_call)(
+            -1,
+            abi::registry::kernel::RANDOM_FILL,
+            s.salt.as_mut_ptr(),
+            8,
+        );
         s.inserted = 0;
         s.updated_at = dev_unix_millis(sys) / 1000;
         s.discovery = [[0u8; MAX_URL]; DISCOVERY_URLS];

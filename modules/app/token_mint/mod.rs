@@ -66,8 +66,7 @@ mod typed_exchange;
 // backend is present the signing key lives in it (kernel static slots on the
 // software backend, a PKCS#11 token on a hardware backend) and never in this
 // module; SIGN runs in the backend. See rfc_crypto_extensions.md.
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/key_vault.rs"]
-mod key_vault;
+use abi::contracts::key_vault;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
 use auth_wire::{MintClaimValue, MintRequest, PayloadWriter};
