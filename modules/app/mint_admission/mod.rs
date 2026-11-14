@@ -51,36 +51,28 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other kagi modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ed25519 references Sha512 (sha384.rs) and helpers from p256.rs, and p256
 // pulls in hmac + both hash widths, so the include set is the full chain.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+use fluxor_sdk::crypto::ed25519::*;
+use fluxor_sdk::crypto::hmac::*;
+use fluxor_sdk::crypto::p256::*;
+use fluxor_sdk::crypto::sha256::*;
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
 // ed25519.rs. Order matters for all four.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+use fluxor_sdk::crypto::ml_dsa::*;
 include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
@@ -319,7 +311,7 @@ struct ModuleState {
     mint_buf: [u8; x::RECORD_MAX],
 }
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // Grant-mode policy. All optional: a graph using admission for bare
@@ -365,17 +357,7 @@ define_params! {
     };
 }
 
-#[cfg_attr(not(feature = "host-test"), no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "module state is far below u32::MAX"
-    )]
-    {
-        core::mem::size_of::<ModuleState>() as u32
-    }
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_init"]
@@ -398,9 +380,9 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs), the
+    // SAFETY: per the module ABI (`fluxor_abi`), the
     // kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes, and a `syscalls` table whose function
+    // `MODULE_STATE_BYTES` bytes, and a `syscalls` table whose function
     // pointers reach live kernel routines.
     unsafe {
         if syscalls.is_null() || state.is_null() {
@@ -476,15 +458,15 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), no_mangle)]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: as `module_new`.
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut ModuleState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys = &*s.syscalls;
 
@@ -500,9 +482,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         worked |= drain_mint(s, sys);
         worked |= drain_requests(s, sys);
         if worked {
-            STEP_DID_WORK
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }

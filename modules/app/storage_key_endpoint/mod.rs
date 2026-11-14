@@ -10,24 +10,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other kagi modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/http_endpoint.rs"]
 mod http_endpoint;
@@ -96,9 +90,8 @@ struct State {
 mod params_def {
     use super::p_u32;
     use super::State;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         State;
 
         1, timeout_ms, u32, 30000
@@ -106,11 +99,7 @@ mod params_def {
     }
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -152,7 +141,7 @@ pub unsafe extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: as `module_new`.
     unsafe {
         let s = &mut *(state as *mut State);
@@ -163,7 +152,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             s.resolved = 1;
         }
         if s.request_in < 0 || s.response_out < 0 || s.service_out < 0 || s.service_in < 0 {
-            return 0;
+            return StepReturn::Continue;
         }
         let mut worked = false;
         // A call still held goes before anything new is sent. It does NOT
@@ -254,9 +243,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         if worked {
-            STEP_DID_WORK
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }

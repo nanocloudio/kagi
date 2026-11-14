@@ -11,38 +11,24 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
-)]
-#![allow(
-    clippy::needless_return,
-    reason = "fires inside the SDK's aes_gcm.rs, which this module mounts by path; \
-              target/fluxor/** is materialised by `fluxor sync` and not ours to edit"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other kagi modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Crypto primitives (crate-root include, mirroring fluxor's tls module).
 // aes_gcm's key zeroisation lives in p256.rs, and p256 in turn needs
 // hmac + both hash widths, so the include set is the full chain.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/aes_gcm.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
+use fluxor_sdk::crypto::aes_gcm::*;
+use fluxor_sdk::crypto::hmac::*;
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -55,7 +41,7 @@ mod secret_record;
 
 use auth_wire::{PayloadReader, PayloadWriter};
 
-// FS opcodes (see target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs)
+// FS opcodes (see `fluxor_abi::contracts::storage::fs`)
 const FS_OPEN: u32 = abi::registry::fs::OPEN;
 const FS_READ: u32 = abi::registry::fs::READ;
 const FS_SEEK: u32 = abi::registry::fs::SEEK;
@@ -214,11 +200,7 @@ struct ModuleState {
     file_buf: [u8; FILE_BUF_LEN],
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -236,9 +218,9 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of
-    // at least `module_state_size()` bytes, and a `syscalls`
+    // at least `MODULE_STATE_BYTES` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
     // The dereferences and syscall invocations below rely on
     // those guarantees.
@@ -288,10 +270,10 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of
-    // at least `module_state_size()` bytes, and a `syscalls`
+    // at least `MODULE_STATE_BYTES` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
     // The dereferences and syscall invocations below rely on
     // those guarantees.
@@ -327,7 +309,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             handle_request(s, sys, msg_type, plen as usize);
         }
 
-        0
+        StepReturn::Continue
     }
 }
 
@@ -340,7 +322,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn drain_key_updates(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_key_update < 0 {
         return;
@@ -375,7 +357,7 @@ fn next_nonce(s: &mut ModuleState) -> [u8; secret_record::NONCE_LEN] {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, msg_type: u8, plen: usize) {
     // Correlation id is the first field of every request; a payload too
     // short even for that is dropped (no way to address a reply).
@@ -406,7 +388,7 @@ fn find_record(s: &ModuleState, id: &[u8]) -> Option<usize> {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn handle_get(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: usize) {
     s.get_ops = s.get_ops.saturating_add(1);
     let mut r = PayloadReader::new(&s.msg_buf[..plen]);
@@ -476,7 +458,7 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn handle_derive(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: usize) {
     s.get_ops = s.get_ops.saturating_add(1);
     let mut r = PayloadReader::new(&s.msg_buf[..plen]);
@@ -535,7 +517,7 @@ unsafe fn handle_derive(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn handle_put(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: usize) {
     s.put_ops = s.put_ops.saturating_add(1);
 
@@ -613,7 +595,7 @@ unsafe fn handle_put(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: u
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn handle_list(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: usize) {
     s.list_ops = s.list_ops.saturating_add(1);
     let mut prefix = [0u8; MAX_ID_LEN];
@@ -666,7 +648,7 @@ unsafe fn handle_list(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: 
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn handle_rotate(s: &mut ModuleState, sys: &SyscallTable, corr: u32, plen: usize) {
     s.rotate_ops = s.rotate_ops.saturating_add(1);
     let mut id = [0u8; MAX_ID_LEN];
@@ -795,7 +777,7 @@ fn fmt_ver_dec(mut v: u32, out: &mut [u8; MAX_VER_LEN]) -> usize {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn reply_ack(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: u8) {
     let mut payload = [0u8; 8];
     let mut w = PayloadWriter::new(&mut payload);
@@ -809,7 +791,7 @@ unsafe fn reply_ack(s: &mut ModuleState, sys: &SyscallTable, corr: u32, status: 
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn reply_value(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -848,21 +830,21 @@ unsafe fn reply_value(
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
+/// per the module ABI in `fluxor_abi`.
+unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> StepReturn {
     if s.load_fd < 0 {
         let mut path = [0u8; 32];
         path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), STORE_PATH.len());
         if fs_pending(fd) {
             // Not now (mount not up, entry not cached) — ask again next step.
-            return 0;
+            return StepReturn::Continue;
         }
         if fd < 0 {
             // No file yet (fresh deployment) or no provider. Start empty;
             // the write path decides memory-only degradation on its own.
             s.phase = PHASE_NORMAL;
-            return 0;
+            return StepReturn::Continue;
         }
         s.load_fd = fd;
         s.load_total = 0;
@@ -878,7 +860,7 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
         );
         if fs_pending(r) {
             // Sectors still being fetched; keep the FD and progress.
-            return 0;
+            return StepReturn::Continue;
         }
         if r < 0 || r as usize > FILE_BUF_LEN - s.load_total {
             (sys.provider_call)(s.load_fd, FS_CLOSE, core::ptr::null_mut(), 0);
@@ -892,7 +874,7 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
                 39,
             );
             s.phase = PHASE_NORMAL;
-            return 0;
+            return StepReturn::Continue;
         }
         if r == 0 {
             break;
@@ -934,7 +916,7 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
     }
 
     s.phase = PHASE_NORMAL;
-    0
+    StepReturn::Continue
 }
 
 /// Best-effort ascii-decimal parse (rotate counters round-trip).
@@ -959,7 +941,7 @@ fn parse_dec_u32(bytes: &[u8]) -> Option<u32> {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn persist(s: &mut ModuleState, sys: &SyscallTable) {
     s.dirty = true;
     step_persist(s, sys);
@@ -1014,7 +996,7 @@ unsafe fn persist_end(s: &mut ModuleState, sys: &SyscallTable, retry: bool) {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
     if s.no_fs {
         s.dirty = false;
@@ -1105,4 +1087,4 @@ unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
 // WASM entry wrappers (module_init_wasm / module_step_wasm). Emits
 // nothing on non-wasm targets; on wasm32 it adapts the PIC exports
 // above to the browser kernel's calling convention.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

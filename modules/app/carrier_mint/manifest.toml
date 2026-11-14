@@ -5,6 +5,7 @@ type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
+grants = ["key_vault"]
 
 # carrier_mint — the holder's half of a certificate-bound identity carrier
 # (modules/common/cert_bound_identity.rs is the relying party's): ES256

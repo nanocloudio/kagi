@@ -29,34 +29,26 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other kagi modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+use fluxor_sdk::crypto::ed25519::*;
+use fluxor_sdk::crypto::hmac::*;
+use fluxor_sdk::crypto::p256::*;
+use fluxor_sdk::crypto::sha256::*;
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
 // ed25519.rs. Order matters for all four.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+use fluxor_sdk::crypto::ml_dsa::*;
 include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/http_endpoint.rs"]
@@ -111,8 +103,6 @@ mod verify_keyset;
 // other.
 #[path = "../../../target/fluxor/wave-common/smtp_wire.rs"]
 mod smtp_wire;
-
-use auth_wire::PayloadReader;
 
 const STEP_DID_WORK: i32 = 2;
 
@@ -743,7 +733,7 @@ unsafe fn drain_mail(s: &mut ModuleState, sys: &SyscallTable) {
 /// This module's client id on the ledger's shared reply port.
 const STATE_CLIENT: u8 = 1;
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     1, iss, str, 0 => |s, d, len| {
@@ -915,7 +905,7 @@ impl Refusal {
 // `BadCode` is deliberately the same shape as `BadPossession`: a code that
 // did not match and a code already used are the same answer to whoever is
 // guessing.
-name_table!(
+fluxor_rt::name_table!(
     REFUSAL_BODIES = [
         br#"{"error":"temporarily_unavailable"}"#,
         br#"{"error":"server_error","detail":"entropy"}"#,
@@ -930,11 +920,7 @@ name_table!(
     ]
 );
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -957,9 +943,9 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs), the
+    // SAFETY: per the module ABI (`fluxor_abi`), the
     // kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes, and a `syscalls` table whose function
+    // `MODULE_STATE_BYTES` bytes, and a `syscalls` table whose function
     // pointers reach live kernel routines.
     unsafe {
         if syscalls.is_null() || state.is_null() {
@@ -1053,7 +1039,7 @@ pub extern "C" fn module_new(
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: as `module_new`.
     unsafe {
         let s = &mut *(state as *mut ModuleState);
@@ -1107,9 +1093,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if worked {
-            STEP_DID_WORK
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -1378,7 +1364,7 @@ unsafe fn authenticate_device(
     let claims_out = &mut claims_buf;
     let verifiers = device_auth::Verifiers {
         sha256: sha256_into,
-        ecdsa_verify,
+        ecdsa_verify: ecdsa_verify_local,
         ed25519_verify: ed25519_verify_slice,
         ml_dsa_verify: ml_dsa_verify_suite,
     };
@@ -3283,6 +3269,14 @@ fn put_u64(out: &mut [u8], at: &mut usize, mut value: u64) -> Result<(), Refusal
 /// The `Sha256Fn` shape the fragments take.
 fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
     *out = sha256(data);
+}
+
+/// The SDK's P-256 verify as the `EcdsaVerifyFn` the verifier table holds.
+/// Defined here so the table holds this module's own address: an SDK
+/// function's address is taken through a GOT entry the loader never
+/// relocates.
+fn ecdsa_verify_local(public: &[u8], hash: &[u8], signature: &[u8]) -> bool {
+    ecdsa_verify(public, hash, signature)
 }
 
 /// The `HkdfSha256Fn` shape `ids` takes.

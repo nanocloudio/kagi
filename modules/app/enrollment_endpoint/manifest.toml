@@ -4,6 +4,7 @@ type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
+grants = ["key_vault"]
 
 [[ports]]
 name = "request_in"

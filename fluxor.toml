@@ -9,8 +9,8 @@ version = "0.0.1"
 
 # Cross-project dependencies. Resolves to fluxor's published source
 # crates and fmod palette via the local registry. PIC modules in
-# `modules/app/*/mod.rs` consume the materialised SDK source at
-# `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
+# `modules/app/*/mod.rs` link the SDK crates `fluxor sync` stages under
+# `target/fluxor/` (`fluxor-abi`, `fluxor-rt`, `fluxor-sdk`).
 [dependencies]
 fluxor = "0.0.1"
 # wave publishes the protocol-module palette. `configs/e2e-*.yaml` have
@@ -63,7 +63,7 @@ max_inline_lines = 80
 # on the function itself.
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/"
-reason = """PIC modules mount the SDK wholesale via include! and the common fragments by #[path], so each compile sees the entire surface and uses a subset."""
+reason = """PIC modules mount the common fragments whole by #[path], so each compile sees every fragment and uses a subset."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "tests/harness/tests/support/"

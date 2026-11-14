@@ -30,30 +30,22 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other kagi modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+use fluxor_rt::*;
+use fluxor_sdk::crypto::ed25519::*;
+use fluxor_sdk::crypto::ml_dsa::*;
+use fluxor_sdk::crypto::p256::*;
+use fluxor_sdk::crypto::sha256::*;
 include!("../../common/sdk_bridge.rs");
 
 #[path = "../../common/auth_wire.rs"]
@@ -164,11 +156,7 @@ struct ModuleState {
     beats: u32,
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -186,9 +174,9 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs), the
+    // SAFETY: per the module ABI (`fluxor_abi`), the
     // kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes, and a `syscalls` table whose function
+    // `MODULE_STATE_BYTES` bytes, and a `syscalls` table whose function
     // pointers reach live kernel routines.
     unsafe {
         if syscalls.is_null() || state.is_null() {
@@ -327,7 +315,7 @@ fn advance(s: &mut ModuleState) {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: per the module ABI, `state` is valid and exclusively borrowed,
     // and the syscall table it holds reaches live kernel routines.
     unsafe {
@@ -412,7 +400,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             s.suite_idx = (s.suite_idx + 1) % SUITES.len();
             s.op = OP_SIGN;
-            return 0;
+            return StepReturn::Continue;
         }
 
         // ECDSA signs a DIGEST — the vault's sign_mode for ES256 — so the
@@ -468,6 +456,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             emit_beat(s, sys);
             advance(s);
         }
-        0
+        StepReturn::Continue
     }
 }

@@ -5,6 +5,7 @@ entry = "mod.rs"
 edition = "2021"
 # Where its ledger runs: a grant's single-use state is the ledger's.
 hardware_targets = ["bcm2712", "linux"]
+grants = ["key_vault"]
 
 # custody_authority — the continuity authority a Fluxor
 # TRANSPORT_CONTINUITY provider asks, as a module of the provider's graph

@@ -40,36 +40,27 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other kagi modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ed25519 references Sha512 (sha384.rs) and helpers from p256.rs, and p256
 // pulls in hmac + both hash widths, so the include set is the full chain.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha384.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/hmac.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/p256.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ed25519.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/sha3.rs");
+use fluxor_sdk::crypto::ed25519::*;
+use fluxor_sdk::crypto::p256::*;
+use fluxor_sdk::crypto::sha256::*;
 // ml_dsa.rs needs sha3.rs's SHAKE in scope; sdk_bridge.rs needs both, plus
 // ed25519.rs. Order matters for all four.
-include!("../../../target/fluxor/fluxor-abi/sdk/crypto/ml_dsa.rs");
+use fluxor_sdk::crypto::ml_dsa::*;
 include!("../../common/sdk_bridge.rs");
 
 /// The assurance ladder, reached through `auth_wire` so this module and the
@@ -111,7 +102,6 @@ mod time_policy;
 mod verify_keyset;
 
 use assurance::AssuranceLevel;
-use auth_wire::PayloadReader;
 
 /// `module_step` return code for "did work, step me again".
 ///
@@ -298,7 +288,7 @@ impl Refusal {
     }
 }
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // The floor as its `acr` word, so a graph reads the way a token does.
@@ -331,11 +321,7 @@ define_params! {
     };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[no_mangle]
 #[link_section = ".text.module_init"]
@@ -358,9 +344,9 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs), the
+    // SAFETY: per the module ABI (`fluxor_abi`), the
     // kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes, and a `syscalls` table whose function
+    // `MODULE_STATE_BYTES` bytes, and a `syscalls` table whose function
     // pointers reach live kernel routines. The dereferences and syscall
     // invocations below rely on those guarantees.
     unsafe {
@@ -427,7 +413,7 @@ fn level_from(text: &[u8]) -> Option<AssuranceLevel> {
 
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: as `module_new` — the kernel's `state` pointer is valid and
     // exclusively borrowed for the duration of the call.
     unsafe {
@@ -480,9 +466,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if worked {
-            STEP_DID_WORK
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }
@@ -494,7 +480,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 ///
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines per the
-/// module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// module ABI in `fluxor_abi`.
 unsafe fn drain_key_material(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_key < 0 {
         return;

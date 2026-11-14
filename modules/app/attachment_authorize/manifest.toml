@@ -6,6 +6,7 @@ edition = "2021"
 # Where its ledger runs: each attached service's revocation generation is
 # the ledger's, so it runs on the runtimes `security_state` does.
 hardware_targets = ["bcm2712", "linux"]
+grants = ["key_vault"]
 
 # A typed operation: the PROVIDER side of the workspace exchange contract.
 # Each request body is one `attachment_grant::msg::REQUEST` envelope (a
