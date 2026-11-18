@@ -56,6 +56,7 @@ mod time_policy;
 mod typed_exchange;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 
 use auth_wire::PayloadReader;
 
@@ -75,7 +76,7 @@ const MAX_EXCHANGES: usize = 4;
 /// Longest target and header block held. Neither is read; they are bounded
 /// so the module can sit behind an HTTP route as well as a pipeline.
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: one `MSG_VERIFY_REQ` envelope, whose credential is
 /// the bulk of it.
 const MAX_REQUEST: usize = x::PAYLOAD_MAX;
@@ -198,7 +199,7 @@ struct ModuleState {
     no_key_errors: u32,
 
     /// Requests being collected until their body is whole.
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     /// The one answer, credit or refusal owed to `response_out`. Nothing new
     /// is read while it is held, so a full channel holds an answer rather
     /// than losing it.
@@ -305,7 +306,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = s.requests.take_refusal() {
-                answer_status(s, sys, &id, why.status());
+                answer_status(s, sys, &id, http::canonical_status(why.outcome()));
             }
             if let Ok(Some(at)) = outcome {
                 handle_verify(s, sys, at);
@@ -491,7 +492,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     // Copied out of the collector so its slot is free, and the module
     // borrowable, before the answer is written.
     let body_len = request.body.len();
@@ -506,7 +507,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         typed_exchange::message(&req_bytes[..body_len])
     else {
         // Not a verify request at all: there is no verdict to give.
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
 
@@ -806,7 +807,7 @@ unsafe fn emit(
         Ok(len) => len,
         // An identity that does not fit one answer is not delivered in part.
         Err(_) => {
-            answer_status(s, sys, id, x::status::FAILED);
+            answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
             return;
         }
     };

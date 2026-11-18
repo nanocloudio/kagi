@@ -63,6 +63,7 @@ use fluxor_sdk::crypto::sha256::*;
 mod http_endpoint;
 
 use abi::contracts::exchange::{self as x, ExchangeId};
+use abi::contracts::exchange_http as http;
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -81,8 +82,8 @@ use auth_wire::PayloadReader;
 const STEP_DID_WORK: i32 = 2;
 
 /// The exchange contract's method bytes for `GET` and `HEAD`.
-const METHOD_GET: u8 = x::METHOD_GET;
-const METHOD_HEAD: u8 = x::METHOD_HEAD;
+const METHOD_GET: u8 = http::method::GET;
+const METHOD_HEAD: u8 = http::method::HEAD;
 
 /// Longest published key, from the registry: the widest key this build
 /// can verify under, since a key it cannot verify is not published.
@@ -420,6 +421,8 @@ pub extern "C" fn module_new(
         let _ = (sys.provider_call)(
             -1,
             abi::registry::kernel::RANDOM_FILL,
+            core::ptr::null_mut(),
+            0,
             s.salt.as_mut_ptr(),
             8,
         );
@@ -500,7 +503,15 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // named none this could answer.
                 Err(why) => {
                     if let Some((rid, _)) = s.exch.take_refusal() {
-                        respond(s, sys, &rid, 0, why.status(), b"", &[]);
+                        respond(
+                            s,
+                            sys,
+                            &rid,
+                            0,
+                            http::canonical_status(why.outcome()),
+                            b"",
+                            &[],
+                        );
                     }
                 }
             }
@@ -991,7 +1002,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     };
     let id = req.id;
     let credit = req.resp_credit;
-    let method = req.method;
+    let method = req.verb;
     let target = req.target;
     let revocations = target == b"/.well-known/revocations.json";
     let discovery = target == b"/.well-known/openid-configuration";

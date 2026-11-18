@@ -79,6 +79,7 @@ mod typed_exchange;
 mod x509_leaf;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use custody_authority_service::{self as ca, ready, Authority};
 use transfer_grant as tg;
 
@@ -88,7 +89,7 @@ const MSG_BUF: usize = 2048;
 /// Exchanges being collected at once.
 const MAX_EXCHANGES: usize = 2;
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest `CUSTODY_READY` request body: its envelope and 32 hosts fit.
 const MAX_REQUEST: usize = 1024;
 /// One `cert_in` frame: a leaf and its issuer.
@@ -140,7 +141,7 @@ struct ModuleState {
     ready_ids: [Option<ExchangeId>; ready::PROBES],
     ready_reply: [[u8; ready::REPLY_MAX]; ready::PROBES],
     ready_len: [u16; ready::PROBES],
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     outbox: ExchangeOutbox,
     req_buf: [u8; x::RECORD_MAX],
     out: [u8; x::RECORD_MAX],
@@ -443,19 +444,14 @@ pub unsafe extern "C" fn module_new(
         };
         // The grant key's custody floor, as the transfer-grant service's:
         // a grant moves live TLS secrets.
-        let tier = if (sys.provider_call)(-1, key_vault::PROBE, core::ptr::null_mut(), 0) == 1 {
-            let mut tier_buf = [0u8; 4];
-            if (sys.provider_call)(-1, key_vault::TIER, tier_buf.as_mut_ptr(), tier_buf.len()) >= 0
-            {
-                tier_buf[0]
-            } else {
-                key_custody::TIER_NONE
-            }
-        } else {
-            key_custody::TIER_NONE
+        let Some(tier) = issuer_key::vault_tier(sys) else {
+            let line =
+                b"[custody-authority] refusing to construct: the key vault did not answer its tier";
+            dev_log(sys, 1, line.as_ptr(), line.len());
+            return -1;
         };
         if !key_custody::permits(key_custody::KeyRole::TransferGrant, posture, tier) {
-            let why = key_custody::refusal_text(tier);
+            let why = key_custody::REFUSAL_TEXT;
             let line = b"[custody-authority] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());
             dev_log(sys, 1, why.as_ptr(), why.len());
@@ -606,7 +602,7 @@ unsafe fn serve_ready(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             }
         }
         if let Some((id, why)) = s.requests.take_refusal() {
-            answer_status(s, sys, &id, why.status());
+            answer_status(s, sys, &id, http::canonical_status(why.outcome()));
         }
         if let Ok(Some(at)) = outcome {
             take_question(s, sys, at);
@@ -625,7 +621,7 @@ unsafe fn take_question(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     let body_len = request.body.len();
     let mut body = [0u8; MAX_REQUEST];
     body[..body_len].copy_from_slice(request.body);
@@ -635,7 +631,7 @@ unsafe fn take_question(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
     let Some((ready::REQUEST, payload)) = typed_exchange::message(&body[..body_len]) else {
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
     let Some(slot) = s.ready_ids.iter().position(Option::is_none) else {
@@ -692,7 +688,7 @@ unsafe fn answer_ready(
     let Ok(len) =
         auth_wire::write_envelope(ready::REPLY, reply, &mut s.out[typed_exchange::ANSWER_AT..])
     else {
-        answer_status(s, sys, id, x::status::FAILED);
+        answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     if let Some(total) = typed_exchange::seal_answer(id, len, &mut s.out) {

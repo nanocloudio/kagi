@@ -144,10 +144,9 @@ struct ModuleState {
     sig: [u8; auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN],
     sig_len: u16,
 
-    /// Vault SIGN scratch: header + message + widest signature.
-    scratch: [u8; issuer_key::SIGN_SCRATCH_OVERHEAD
-        + MSG.len()
-        + auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN],
+    /// Vault SIGN scratch, signed in place: the message, then room for the
+    /// widest signature.
+    scratch: [u8; issuer_key::SIGN_SCRATCH_OVERHEAD + MSG.len()],
 
     // Metrics (names mirror manifest [observability]).
     ops_done: u32,
@@ -240,23 +239,39 @@ unsafe fn raw_open_rc(sys: &SyscallTable, suite: u16, label: &[u8]) -> i32 {
         auth_wire::suite::ML_DSA_87 => key_vault::suite::ML_DSA_87,
         _ => return -999,
     };
+    let mut arg = [0u8; key_vault::open::MAX_ARG];
+    let Some(arg_len) = key_vault::open::encode(
+        &mut arg,
+        &key_vault::open::Request {
+            suite: vault,
+            usage: USAGE,
+            flags: 0,
+            label,
+        },
+    ) else {
+        return -999;
+    };
     let mut pub_out = [0u8; issuer_key::MAX_ISSUER_PUBKEY];
-    let mut arg = [0u8; 8 + 32 + 12];
-    arg[0..2].copy_from_slice(&vault.to_le_bytes());
-    arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
-    arg[6] = 0;
-    arg[7] = label.len() as u8;
-    arg[8..8 + label.len()].copy_from_slice(label);
-    let tail = 8 + label.len();
-    arg[tail..tail + 8].copy_from_slice(&(pub_out.as_mut_ptr() as u64).to_le_bytes());
-    arg[tail + 8..tail + 10].copy_from_slice(&(issuer_key::MAX_ISSUER_PUBKEY as u16).to_le_bytes());
-    arg[tail + 10..tail + 12].copy_from_slice(&0u16.to_le_bytes());
-    let rc = (sys.provider_call)(-1, key_vault::OPEN_OR_GENERATE, arg.as_mut_ptr(), tail + 12);
+    let rc = (sys.provider_call)(
+        -1,
+        key_vault::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        arg_len,
+        pub_out.as_mut_ptr(),
+        pub_out.len(),
+    );
     if rc >= 0 {
         // The diagnostic retry SUCCEEDED where the wrapper failed — a
         // transient. Close the handle so the probe cannot leak a vault
         // slot; the step-side retry will reopen it properly.
-        let _ = (sys.provider_call)(rc, key_vault::DESTROY, core::ptr::null_mut(), 0);
+        let _ = (sys.provider_call)(
+            rc,
+            key_vault::DESTROY,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     rc
 }
@@ -330,21 +345,17 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // it is the vault's own keygen/public path.
         if s.suite_idx == 0 && s.op == OP_SIGN {
             let mut rng_buf = [0u8; 64];
-            let rng_rc = (sys.provider_call)(
+            let rng_rc = dev_csprng_fill(sys, rng_buf.as_mut_ptr(), 8);
+            let rng32_rc = dev_csprng_fill(sys, rng_buf.as_mut_ptr(), 32);
+            let mut tier_buf = [0u8; key_vault::tier_arg::ARG_LEN];
+            let tier_rc = (sys.provider_call)(
                 -1,
-                abi::registry::kernel::RANDOM_FILL,
-                rng_buf.as_mut_ptr(),
-                8,
+                key_vault::TIER,
+                tier_buf.as_mut_ptr(),
+                tier_buf.len(),
+                core::ptr::null_mut(),
+                0,
             );
-            let rng32_rc = (sys.provider_call)(
-                -1,
-                abi::registry::kernel::RANDOM_FILL,
-                rng_buf.as_mut_ptr(),
-                32,
-            );
-            let mut tier_buf = [0u8; 4];
-            let tier_rc =
-                (sys.provider_call)(-1, key_vault::TIER, tier_buf.as_mut_ptr(), tier_buf.len());
             let mut line = [0u8; 64];
             let mut at = 0usize;
             line[..12].copy_from_slice(b"[bench] rng=");

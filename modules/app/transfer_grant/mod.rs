@@ -85,6 +85,7 @@ mod cert_bound_identity {
 }
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use transfer_grant as tg;
 use transfer_grant_service::{self as svc};
 
@@ -94,7 +95,7 @@ const MAX_LEDGER_PER_STEP: usize = 4;
 const MSG_BUF: usize = 4096;
 const MAX_EXCHANGES: usize = 4;
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 const MAX_REQUEST: usize = x::PAYLOAD_MAX;
 const MAX_FIELD: usize = 64;
 const REPLAY_SLOTS: usize = 64;
@@ -133,7 +134,7 @@ struct ModuleState {
 
     auth: carrier_auth::Authenticator<REPLAY_SLOTS>,
     service: svc::Service,
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     peers: exchange_peer::Peers<MAX_EXCHANGES>,
     outbox: ExchangeOutbox,
     buf: [u8; MSG_BUF],
@@ -350,9 +351,13 @@ impl svc::Host for ModuleHost<'_> {
             return false;
         }
         let id = ExchangeId(*caller);
-        let Some(n) = typed_exchange::write_answer(&id, frame, &mut self.out[..])
-            .or_else(|| typed_exchange::write_status(&id, x::status::FAILED, &mut self.out[..]))
-        else {
+        let Some(n) = typed_exchange::write_answer(&id, frame, &mut self.out[..]).or_else(|| {
+            typed_exchange::write_status(
+                &id,
+                http::status::INTERNAL_SERVER_ERROR,
+                &mut self.out[..],
+            )
+        }) else {
             return false;
         };
         // SAFETY: as above.
@@ -446,19 +451,14 @@ pub extern "C" fn module_new(
         // The grant key's custody floor, refused at construction like
         // token_mint's: a grant moves live TLS secrets, so its key is
         // issuer-grade.
-        let tier = if (sys.provider_call)(-1, key_vault::PROBE, core::ptr::null_mut(), 0) == 1 {
-            let mut tier_buf = [0u8; 4];
-            if (sys.provider_call)(-1, key_vault::TIER, tier_buf.as_mut_ptr(), tier_buf.len()) >= 0
-            {
-                tier_buf[0]
-            } else {
-                key_custody::TIER_NONE
-            }
-        } else {
-            key_custody::TIER_NONE
+        let Some(tier) = issuer_key::vault_tier(sys) else {
+            let line =
+                b"[transfer-grant] refusing to construct: the key vault did not answer its tier";
+            dev_log(sys, 1, line.as_ptr(), line.len());
+            return -1;
         };
         if !key_custody::permits(key_custody::KeyRole::TransferGrant, posture, tier) {
-            let why = key_custody::refusal_text(tier);
+            let why = key_custody::REFUSAL_TEXT;
             let line = b"[transfer-grant] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());
             dev_log(sys, 1, why.as_ptr(), why.len());
@@ -565,7 +565,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = requests.take_refusal() {
-                answer_status(&mut host, &id, why.status());
+                answer_status(&mut host, &id, http::canonical_status(why.outcome()));
             }
             let Ok(Some(at)) = outcome else {
                 continue;
@@ -574,7 +574,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 continue;
             };
             let id = request.id;
-            let refused = typed_exchange::admissible(request.method, request.resp_credit);
+            let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
             let body_len = request.body.len().min(body.len());
             for (d, s) in body.iter_mut().zip(request.body.iter().take(body_len)) {
                 *d = *s;
@@ -593,7 +593,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     };
                     service.on_request(&mut host, &id.0, svid, payload);
                 }
-                _ => answer_status(&mut host, &id, x::status::BAD_REQUEST),
+                _ => answer_status(&mut host, &id, http::status::BAD_REQUEST),
             }
         }
         if !host.outbox.holding() {

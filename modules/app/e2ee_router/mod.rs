@@ -44,7 +44,9 @@ mod chan;
 #[path = "../../common/http_endpoint.rs"]
 mod http_endpoint;
 
-use abi::contracts::exchange::{self as x, parse_request, ExchangeId, Record, RequestRecord};
+use abi::contracts::exchange::{
+    self as x, parse_request, ExchangeId, Record, Relayed, RequestRecord,
+};
 
 /// The path families, longest-first so `/e2ee/state/` is tested before any
 /// shorter prefix could swallow it.
@@ -266,7 +268,8 @@ unsafe fn forward_answers(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
 unsafe fn route(s: &mut ModuleState, sys: &SyscallTable, len: usize) {
     let record = s.buf.get(..len).unwrap_or(&[]);
-    let Some(parsed) = parse_request(record) else {
+    // Relayed: the records go on verbatim, and the endpoints judge the verbs.
+    let Ok(parsed) = parse_request::<Relayed>(record) else {
         return;
     };
     let out = match parsed {

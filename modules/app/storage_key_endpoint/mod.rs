@@ -27,6 +27,7 @@ use fluxor_rt::*;
 mod http_endpoint;
 
 use abi::contracts::exchange::{self as x, ExchangeId};
+use abi::contracts::exchange_http as http;
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -186,7 +187,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     if msg_type == msg::REPLY {
                         respond(s, sys, &id, credit, 200, payload);
                     } else {
-                        respond(s, sys, &id, credit, x::status::BAD_GATEWAY, &[]);
+                        respond(s, sys, &id, credit, http::status::BAD_GATEWAY, &[]);
                     }
                 }
                 // The service refused the exchange itself, or it ended with
@@ -236,7 +237,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((rid, why)) = s.exch.take_refusal() {
-                respond(s, sys, &rid, 0, why.status(), &[]);
+                respond(s, sys, &rid, 0, http::canonical_status(why.outcome()), &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle(s, sys, at, now);
@@ -256,7 +257,7 @@ unsafe fn handle(s: &mut State, sys: &SyscallTable, at: usize, now: u64) {
     let Some(req) = s.exch.request(at) else {
         return;
     };
-    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    let (id, credit, method) = (req.id, req.resp_credit, req.verb);
     let mut path = [0u8; 32];
     let pl = req.target.len().min(path.len());
     path[..pl].copy_from_slice(&req.target[..pl]);

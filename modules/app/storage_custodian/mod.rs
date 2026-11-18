@@ -253,26 +253,38 @@ unsafe fn open_recovery_key(s: &mut ModuleState, sys: &SyscallTable) {
     // never leaves.
     const USAGE: u32 =
         key_vault::usage::AGREE | key_vault::usage::EXPORT_PUBLIC | key_vault::usage::PERSIST;
-    // [suite u16][usage u32][flags u8][label_len u8][label]
-    // [pub_out_ptr u64][pub_out_cap u16][pub_len_out u16]
-    let mut arg = [0u8; 8 + key_vault::MAX_LABEL + 12];
-    arg[0..2].copy_from_slice(&key_vault::suite::P256.to_le_bytes());
-    arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
-    arg[6] = 0;
-    arg[7] = s.label_len;
-    arg[8..8 + n].copy_from_slice(&s.label[..n]);
-    let tail = 8 + n;
-    let ptr = s.public.as_mut_ptr() as u64;
-    arg[tail..tail + 8].copy_from_slice(&ptr.to_le_bytes());
-    #[expect(clippy::cast_possible_truncation, reason = "PUBLIC_LEN is 65")]
-    arg[tail + 8..tail + 10].copy_from_slice(&(sk::PUBLIC_LEN as u16).to_le_bytes());
-    let h = (sys.provider_call)(-1, key_vault::OPEN_OR_GENERATE, arg.as_mut_ptr(), tail + 12);
+    let mut arg = [0u8; key_vault::open::MAX_ARG];
+    let Some(arg_len) = key_vault::open::encode(
+        &mut arg,
+        &key_vault::open::Request {
+            suite: key_vault::suite::P256,
+            usage: USAGE,
+            flags: 0,
+            label: &s.label[..n],
+        },
+    ) else {
+        return;
+    };
+    let h = (sys.provider_call)(
+        -1,
+        key_vault::OPEN_OR_GENERATE,
+        arg.as_mut_ptr(),
+        arg_len,
+        s.public.as_mut_ptr(),
+        s.public.len(),
+    );
     if h < 0 {
         return;
     }
-    let got = usize::from(u16::from_le_bytes([arg[tail + 10], arg[tail + 11]]));
-    if got != sk::PUBLIC_LEN {
-        let _ = (sys.provider_call)(h, key_vault::DESTROY, core::ptr::null_mut(), 0);
+    if key_vault::open::len(&arg[..arg_len]) != Some(sk::PUBLIC_LEN) {
+        let _ = (sys.provider_call)(
+            h,
+            key_vault::DESTROY,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         return;
     }
     s.handle = h;
@@ -438,25 +450,22 @@ unsafe fn release(
         order.envelope,
         s.erased.get(..usize::from(s.erased_live)).unwrap_or(&[]),
     )?;
-    let mut arg = [0u8; sk::REWRAP_ARG_LEN];
-    #[expect(clippy::cast_possible_truncation, reason = "ENVELOPE_LEN is 260")]
-    sk::write_rewrap_arg(
-        &auth,
-        order.recipient,
-        order.envelope,
-        envelope.as_mut_ptr() as u64,
-        sk::ENVELOPE_LEN as u32,
-        &mut arg,
-    )?;
+    let mut arg = [0u8; key_vault::share::rewrap::ARG_LEN];
+    sk::write_rewrap_arg(&auth, order.recipient, &mut arg)?;
+    if order.envelope.len() != sk::ENVELOPE_LEN {
+        return Err(Refusal::Malformed);
+    }
+    envelope.copy_from_slice(order.envelope);
     let rc = (sys.provider_call)(
         s.handle,
         key_vault::SHARE_REWRAP,
         arg.as_mut_ptr(),
         arg.len(),
+        envelope.as_mut_ptr(),
+        envelope.len(),
     );
-    let at = key_vault::share::rewrap::OUT_LEN;
-    let written = u32::from_le_bytes([arg[at], arg[at + 1], arg[at + 2], arg[at + 3]]);
-    if rc < 0 || written as usize != sk::ENVELOPE_LEN {
+    if rc < 0 || rc as usize != sk::ENVELOPE_LEN {
+        envelope.fill(0);
         return Err(Refusal::CustodianRefused);
     }
     // Remembered only once released: a refused order drew nothing.

@@ -1695,9 +1695,7 @@ fn write_share_grant(
 /// custodians the authorisation names, in share-index order.
 pub fn write_split_arg(
     creation: &Record<'_>,
-    out_ptr: u64,
-    out_cap: u32,
-    arg: &mut [u8; share::split::LEN],
+    arg: &mut [u8; share::split::ARG_LEN],
 ) -> Result<(), Refusal> {
     use share::split as a;
     let c = &creation.binding;
@@ -1717,28 +1715,21 @@ pub fn write_split_arg(
             return Err(Refusal::Malformed);
         }
     }
-    arg[a::OUT_PTR..a::OUT_PTR + 8].copy_from_slice(&out_ptr.to_le_bytes());
-    arg[a::OUT_CAP..a::OUT_CAP + 4].copy_from_slice(&out_cap.to_le_bytes());
     Ok(())
 }
-
-/// The fixed length of a `SHARE_REWRAP` argument around one P-256 envelope.
-pub const REWRAP_ARG_LEN: usize = share::rewrap::ENV + ENVELOPE_LEN;
 
 /// The `SHARE_REWRAP` argument a custodian runs to release its share to the
 /// authorised recipient: purpose attachment, the authorisation's fence,
 /// expiry and policy. The vault carries the set, resource, epoch and AEAD
-/// over from the custody envelope itself.
+/// over from the custody envelope itself, which travels in the call's
+/// `data` and is rewrapped there in place.
 pub fn write_rewrap_arg(
     auth: &Binding,
     recipient_public: &[u8],
-    custody_envelope: &[u8],
-    out_ptr: u64,
-    out_cap: u32,
-    arg: &mut [u8; REWRAP_ARG_LEN],
+    arg: &mut [u8; share::rewrap::ARG_LEN],
 ) -> Result<(), Refusal> {
     use share::rewrap as a;
-    if recipient_public.len() != PUBLIC_LEN || custody_envelope.len() != ENVELOPE_LEN {
+    if recipient_public.len() != PUBLIC_LEN {
         return Err(Refusal::Malformed);
     }
     arg.fill(0);
@@ -1753,17 +1744,9 @@ pub fn write_rewrap_arg(
     if !copy_exact(
         &mut arg[a::RECIPIENT..a::RECIPIENT + PUBLIC_LEN],
         recipient_public,
-    ) || !copy_exact(&mut arg[a::ENV..a::ENV + ENVELOPE_LEN], custody_envelope)
-    {
+    ) {
         return Err(Refusal::Malformed);
     }
-    arg[a::OUT_PTR..a::OUT_PTR + 8].copy_from_slice(&out_ptr.to_le_bytes());
-    arg[a::OUT_CAP..a::OUT_CAP + 4].copy_from_slice(&out_cap.to_le_bytes());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "ENVELOPE_LEN is a 260-byte constant"
-    )]
-    arg[a::ENV_LEN..a::ENV_LEN + 2].copy_from_slice(&(ENVELOPE_LEN as u16).to_le_bytes());
     Ok(())
 }
 

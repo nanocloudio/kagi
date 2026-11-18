@@ -18,6 +18,8 @@ direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = 16384
 max_record = 8192
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_out"
@@ -48,7 +50,8 @@ buffer_size = 512
 name = "key_announce"
 direction = "output"
 content_type = "OctetStream"
-buffer_size = 512
+# Room for one whole record and its 2-byte length.
+buffer_size = 1024
 max_record = 512
 
 # One KCAA audit entry per decision, minted or refused. Kagi keeps none of

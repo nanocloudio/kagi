@@ -48,6 +48,7 @@ use fluxor_sdk::crypto::sha256::*;
 mod http_endpoint;
 
 use abi::contracts::exchange::{self as x, ExchangeId};
+use abi::contracts::exchange_http as http;
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -72,7 +73,7 @@ use credential::Ciphersuite;
 const STEP_DID_WORK: i32 = 2;
 
 /// The exchange contract's method byte for `POST`.
-const METHOD_POST: u8 = x::METHOD_POST;
+const METHOD_POST: u8 = http::method::POST;
 
 /// The `cty` a credential carries. The contract owns the value; this is the
 /// spelling a JOSE header needs.
@@ -346,7 +347,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
             if let Some((rid, why)) = s.exch.take_refusal() {
-                respond(s, sys, &rid, 0, why.status(), &[]);
+                respond(s, sys, &rid, 0, http::canonical_status(why.outcome()), &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -519,7 +520,7 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let Some(req) = s.exch.request(at) else {
         return;
     };
-    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    let (id, credit, method) = (req.id, req.resp_credit, req.verb);
     // Copied out of the collector so the handler can still take `&mut s`:
     // the request borrows the table, and answering borrows the module.
     let mut target_buf = [0u8; http_endpoint::MAX_TARGET];

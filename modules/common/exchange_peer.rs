@@ -18,6 +18,7 @@
 )]
 
 use crate::abi::contracts::exchange::{self as x, ExchangeId};
+use crate::abi::contracts::exchange_http::Http;
 
 /// An SVID's length.
 pub const SVID_LEN: usize = 32;
@@ -52,7 +53,7 @@ impl<const N: usize> Peers<N> {
     /// A HEAD without one clears whatever an earlier exchange with the same
     /// id left, so a reused id never inherits an identity.
     pub fn note(&mut self, record: &[u8]) {
-        let Some(x::Record::Head(h)) = x::parse_request(record) else {
+        let Ok(x::Record::Head(h)) = x::parse_request::<Http>(record) else {
             return;
         };
         for slot in &mut self.slots {

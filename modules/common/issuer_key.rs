@@ -45,12 +45,45 @@ use crate::auth_wire;
 use crate::key_vault;
 use crate::E_INVAL;
 
-/// Scratch an [`IssuerKey::sign`] call needs BEYOND the signing input.
+/// Scratch an [`IssuerKey::sign`] call needs BEYOND the signing input: the
+/// vault signs in place, so the scratch holds the input and then the
+/// signature written over it, and the widest signature bounds what the
+/// input alone does not.
 ///
 /// The caller supplies the buffer rather than this fragment putting one on
 /// the stack: these are PIC modules, and a signing input can be a whole
 /// TBSCertificate. A module that already owns a work buffer lends it.
-pub const SIGN_SCRATCH_OVERHEAD: usize = 18;
+pub const SIGN_SCRATCH_OVERHEAD: usize = auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN;
+
+/// Most identical `SIGN` calls one signature is given before it is refused:
+/// far above what a resumable P-256 or ML-DSA job takes on any core, so it
+/// bounds only a vault that never finishes.
+const SIGN_CALLS_MAX: usize = 1024;
+
+/// The isolation tier the vault reads out (`key_vault::TIER`), or `None`
+/// when it will not say. A vault that will not say what it is gets no
+/// credit for being one: reading a refusal as `TIER_SOFTWARE` would be
+/// inventing the answer.
+///
+/// # Safety
+///
+/// `sys` must be a valid syscall table per the module ABI.
+pub unsafe fn vault_tier(sys: &SyscallTable) -> Option<u8> {
+    let mut tier = [0u8; key_vault::tier_arg::ARG_LEN];
+    let rc = (sys.provider_call)(
+        -1,
+        key_vault::TIER,
+        tier.as_mut_ptr(),
+        tier.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    if rc == 1 {
+        Some(tier[0])
+    } else {
+        None
+    }
+}
 
 /// A signing key that lives in the vault.
 ///
@@ -157,48 +190,48 @@ impl IssuerKey {
         }
         const USAGE: u32 =
             key_vault::usage::SIGN | key_vault::usage::EXPORT_PUBLIC | key_vault::usage::PERSIST;
-        // [suite u16][usage u32][flags u8][label_len u8][label]
-        // [pub_out_ptr u64][pub_out_cap u16][pub_len_out u16]
-        let mut pub_out = [0u8; MAX_ISSUER_PUBKEY];
-        let mut arg = [0u8; 8 + auth_wire::MAX_KEY_LABEL + 12];
         let vault = vault_suite(suite);
         if vault == key_vault::suite::NONE {
             return E_INVAL;
         }
-        arg[0..2].copy_from_slice(&vault.to_le_bytes());
-        arg[2..6].copy_from_slice(&USAGE.to_le_bytes());
-        arg[6] = 0;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "label length bounded by MAX_KEY_LABEL immediately above"
-        )]
-        {
-            arg[7] = label.len() as u8;
-        }
-        arg[8..8 + label.len()].copy_from_slice(label);
-        let tail = 8 + label.len();
-        let pub_ptr = pub_out.as_mut_ptr() as u64;
-        arg[tail..tail + 8].copy_from_slice(&pub_ptr.to_le_bytes());
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "MAX_ISSUER_PUBKEY is the registry's widest key, far inside u16"
-        )]
-        {
-            arg[tail + 8..tail + 10].copy_from_slice(&(MAX_ISSUER_PUBKEY as u16).to_le_bytes());
-        }
-        arg[tail + 10..tail + 12].copy_from_slice(&0u16.to_le_bytes());
-        let handle =
-            (sys.provider_call)(-1, key_vault::OPEN_OR_GENERATE, arg.as_mut_ptr(), tail + 12);
+        let mut arg = [0u8; key_vault::open::MAX_ARG];
+        let Some(arg_len) = key_vault::open::encode(
+            &mut arg,
+            &key_vault::open::Request {
+                suite: vault,
+                usage: USAGE,
+                flags: 0,
+                label,
+            },
+        ) else {
+            return E_INVAL;
+        };
+        let mut pub_out = [0u8; MAX_ISSUER_PUBKEY];
+        let handle = (sys.provider_call)(
+            -1,
+            key_vault::OPEN_OR_GENERATE,
+            arg.as_mut_ptr(),
+            arg_len,
+            pub_out.as_mut_ptr(),
+            pub_out.len(),
+        );
         if handle < 0 {
             return handle;
         }
-        let pub_len = usize::from(u16::from_le_bytes([arg[tail + 10], arg[tail + 11]]));
+        let pub_len = key_vault::open::len(&arg[..arg_len]).unwrap_or(0);
         if pub_len == 0 || pub_len > MAX_ISSUER_PUBKEY {
             // A key that opened but exported nothing cannot be announced,
             // and a key verifiers never learn signs credentials nobody can
             // check. Released rather than kept: a half-open key is the state
             // that looks configured and is not.
-            let _ = (sys.provider_call)(handle, key_vault::DESTROY, core::ptr::null_mut(), 0);
+            let _ = (sys.provider_call)(
+                handle,
+                key_vault::DESTROY,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             return E_INVAL;
         }
         self.handle = handle;
@@ -227,7 +260,8 @@ impl IssuerKey {
     /// caller handing a P-256 slot a whole message got a valid signature
     /// over the wrong thing.
     ///
-    /// `scratch` must hold `input.len() + SIGN_SCRATCH_OVERHEAD`.
+    /// `scratch` must hold `input.len()` and the suite's signature:
+    /// `input.len() + SIGN_SCRATCH_OVERHEAD` always does.
     ///
     /// # Safety
     ///
@@ -251,7 +285,7 @@ impl IssuerKey {
         if want == 0 || sig_out.len() < want {
             return None;
         }
-        let total = input.len().checked_add(SIGN_SCRATCH_OVERHEAD)?;
+        let total = input.len().max(want);
         if scratch.len() < total || input.len() > u32::MAX as usize {
             return None;
         }
@@ -265,42 +299,38 @@ impl IssuerKey {
             | auth_wire::suite::ML_DSA_87 => key_vault::sign_mode::RAW,
             _ => key_vault::sign_mode::DIGEST,
         };
-        let sig = &mut sig_out[..want];
-        // SIGN v1: [sign_mode u8][_pad u8][input_len u32][input]
-        //          [sig_out_ptr u64][sig_out_cap u16][sig_len_out u16]
-        scratch[0] = mode;
-        scratch[1] = 0;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "input length bounded against u32::MAX immediately above"
         )]
-        {
-            scratch[2..6].copy_from_slice(&(input.len() as u32).to_le_bytes());
+        let mut arg = key_vault::sign::encode(mode, input.len() as u32);
+        // SIGN works in place: the input at the head of `scratch`, the
+        // signature written over it from byte 0. A suite the vault signs as
+        // a resumable job answers EAGAIN on the call that starts it and on
+        // each identical call that advances it, until the one that writes
+        // the signature.
+        let mut rc = crate::abi::errno::EAGAIN;
+        let mut calls = 0usize;
+        while rc == crate::abi::errno::EAGAIN && calls < SIGN_CALLS_MAX {
+            scratch[..input.len()].copy_from_slice(input);
+            rc = (sys.provider_call)(
+                self.handle,
+                key_vault::SIGN,
+                arg.as_mut_ptr(),
+                arg.len(),
+                scratch.as_mut_ptr(),
+                total,
+            );
+            calls += 1;
         }
-        scratch[6..6 + input.len()].copy_from_slice(input);
-        let tail = 6 + input.len();
-        let sig_ptr = sig.as_mut_ptr() as u64;
-        scratch[tail..tail + 8].copy_from_slice(&sig_ptr.to_le_bytes());
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the registry's widest signature is 4627, far inside u16"
-        )]
-        {
-            scratch[tail + 8..tail + 10].copy_from_slice(&(want as u16).to_le_bytes());
-        }
-        scratch[tail + 10..tail + 12].copy_from_slice(&0u16.to_le_bytes());
-        let rc = (sys.provider_call)(self.handle, key_vault::SIGN, scratch.as_mut_ptr(), total);
-        if rc < 0 {
-            return None;
-        }
-        let sig_len = usize::from(u16::from_le_bytes([scratch[tail + 10], scratch[tail + 11]]));
         // A signature of the wrong length is refused rather than
         // zero-padded: padding one produces a well-formed value that
         // verifies against nothing, which is the failure that gets
         // diagnosed last.
-        if sig_len != want {
+        if rc < 0 || rc as usize != want {
             return None;
         }
+        sig_out[..want].copy_from_slice(&scratch[..want]);
         Some(want)
     }
 
@@ -313,7 +343,14 @@ impl IssuerKey {
     /// `sys` must be a valid syscall table per the module ABI.
     pub unsafe fn close(&mut self, sys: &SyscallTable) {
         if self.handle >= 0 {
-            let _ = (sys.provider_call)(self.handle, key_vault::DESTROY, core::ptr::null_mut(), 0);
+            let _ = (sys.provider_call)(
+                self.handle,
+                key_vault::DESTROY,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         *self = Self::empty();
     }

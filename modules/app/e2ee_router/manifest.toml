@@ -13,6 +13,8 @@ name = "request_in"
 direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = 16384
+[ports.facts]
+binding = ["http"]
 
 # The endpoints' answers arrive here rather than going straight to the
 # listener.
@@ -54,6 +56,8 @@ name = "credential_out"
 direction = "output"
 content_type = "ExchangeRequest"
 buffer_size = 16384
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "keypkg_out"
@@ -61,6 +65,8 @@ index = 1
 direction = "output"
 content_type = "ExchangeRequest"
 buffer_size = 16384
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "state_out"
@@ -68,6 +74,8 @@ index = 2
 direction = "output"
 content_type = "ExchangeRequest"
 buffer_size = 16384
+[ports.facts]
+binding = ["http"]
 
 # Every answer this listener sends leaves here: the endpoints' responses
 # forwarded verbatim, and this router's own refusals. A path it does not

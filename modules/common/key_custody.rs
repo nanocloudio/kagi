@@ -40,10 +40,6 @@ pub const TIER_SOFTWARE: u8 = 0;
 pub const TIER_PROCESS_HW: u8 = 1;
 pub const TIER_DEVICE_HW: u8 = 2;
 
-/// No backend answered at all. Distinct from `TIER_SOFTWARE`, which is a
-/// backend that exists and isolates against a compromised module.
-pub const TIER_NONE: u8 = 0xFF;
-
 /// What a key is for. The requirement follows from this, not from the
 /// caller's own opinion of how important it is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,10 +91,7 @@ pub enum Posture {
 #[must_use]
 pub const fn required_tier(role: KeyRole, posture: Posture) -> u8 {
     match posture {
-        // Development runs on whatever is there. The floor is `SOFTWARE`
-        // rather than `NONE`, because a development graph with no vault at
-        // all is one whose vault path is never exercised — and the first
-        // time anyone runs it is then in production.
+        // Development runs on whatever vault is there.
         Posture::Development => TIER_SOFTWARE,
         Posture::Production => match role {
             KeyRole::Issuer
@@ -111,31 +104,14 @@ pub const fn required_tier(role: KeyRole, posture: Posture) -> u8 {
 }
 
 /// Whether a backend at `tier` may hold a key for `role`.
-///
-/// `TIER_NONE` satisfies nothing, including `Development`: a graph with no
-/// vault has no custody at all, and the development floor exists precisely
-/// so the vault path is exercised before production depends on it.
 #[must_use]
 pub const fn permits(role: KeyRole, posture: Posture, tier: u8) -> bool {
-    if tier == TIER_NONE {
-        return false;
-    }
     tier >= required_tier(role, posture)
 }
 
-/// Why a key was refused, for an operator-facing log line.
-///
-/// Two distinct reasons, because they need different actions: one is "wire
-/// a vault", the other is "wire a *better* vault", and an operator told
-/// only "refused" will try the first when they need the second.
-#[must_use]
-pub const fn refusal_text(tier: u8) -> &'static [u8] {
-    if tier == TIER_NONE {
-        b"no key_vault backend is wired"
-    } else {
-        b"key_vault tier is below this role's production floor"
-    }
-}
+/// Why a key was refused, for an operator-facing log line: the vault every
+/// signing module claims is there, and isolates less than the role needs.
+pub const REFUSAL_TEXT: &[u8] = b"key_vault tier is below this role's production floor";
 
 /// Short stable token for a tier.
 #[must_use]
@@ -144,6 +120,6 @@ pub const fn tier_text(tier: u8) -> &'static [u8] {
         TIER_SOFTWARE => b"software",
         TIER_PROCESS_HW => b"process-hw",
         TIER_DEVICE_HW => b"device-hw",
-        _ => b"none",
+        _ => b"unknown",
     }
 }

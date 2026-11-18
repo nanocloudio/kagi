@@ -11,10 +11,10 @@
 //!
 //! # The request
 //!
-//! A request HEAD with method `POST`. The target, headers and peer are not
-//! read — a typed operation sits as happily behind wave's `http` on a route
-//! as behind a pipeline, and neither the route nor the headers are an input
-//! to its decision. The body is exactly ONE `auth_wire` envelope:
+//! A CALL whose verb is the HTTP method `POST` (the `exchange_http`
+//! binding). The target, meta and peer are not read — a typed operation sits
+//! as happily behind wave's `http` on a route as behind a pipeline, and
+//! neither the route nor the header fields are an input to its decision. The body is exactly ONE `auth_wire` envelope:
 //!
 //! ```text
 //! [msg_type u8][len u16 LE][payload: len bytes]      len == body length - 3
@@ -32,13 +32,13 @@
 //!
 //! # The answer
 //!
-//! One response HEAD, no `MORE`, empty content type, no headers:
+//! One response HEAD, no `MORE`, no meta:
 //!
 //! | Status | When | Body |
 //! |---|---|---|
 //! | 200 | the operation produced its typed answer, a refusal verdict included | the answer envelope |
-//! | 400 | the method is not `POST`; the body is not one envelope of a request type the operation takes; the response credit is below [`ANSWER_CREDIT`] | empty |
-//! | 413 | the target, headers or body pass the provider's collector bounds | empty |
+//! | 400 | the request is not a `POST` call; the body is not one envelope of a request type the operation takes; the response credit is below [`ANSWER_CREDIT`] | empty |
+//! | 413 | the target, meta or body pass the provider's collector bounds | empty |
 //! | 503 | the provider holds as many exchanges as it can | empty |
 //!
 //! A request whose envelope is well framed but whose payload does not decode
@@ -62,16 +62,17 @@
 )]
 
 use crate::abi::contracts::exchange::{self as x, ExchangeId, Record};
+use crate::abi::contracts::exchange_http::{self as http, Http};
 use crate::auth_wire;
 
-/// The content type of every answer: none. The body is an `auth_wire`
-/// envelope, which names its own type.
-pub const CONTENT_TYPE: &[u8] = b"";
+/// The meta of every answer: none, so no content type. The body is an
+/// `auth_wire` envelope, which names its own type.
+pub const META: &[u8] = b"";
 
 /// Where an answer's envelope starts inside its response record. An answer
 /// is encoded straight into the record from here and sealed with
 /// [`seal_answer`].
-pub const ANSWER_AT: usize = x::response_body_at(CONTENT_TYPE.len());
+pub const ANSWER_AT: usize = x::response_body_at(META.len());
 
 /// The largest answer body: whatever one record carries after its head.
 pub const ANSWER_MAX: usize = x::RECORD_MAX - ANSWER_AT;
@@ -80,7 +81,7 @@ pub const ANSWER_MAX: usize = x::RECORD_MAX - ANSWER_AT;
 pub const ANSWER_CREDIT: u32 = ANSWER_MAX as u32;
 
 /// Where a call's envelope starts inside its request record: after the
-/// HEAD's fixed part, with an empty target, headers and peer.
+/// HEAD's fixed part, with an empty target, meta and peer.
 pub const CALL_AT: usize = x::HDR + x::REQ_HEAD_FIXED;
 
 /// The largest call body: whatever one record carries after its head.
@@ -100,29 +101,31 @@ pub fn message(body: &[u8]) -> Option<(u8, &[u8])> {
 }
 
 /// Why a collected request is not one a typed operation reads, as the status
-/// it is answered with. `None` when it is: `POST`, credit for any answer.
+/// it is answered with. `None` when it is: a `POST` call, credit for any
+/// answer.
 #[must_use]
-pub fn admissible(method: u8, resp_credit: u32) -> Option<u16> {
-    if method != x::METHOD_POST || resp_credit < ANSWER_CREDIT {
-        return Some(x::status::BAD_REQUEST);
+pub fn admissible(op: u8, verb: u8, resp_credit: u32) -> Option<u16> {
+    if op != x::op::CALL || verb != http::method::POST || resp_credit < ANSWER_CREDIT {
+        return Some(http::status::BAD_REQUEST);
     }
     None
 }
 
 /// Write a 200 answer carrying `envelope` as its whole body.
 pub fn write_answer(id: &ExchangeId, envelope: &[u8], out: &mut [u8]) -> Option<usize> {
-    x::write_response(id, x::status::OK, CONTENT_TYPE, envelope, out)
+    http::write_response(id, http::status::OK, META, envelope, out)
 }
 
 /// Seal a 200 answer whose `len`-byte envelope is already at [`ANSWER_AT`].
 pub fn seal_answer(id: &ExchangeId, len: usize, out: &mut [u8]) -> Option<usize> {
-    x::seal_response(id, x::status::OK, CONTENT_TYPE, len, out)
+    let head = http::head(*id, http::status::OK, META, &[])?;
+    x::seal_response_head::<Http>(&head, len, out)
 }
 
 /// Write an answer that is a status alone: a refusal before the operation
 /// read the request.
 pub fn write_status(id: &ExchangeId, status: u16, out: &mut [u8]) -> Option<usize> {
-    x::write_response(id, status, CONTENT_TYPE, &[], out)
+    http::write_response(id, status, META, &[], out)
 }
 
 // ── calling one ───────────────────────────────────────────────────────────
@@ -137,16 +140,17 @@ pub fn call_id(n: u64, port: i32) -> ExchangeId {
     ExchangeId(id)
 }
 
-/// Write a call: a request HEAD, `POST`, empty target, headers and peer,
+/// Write a call: a request HEAD, a `POST` call, empty target, meta and peer,
 /// granting [`ANSWER_CREDIT`], with `envelope` inline as its whole body.
 pub fn write_call(id: &ExchangeId, envelope: &[u8], out: &mut [u8]) -> Option<usize> {
-    x::write_request_head(
+    x::write_request_head::<Http>(
         &x::RequestHead {
             id: *id,
             flags: 0,
-            method: x::METHOD_POST,
+            op: x::op::CALL,
+            verb: http::method::POST,
             target: &[],
-            headers: &[],
+            meta: &[],
             peer: &[],
             resp_credit: ANSWER_CREDIT,
             body: envelope,
@@ -161,13 +165,14 @@ pub fn seal_call(id: &ExchangeId, len: usize, out: &mut [u8]) -> Option<usize> {
     if end > out.len() || end > x::RECORD_MAX {
         return None;
     }
-    x::write_request_head(
+    x::write_request_head::<Http>(
         &x::RequestHead {
             id: *id,
             flags: 0,
-            method: x::METHOD_POST,
+            op: x::op::CALL,
+            verb: http::method::POST,
             target: &[],
-            headers: &[],
+            meta: &[],
             peer: &[],
             resp_credit: ANSWER_CREDIT,
             body: &[],
@@ -202,12 +207,12 @@ pub enum Answer<'a> {
 /// Read one response-direction record.
 #[must_use]
 pub fn read_answer(record: &[u8]) -> Answer<'_> {
-    match x::parse_response(record) {
-        Some(Record::Head(h)) => {
-            if h.status != x::status::OK {
+    match x::parse_response::<Http>(record) {
+        Ok(Record::Head(h)) => {
+            if h.outcome != x::outcome::OK {
                 return Answer::Failed {
                     id: h.id,
-                    status: h.status,
+                    status: http::status_of(&h),
                 };
             }
             if h.flags & x::flag::MORE != 0 {
@@ -215,7 +220,7 @@ pub fn read_answer(record: &[u8]) -> Answer<'_> {
                 // streams is not a typed answer.
                 return Answer::Failed {
                     id: h.id,
-                    status: x::status::BAD_GATEWAY,
+                    status: http::status::BAD_GATEWAY,
                 };
             }
             match message(h.body) {
@@ -226,15 +231,15 @@ pub fn read_answer(record: &[u8]) -> Answer<'_> {
                 },
                 None => Answer::Failed {
                     id: h.id,
-                    status: x::status::BAD_GATEWAY,
+                    status: http::status::BAD_GATEWAY,
                 },
             }
         }
-        Some(Record::Abort { id, .. }) => Answer::Failed {
+        Ok(Record::Abort { id, .. }) => Answer::Failed {
             id,
-            status: x::status::BAD_GATEWAY,
+            status: http::status::BAD_GATEWAY,
         },
-        Some(Record::Link { state }) => Answer::Link { state },
+        Ok(Record::Link { state }) => Answer::Link { state },
         _ => Answer::Ignored,
     }
 }

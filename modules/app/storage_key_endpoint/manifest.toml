@@ -22,6 +22,8 @@ name = "request_in"
 direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = 16384
+[ports.facts]
+binding = ["http"]
 
 # Answers to `http.response_in`.
 [[ports]]
@@ -39,6 +41,8 @@ index = 1
 content_type = "ExchangeRequest"
 buffer_size = 16384
 max_record = 8192
+[ports.facts]
+binding = ["http"]
 
 # Answers from `storage_key.response_out`.
 [[ports]]

@@ -48,6 +48,7 @@ mod typed_exchange;
 mod verify_keyset;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use control_act as ca;
 
 /// WCET bound: request records taken per step (at most one signature each).
@@ -57,7 +58,7 @@ const MAX_EXCHANGES: usize = 4;
 /// Longest target and header block held. Neither is read; they are bounded
 /// so the module can sit behind an HTTP route as well as a pipeline.
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: one `VERIFY_REQ` envelope — a record and the
 /// declaring payload it covers, which may be a whole `WHR1` route record.
 const MAX_REQUEST: usize = x::PAYLOAD_MAX;
@@ -80,7 +81,7 @@ struct ModuleState {
     act_malformed: u32,
     no_key_errors: u32,
 
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     outbox: ExchangeOutbox,
     buf: [u8; x::RECORD_MAX],
     out: [u8; x::RECORD_MAX],
@@ -164,7 +165,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = s.requests.take_refusal() {
-                answer_status(s, sys, &id, why.status());
+                answer_status(s, sys, &id, http::canonical_status(why.outcome()));
             }
             if let Ok(Some(at)) = outcome {
                 handle_verify(s, sys, at);
@@ -227,7 +228,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     let body_len = request.body.len();
     let mut req_bytes = [0u8; MAX_REQUEST];
     req_bytes[..body_len].copy_from_slice(request.body);
@@ -238,7 +239,7 @@ unsafe fn handle_verify(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     }
     let Some((ca::msg::VERIFY_REQ, payload)) = typed_exchange::message(&req_bytes[..body_len])
     else {
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
 
@@ -304,7 +305,7 @@ fn lookup<'k>(
 unsafe fn emit(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, verdict: &ca::Verdict) {
     let mut payload = [0u8; ca::VERDICT_LEN];
     let Some(n) = verdict.encode(&mut payload) else {
-        answer_status(s, sys, id, x::status::FAILED);
+        answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     let Ok(len) = auth_wire::write_envelope(
@@ -312,7 +313,7 @@ unsafe fn emit(s: &mut ModuleState, sys: &SyscallTable, id: &ExchangeId, verdict
         &payload[..n],
         &mut s.out[typed_exchange::ANSWER_AT..],
     ) else {
-        answer_status(s, sys, id, x::status::FAILED);
+        answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     if let Some(total) = typed_exchange::seal_answer(id, len, &mut s.out) {

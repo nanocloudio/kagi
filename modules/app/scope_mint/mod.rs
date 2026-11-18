@@ -81,13 +81,14 @@ mod cert_bound_identity {
 }
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use operation_scope as os;
 
 const STEP_DID_WORK: i32 = 2;
 const MAX_REQS_PER_STEP: usize = 2;
 const MAX_EXCHANGES: usize = 4;
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: a mint request whose carrier holds a leaf.
 const MAX_REQUEST: usize = x::PAYLOAD_MAX;
 /// Longest issuer, trust domain or audience the graph names.
@@ -154,7 +155,7 @@ struct ModuleState {
     scope_unauthenticated: u32,
     scope_no_key: u32,
 
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     /// The verified peer each collecting exchange arrived with.
     peers: exchange_peer::Peers<MAX_EXCHANGES>,
     outbox: ExchangeOutbox,
@@ -274,19 +275,13 @@ pub extern "C" fn module_new(
         // The signing key's custody floor, refused at construction: a scope
         // authorises fences, DR moves and prefix imports, so the key is
         // issuer-grade.
-        let tier = if (sys.provider_call)(-1, key_vault::PROBE, core::ptr::null_mut(), 0) == 1 {
-            let mut tier_buf = [0u8; 4];
-            if (sys.provider_call)(-1, key_vault::TIER, tier_buf.as_mut_ptr(), tier_buf.len()) >= 0
-            {
-                tier_buf[0]
-            } else {
-                key_custody::TIER_NONE
-            }
-        } else {
-            key_custody::TIER_NONE
+        let Some(tier) = issuer_key::vault_tier(sys) else {
+            let line = b"[scope-mint] refusing to construct: the key vault did not answer its tier";
+            dev_log(sys, 1, line.as_ptr(), line.len());
+            return -1;
         };
         if !key_custody::permits(key_custody::KeyRole::Issuer, posture, tier) {
-            let why = key_custody::refusal_text(tier);
+            let why = key_custody::REFUSAL_TEXT;
             let line = b"[scope-mint] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());
             dev_log(sys, 1, why.as_ptr(), why.len());
@@ -339,7 +334,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = s.requests.take_refusal() {
-                answer_status(s, sys, &id, why.status());
+                answer_status(s, sys, &id, http::canonical_status(why.outcome()));
             }
             if let Ok(Some(at)) = outcome {
                 handle_mint(s, sys, at);
@@ -596,7 +591,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     let body_len = request.body.len();
     let mut req_bytes = [0u8; MAX_REQUEST];
     req_bytes[..body_len].copy_from_slice(request.body);
@@ -607,7 +602,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
     let Some((os::msg::REQUEST, payload)) = typed_exchange::message(&req_bytes[..body_len]) else {
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
 
@@ -636,7 +631,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     };
     let mut resp = [0u8; 3 + os::MAX_RECORD];
     let Some(n) = os::write_reply(refusal, &s.sign_scratch[..record_len], &mut resp) else {
-        answer_status(s, sys, &id, x::status::FAILED);
+        answer_status(s, sys, &id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     let Ok(len) = auth_wire::write_envelope(
@@ -644,7 +639,7 @@ unsafe fn handle_mint(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         &resp[..n],
         &mut s.out[typed_exchange::ANSWER_AT..],
     ) else {
-        answer_status(s, sys, &id, x::status::FAILED);
+        answer_status(s, sys, &id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     if let Some(total) = typed_exchange::seal_answer(&id, len, &mut s.out) {

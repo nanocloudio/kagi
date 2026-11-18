@@ -80,6 +80,7 @@ mod typed_exchange;
 mod verify_keyset;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use typed_exchange::Answer;
 
 /// Exchanges collected at once.
@@ -87,7 +88,7 @@ const MAX_EXCHANGES: usize = 4;
 /// Longest target and header block held. Neither is read; they are bounded
 /// so the module can sit behind an HTTP route as well as a pipeline.
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: one `MSG_AUTHORIZE_REQ` envelope, which carries two
 /// compact JWSs and the client's parameters.
 const MAX_REQUEST: usize = 4096 + auth_wire::ENVELOPE;
@@ -104,7 +105,6 @@ const PROOF_WINDOW_SECS: u64 = 300;
 /// This module's identity to the state ledger. Not an OAuth client id, and
 /// not a namespace — those are `state_wire::NS_OAUTH_*`.
 const STATE_CLIENT: u8 = 7;
-const CSPRNG_OP: u32 = abi::registry::kernel::RANDOM_FILL;
 
 /// PKCE: only S256 is offered — `plain` is a downgrade a client can force.
 const PKCE_CHALLENGE_LEN: usize = 43; // base64url(SHA256) is 43 chars
@@ -260,7 +260,7 @@ struct ModuleState {
     xchg_ok: u32,
     xchg_refused: u32,
     /// Requests being collected until their body is whole.
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     /// The one answer, credit or refusal owed to `response_out`.
     outbox: ExchangeOutbox,
     /// The one mint call owed to `mint_out`.
@@ -488,7 +488,7 @@ unsafe fn answer(
     encode: impl FnOnce(&mut [u8]) -> Result<usize, auth_wire::WireError>,
 ) -> bool {
     let Ok(len) = encode(&mut s.out[typed_exchange::ANSWER_AT..]) else {
-        answer_status(s, sys, id, x::status::FAILED);
+        answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
         return false;
     };
     if let Some(n) = typed_exchange::seal_answer(id, len, &mut s.out) {
@@ -566,7 +566,7 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             }
         }
         if let Some((id, why)) = s.requests.take_refusal() {
-            answer_status(s, sys, &id, why.status());
+            answer_status(s, sys, &id, http::canonical_status(why.outcome()));
         }
         if let Ok(Some(at)) = outcome {
             take_request(s, sys, at);
@@ -584,7 +584,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     // Copied out of the collector so its slot is free, and the module
     // borrowable, before anything is answered.
     let body_len = request.body.len();
@@ -596,7 +596,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
     let Some((msg_type, payload)) = typed_exchange::message(&body[..body_len]) else {
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
     // A payload that does not decode is still a request of its type, and is
@@ -610,7 +610,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
             Ok(req) => handle_exchange(s, sys, &id, &req),
             Err(_) => refuse_xchg(s, sys, &id, auth_wire::authz_err::MALFORMED),
         },
-        _ => answer_status(s, sys, &id, x::status::BAD_REQUEST),
+        _ => answer_status(s, sys, &id, http::status::BAD_REQUEST),
     }
 }
 
@@ -976,7 +976,7 @@ fn u64_dec(mut v: u64, out: &mut [u8; 20]) -> usize {
 /// As `drain_keys`.
 unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_ID_CHARS]) -> bool {
     let mut raw = [0u8; CODE_ID_BYTES];
-    if (sys.provider_call)(-1, CSPRNG_OP, raw.as_mut_ptr(), raw.len()) < 0 {
+    if dev_csprng_fill(sys, raw.as_mut_ptr(), raw.len()) < 0 {
         return false;
     }
     let mut enc = [0u8; 24];

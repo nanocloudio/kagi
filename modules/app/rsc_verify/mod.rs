@@ -48,6 +48,7 @@ mod time_policy;
 mod typed_exchange;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use rsc_verify as rv;
 
 const STEP_DID_WORK: i32 = 2;
@@ -55,7 +56,7 @@ const STEP_DID_WORK: i32 = 2;
 const MAX_REQS_PER_STEP: usize = 1;
 const MAX_EXCHANGES: usize = 2;
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: a certificate, a CRL or a checklist.
 const MAX_REQUEST: usize = x::PAYLOAD_MAX;
 
@@ -90,7 +91,7 @@ struct ModuleState {
 
     job: RsaVerifyJob,
     cache: rv::Cache,
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     outbox: ExchangeOutbox,
     body: [u8; MAX_REQUEST],
     buf: [u8; x::RECORD_MAX],
@@ -174,7 +175,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = s.requests.take_refusal() {
-                answer_status(s, sys, &id, why.status());
+                answer_status(s, sys, &id, http::canonical_status(why.outcome()));
             }
             if let Ok(Some(at)) = outcome {
                 handle(s, sys, at);
@@ -198,7 +199,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     let body_len = request.body.len();
     s.body[..body_len].copy_from_slice(request.body);
     s.requests.release(at);
@@ -208,7 +209,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     }
     let mut reply = [0u8; rv::REPLY_MAX];
     let Some(n) = decide(s, sys, body_len, &mut reply) else {
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
     let Ok(len) = auth_wire::write_envelope(
@@ -216,7 +217,7 @@ unsafe fn handle(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         &reply[..n],
         &mut s.out[typed_exchange::ANSWER_AT..],
     ) else {
-        answer_status(s, sys, &id, x::status::FAILED);
+        answer_status(s, sys, &id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     if let Some(total) = typed_exchange::seal_answer(&id, len, &mut s.out) {

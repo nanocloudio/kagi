@@ -11,6 +11,8 @@ name = "request_in"
 direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = 16384
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_out"
@@ -63,6 +65,8 @@ direction = "output"
 content_type = "ExchangeRequest"
 buffer_size = 16384
 max_record = 8192
+[ports.facts]
+binding = ["http"]
 
 # Operator requests for enrolment AUTHORISATIONS, from the control plane.
 #

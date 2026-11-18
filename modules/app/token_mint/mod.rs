@@ -59,6 +59,7 @@ mod typed_exchange;
 use abi::contracts::key_vault;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use auth_wire::{MintClaimValue, MintRequest, PayloadWriter};
 
 // This deployment's posture, for the key-custody floor — a DECLARED graph
@@ -174,7 +175,7 @@ const MAX_EXCHANGES: usize = 4;
 /// Longest target and header block held. Neither is read; they are bounded
 /// so the module can sit behind an HTTP route as well as a pipeline.
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest `MSG_MINT_REQ` payload, and so the longest request body: the
 /// payload plus its envelope.
 const MAX_REQUEST_PAYLOAD: usize = 4096;
@@ -192,18 +193,16 @@ struct ModuleState {
     /// The keyset, indexed by `(issuer, profile_id, kid)`.
     keys: [KeySlot; MAX_KEYS],
 
-    /// True iff a key_vault backend answered `PROBE` at init — signing then
-    /// goes through the vault (key never held long-term in this module).
-    /// The backend's isolation tier from `key_vault::TIER`, or
-    /// `TIER_NONE`. What `C5` is actually checked against: `PROBE` says a
-    /// backend exists, this says what it protects against.
+    /// The vault's isolation tier from `key_vault::TIER`: what `C5` is
+    /// checked against. Signing goes through the vault; the key is never
+    /// held in this module.
     vault_tier: u8,
     /// The declared custody posture (`POSTURE_*`), from the `posture`
     /// param. `POSTURE_UNDECLARED` never survives `module_new`.
     posture: u8,
-    /// Scratch for the key_vault SIGN arg: header, message, and room for
+    /// Scratch the key_vault signs in place in: the message, and room for
     /// the widest signature an implemented suite produces.
-    kv_arg: [u8; 4 + TOKEN_BUF_LEN + auth_wire::suite::MAX_IMPLEMENTED_SIGNATURE_LEN],
+    kv_arg: [u8; TOKEN_BUF_LEN + issuer_key::SIGN_SCRATCH_OVERHEAD],
 
     // Metrics (names mirror manifest [observability])
     mint_ok: u32,
@@ -215,7 +214,7 @@ struct ModuleState {
     msg_buf: [u8; MAX_REQUEST_PAYLOAD],
 
     /// Requests being collected until their body is whole.
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     /// The one answer, credit or refusal owed to `response_out`. Nothing new
     /// is read while it is held.
     outbox: ExchangeOutbox,
@@ -279,42 +278,16 @@ pub extern "C" fn module_new(
         s.no_key_errors = 0;
         s.sign_ops = 0;
 
-        // Probe the key_vault, and read its TIER — not just whether one
-        // answered.
-        //
-        // `PROBE` says a backend exists. It says nothing about what that
-        // backend isolates against — the in-process software one answers it
-        // as readily as an HSM. `C5` is a statement about isolation, so it
-        // is checked against `TIER`, the ordinal that carries isolation,
-        // and not against presence.
-        let probe = (sys.provider_call)(-1, key_vault::PROBE, core::ptr::null_mut(), 0);
-        // No backend, no mint. The vault is the only signing path, so
-        // there is nothing on the other side of this branch: a module that
-        // constructed without one would start cleanly and refuse every
-        // request, which reads as a runtime fault rather than as the
-        // misconfiguration it is.
-        if probe != 1 {
-            dev_log(
-                sys,
-                1,
-                b"[mint] refusing to construct: no key_vault backend".as_ptr(),
-                50,
-            );
+        // The vault's TIER: `C5` is a statement about isolation, so it is
+        // checked against the ordinal that carries isolation. The vault
+        // itself is claimed in the manifest, so a graph without one never
+        // composes; the vault is the only signing path.
+        let Some(tier) = issuer_key::vault_tier(sys) else {
+            let line = b"[mint] refusing to construct: the key vault did not answer its tier";
+            dev_log(sys, 1, line.as_ptr(), line.len());
             return -1;
-        }
-        s.vault_tier = {
-            let mut tier_buf = [0u8; 4];
-            let rc =
-                (sys.provider_call)(-1, key_vault::TIER, tier_buf.as_mut_ptr(), tier_buf.len());
-            if rc >= 0 {
-                tier_buf[0]
-            } else {
-                // A backend that will not say what it is gets no credit for
-                // being one. Reading a refusal as `SOFTWARE` would be
-                // inventing the answer.
-                key_custody::TIER_NONE
-            }
         };
+        s.vault_tier = tier;
 
         // The posture must be DECLARED. An undeclared posture is not
         // development; it is a graph that has not said what it is, and the
@@ -344,7 +317,7 @@ pub extern "C" fn module_new(
         // believes its issuer key is protected, and nothing downstream can
         // tell — the credentials verify either way.
         if !key_custody::permits(key_custody::KeyRole::Issuer, posture, s.vault_tier) {
-            let why = key_custody::refusal_text(s.vault_tier);
+            let why = key_custody::REFUSAL_TEXT;
             dev_log(sys, 1, b"[mint] refusing to construct:".as_ptr(), 29);
             dev_log(sys, 1, why.as_ptr(), why.len());
             return -1;
@@ -401,7 +374,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = s.requests.take_refusal() {
-                answer_status(s, sys, &id, why.status());
+                answer_status(s, sys, &id, http::canonical_status(why.outcome()));
             }
             if let Ok(Some(at)) = outcome {
                 take_request(s, sys, at);
@@ -425,7 +398,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let mut status = typed_exchange::admissible(request.method, request.resp_credit);
+    let mut status = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     let mut plen = 0usize;
     if status.is_none() {
         match typed_exchange::message(request.body) {
@@ -433,7 +406,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
                 s.msg_buf[..payload.len()].copy_from_slice(payload);
                 plen = payload.len();
             }
-            _ => status = Some(x::status::BAD_REQUEST),
+            _ => status = Some(http::status::BAD_REQUEST),
         }
     }
     s.requests.release(at);
@@ -1020,7 +993,7 @@ unsafe fn emit(
     };
     // A credential that does not fit one answer is not delivered in part.
     let Ok(n) = written else {
-        answer_status(s, sys, id, x::status::FAILED);
+        answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
         return;
     };
     let head = typed_exchange::ANSWER_AT;

@@ -90,7 +90,7 @@ impl Table {
 
     /// Admit a request on HTTP exchange `id` whose body is `payload`, to be
     /// carried to the service on exchange `call`. `method` is the exchange
-    /// contract's method byte.
+    /// request's verb, an HTTP method (`exchange_http::method`).
     #[expect(clippy::too_many_arguments, reason = "one admission, field by field")]
     pub fn admit(
         &mut self,
@@ -102,7 +102,7 @@ impl Table {
         call: &ExchangeId,
         now_ms: u64,
     ) -> Result<(), Refuse> {
-        if method != crate::abi::contracts::exchange::METHOD_POST || path != PATH {
+        if method != crate::abi::contracts::exchange_http::method::POST || path != PATH {
             return Err(Refuse::NotFound);
         }
         if payload.len() < 1 + 1 + 16 {

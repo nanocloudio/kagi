@@ -70,6 +70,7 @@ use auth_wire::assurance;
 mod http_endpoint;
 
 use abi::contracts::exchange::{self as x, ExchangeId};
+use abi::contracts::exchange_http as http;
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -458,7 +459,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
             if let Some((rid, why)) = s.exch.take_refusal() {
-                respond(s, sys, &rid, 0, why.status(), &[]);
+                respond(s, sys, &rid, 0, http::canonical_status(why.outcome()), &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -574,12 +575,12 @@ unsafe fn admit(
     let Some(req) = s.exch.request(at) else {
         return Err(Refusal::Token);
     };
-    let method = req.method;
+    let method = req.verb;
     // Copied out of the collector before anything else borrows the module:
     // the header block is read twice below, once per credential.
-    let mut header_buf = [0u8; http_endpoint::MAX_HEADERS];
-    let hdr_len = req.headers.len().min(header_buf.len());
-    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut meta_buf = [0u8; http_endpoint::MAX_META];
+    let meta_len = req.meta.len().min(meta_buf.len());
+    meta_buf[..meta_len].copy_from_slice(&req.meta[..meta_len]);
     let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len();
     if path_len > target_buf.len() {
@@ -589,7 +590,7 @@ unsafe fn admit(
     target_buf[..path_len].copy_from_slice(req.target);
     let mut token = [0u8; MAX_SEGMENT];
     let mut proof = [0u8; MAX_SEGMENT];
-    let headers = &header_buf[..hdr_len];
+    let headers = &meta_buf[..meta_len];
     let token_len = header_value(headers, b"authorization")
         .and_then(strip_dpop_scheme)
         .and_then(|value| copy_into(value, &mut token))
@@ -761,30 +762,18 @@ fn sha256_into(data: &[u8], out: &mut [u8; 32]) {
 
 /// The method word a request's method byte names.
 ///
-/// The exchange contract's own table, not a numbering of ours: this is one
-/// half of a comparison against the proof's `htm`, and a table that drifted
-/// from the encoder would refuse every honest request with the method it got
-/// wrong. `METHOD_NONE` and anything unknown have no word to bind against,
-/// so the comparison fails and the request is refused.
+/// The HTTP binding's own table, not a numbering of ours: this is one half
+/// of a comparison against the proof's `htm`, and a table that drifted from
+/// the encoder would refuse every honest request with the method it got
+/// wrong. A request with no verb, and anything unknown, has no word to bind
+/// against, so the comparison fails and the request is refused.
 fn method_name(method: u8) -> &'static [u8] {
-    x::method_name(method)
+    http::method_name(method)
 }
 
-/// The value of `name` in a CRLF header block, ASCII-case-insensitively.
-fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut rest = headers;
-    while !rest.is_empty() {
-        let line_end = find(rest, b"\r\n").unwrap_or(rest.len());
-        let line = &rest[..line_end];
-        if let Some(colon) = line.iter().position(|&b| b == b':') {
-            let (field, value) = line.split_at(colon);
-            if field.eq_ignore_ascii_case(name) {
-                return Some(trim(&value[1..]));
-            }
-        }
-        rest = rest.get(line_end + 2..)?;
-    }
-    None
+/// A header field's value by its lowercase name, from the request meta.
+fn header_value<'a>(meta: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    x::meta_get(meta, name)
 }
 
 /// `DPoP <token>` → `<token>`. A `Bearer` token is not a DPoP-bound one and

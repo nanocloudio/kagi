@@ -101,6 +101,7 @@ mod typed_exchange;
 mod verify_keyset;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 use typed_exchange::Answer;
 
 /// `module_step` return code for "did work, step me again".
@@ -121,7 +122,7 @@ const MAX_EXCHANGES: usize = 4;
 /// Longest target and header block held. Neither is read; they are bounded
 /// so the module can sit behind an HTTP route as well as a pipeline.
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: one `MSG_ADMIT_REQ` or `MSG_GRANT_REQ` envelope,
 /// which carries two compact JWSs.
 const MAX_REQUEST: usize = 4096 + auth_wire::ENVELOPE;
@@ -298,7 +299,7 @@ struct ModuleState {
     grant_mint_failed: u32,
 
     /// Requests being collected until their body is whole.
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     /// The one answer, credit or refusal owed to `response_out`.
     outbox: ExchangeOutbox,
     /// The one mint call owed to `mint_out`.
@@ -550,7 +551,7 @@ unsafe fn answer(
     encode: impl FnOnce(&mut [u8]) -> Result<usize, auth_wire::WireError>,
 ) -> bool {
     let Ok(len) = encode(&mut s.out[typed_exchange::ANSWER_AT..]) else {
-        answer_status(s, sys, id, x::status::FAILED);
+        answer_status(s, sys, id, http::status::INTERNAL_SERVER_ERROR);
         return false;
     };
     if let Some(n) = typed_exchange::seal_answer(id, len, &mut s.out) {
@@ -685,7 +686,7 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable) -> bool {
             }
         }
         if let Some((id, why)) = s.requests.take_refusal() {
-            answer_status(s, sys, &id, why.status());
+            answer_status(s, sys, &id, http::canonical_status(why.outcome()));
         }
         if let Ok(Some(at)) = outcome {
             take_request(s, sys, at);
@@ -704,7 +705,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     };
     let id = request.id;
-    let refused = typed_exchange::admissible(request.method, request.resp_credit);
+    let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
     // Copied out of the collector so its slot is free, and the module
     // borrowable, before anything is answered.
     let body_len = request.body.len();
@@ -716,7 +717,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
         return;
     }
     let Some((msg_type, payload)) = typed_exchange::message(&body[..body_len]) else {
-        answer_status(s, sys, &id, x::status::BAD_REQUEST);
+        answer_status(s, sys, &id, http::status::BAD_REQUEST);
         return;
     };
     // A GrantRequest is admit-and-mint; an AdmitRequest is admit only. A
@@ -755,7 +756,7 @@ unsafe fn take_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
             ),
             Err(_) => reply(s, sys, &id, auth_wire::admit_err::MALFORMED, false),
         },
-        _ => answer_status(s, sys, &id, x::status::BAD_REQUEST),
+        _ => answer_status(s, sys, &id, http::status::BAD_REQUEST),
     }
 }
 

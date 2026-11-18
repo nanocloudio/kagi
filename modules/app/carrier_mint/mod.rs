@@ -304,12 +304,6 @@ pub extern "C" fn module_new(
         if !(1000..=300_000).contains(&s.period_ms) {
             return refuse(sys, b"[carrier-mint] period_ms must be 1000..=300000");
         }
-        if (sys.provider_call)(-1, key_vault::PROBE, core::ptr::null_mut(), 0) != 1 {
-            return refuse(
-                sys,
-                b"[carrier-mint] refusing to construct: the identity needs a key vault, and this target has none",
-            );
-        }
         if s.in_cert < 0 || s.out_req < 0 || s.out_carrier < 0 {
             return refuse(
                 sys,

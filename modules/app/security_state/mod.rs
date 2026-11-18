@@ -95,7 +95,6 @@ const OBJECT_RANGE_GET: u32 = abi::registry::storage_object::RANGE_GET;
 const OBJECT_DELETE: u32 = abi::registry::storage_object::DELETE;
 const OBJECT_CLOSE: u32 = abi::registry::storage_object::CLOSE;
 
-/// `fence::WIRE_MAX_LEN` — the `ReplicatedDurable` variant is the widest.
 /// Whether this deployment has declared itself a replicated authority.
 ///
 /// A single-node authority genuinely may take `LocalDurable`: it has no other
@@ -115,7 +114,9 @@ const AUTHORITY_UNDECLARED: u8 = 0;
 const AUTHORITY_SINGLE_NODE: u8 = 1;
 const AUTHORITY_REPLICATED: u8 = 2;
 
-const FENCE_CAP: usize = 62;
+/// An encoded fence, as a write's or a `HEAD`'s trailer carries it: the
+/// `ReplicatedDurable` variant is the widest.
+const FENCE_CAP: usize = abi::fence::WIRE_MAX_LEN;
 
 /// The record body's MIME tag. Opaque to the provider; named so an operator
 /// reading the store can tell what wrote a blob.
@@ -197,6 +198,8 @@ struct WritePending {
     live: bool,
     opcode: u32,
     arg_len: usize,
+    /// The body a `PUT` sends from `value_buf`; 0 for a `DELETE`.
+    data_len: usize,
     /// Carried because the answer needs them: the namespace decides which
     /// fence the commit had to achieve, and the key is re-read for the etag.
     namespace: u8,
@@ -214,6 +217,7 @@ impl WritePending {
             live: false,
             opcode: 0,
             arg_len: 0,
+            data_len: 0,
             namespace: 0,
             key_len: 0,
             corr: 0,
@@ -304,7 +308,17 @@ impl KvPending {
 }
 const MSG_BUF_LEN: usize = 4096;
 const ARG_BUF_LEN: usize = 512;
-const HEAD_BUF_LEN: usize = 256;
+/// A `HEAD` request and its answer share one `arg`: the record room, which
+/// also holds the request's key, then the fence trailer.
+const HEAD_RECORD_LEN: usize = {
+    let key = abi::contracts::storage::object::key::arg_len(MAX_COMPOSED_KEY);
+    if key > 256 {
+        key
+    } else {
+        256
+    }
+};
+const HEAD_BUF_LEN: usize = HEAD_RECORD_LEN + abi::fence::trailer::LEN;
 
 #[repr(C)]
 struct ModuleState {
@@ -880,41 +894,73 @@ impl object_read::ObjectReads for Port<'_> {
     }
 
     fn open(&mut self) -> i32 {
-        let mut key_arg = [0u8; MAX_COMPOSED_KEY];
-        for (d, b) in key_arg
-            .iter_mut()
-            .zip(self.s.key_buf.iter().take(self.key_len))
-        {
-            *d = *b;
-        }
-        let len = self.key_len.min(key_arg.len());
+        let mut key_arg = [0u8; abi::contracts::storage::object::key::arg_len(MAX_COMPOSED_KEY)];
+        let Some(key) = self.s.key_buf.get(..self.key_len) else {
+            return abi::kernel_abi::errno::EINVAL;
+        };
+        let Some(len) = abi::contracts::storage::object::key::encode(&mut key_arg, key) else {
+            return abi::kernel_abi::errno::EINVAL;
+        };
         // SAFETY: as `head`; `key_arg` holds `len` initialised bytes.
-        unsafe { (self.sys.provider_call)(-1, OBJECT_GET, key_arg.as_mut_ptr(), len) }
+        unsafe {
+            (self.sys.provider_call)(
+                -1,
+                OBJECT_GET,
+                key_arg.as_mut_ptr(),
+                len,
+                core::ptr::null_mut(),
+                0,
+            )
+        }
     }
 
     fn range(&mut self, handle: i32, len: usize) -> i32 {
-        let Ok(len) = u32::try_from(len.min(self.s.value_buf.len())) else {
-            return abi::kernel_abi::errno::EINVAL;
-        };
-        let out_ptr = self.s.value_buf.as_mut_ptr();
-        let mut arg = [0u8; 20];
-        let fields = 0u64
-            .to_le_bytes()
-            .into_iter()
-            .chain(len.to_le_bytes())
-            .chain((out_ptr as u64).to_le_bytes());
-        for (d, b) in arg.iter_mut().zip(fields) {
-            *d = b;
+        let len = len.min(self.s.value_buf.len());
+        let mut arg = abi::contracts::storage::object::range_get::encode(0);
+        // SAFETY: as `head`; `value_buf` holds `len` writable bytes, which
+        // stay put until the read settles.
+        unsafe {
+            (self.sys.provider_call)(
+                handle,
+                OBJECT_RANGE_GET,
+                arg.as_mut_ptr(),
+                arg.len(),
+                self.s.value_buf.as_mut_ptr(),
+                len,
+            )
         }
-        // SAFETY: as `head`; `out_ptr` addresses `len` writable bytes of
-        // `value_buf`, which stays put until the read settles.
-        unsafe { (self.sys.provider_call)(handle, OBJECT_RANGE_GET, arg.as_mut_ptr(), 20) }
     }
 
     fn close(&mut self, handle: i32) {
-        let mut nothing = [0u8; 1];
         // SAFETY: as `head`.
-        let _ = unsafe { (self.sys.provider_call)(handle, OBJECT_CLOSE, nothing.as_mut_ptr(), 0) };
+        let _ = unsafe {
+            (self.sys.provider_call)(
+                handle,
+                OBJECT_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+    }
+}
+
+/// Take the fence a provider wrote into the trailer of `arg` into `fence`,
+/// or the zero (`Volatile`) fence when the trailer carries none: a provider
+/// that writes no fence must not leave a stronger one standing in.
+fn take_fence(fence: &mut [u8; FENCE_CAP], arg: &[u8]) {
+    *fence = [0u8; FENCE_CAP];
+    let Some(t) = arg
+        .len()
+        .checked_sub(abi::fence::trailer::LEN)
+        .and_then(|at| arg.get(at..))
+    else {
+        return;
+    };
+    let n = usize::from(u16::from_le_bytes([t[0], t[1]]));
+    if let (Some(src), Some(dst)) = (t.get(2..2 + n), fence.get_mut(..n)) {
+        dst.copy_from_slice(src);
     }
 }
 
@@ -960,22 +1006,15 @@ unsafe fn do_write(
         return;
     }
 
-    let body_ptr = s.value_buf.as_ptr();
-    // Cleared for the same reason `head_object` clears it: a provider that
-    // writes no fence must not leave a previous call's stronger one standing
-    // in for this commit. Zero is `Volatile`, which no namespace accepts.
-    s.fence_buf = [0u8; FENCE_CAP];
-    let fence_ptr = s.fence_buf.as_mut_ptr();
-    let key_ptr = s.key_buf.as_ptr();
-    let Some(arg_len) = encode_put_arg(
+    let Some(arg_len) = abi::contracts::storage::object::put::encode(
         &mut s.arg_buf,
-        key_ptr,
-        key_len,
-        body_ptr,
-        value_len,
-        precondition,
-        &guard[..guard_len],
-        fence_ptr,
+        &abi::contracts::storage::object::put::Request {
+            key: s.key_buf.get(..key_len).unwrap_or(&[]),
+            content_type: CONTENT_TYPE,
+            precondition,
+            etag: &guard[..guard_len],
+            kept: abi::contracts::storage::object::Kept::none(),
+        },
     ) else {
         reply(s, sys, corr, client, auth_wire::ST_FULL, &[], false);
         return;
@@ -988,6 +1027,7 @@ unsafe fn do_write(
             live: true,
             opcode: OBJECT_PUT,
             arg_len,
+            data_len: value_len,
             namespace,
             key_len,
             corr,
@@ -1005,13 +1045,31 @@ unsafe fn do_write(
 /// # Safety
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`,
-/// and `s.arg_buf[..p.arg_len]` holds the encoded request.
+/// `s.arg_buf[..p.arg_len]` holds the encoded request and
+/// `s.value_buf[..p.data_len]` its body.
 unsafe fn issue_write(s: &mut ModuleState, sys: &SyscallTable, p: WritePending) {
-    // Cleared before every attempt, retry included: a provider that writes
-    // no fence must not leave the previous attempt's standing in for this
-    // one. Zero is `Volatile`, which no namespace accepts.
-    s.fence_buf = [0u8; FENCE_CAP];
-    let rc = (sys.provider_call)(-1, p.opcode, s.arg_buf.as_mut_ptr(), p.arg_len);
+    // The trailer is cleared before every attempt, retry included, and the
+    // fence taken from it after: a provider that writes no fence must not
+    // leave the previous attempt's standing in for this one. Zero is
+    // `Volatile`, which no namespace accepts.
+    let Some(arg) = s.arg_buf.get_mut(..p.arg_len) else {
+        return;
+    };
+    let _ = abi::fence::trailer::clear(arg);
+    let data_len = p.data_len.min(s.value_buf.len());
+    let rc = (sys.provider_call)(
+        -1,
+        p.opcode,
+        s.arg_buf.as_mut_ptr(),
+        p.arg_len,
+        if data_len == 0 {
+            core::ptr::null_mut()
+        } else {
+            s.value_buf.as_mut_ptr()
+        },
+        data_len,
+    );
+    take_fence(&mut s.fence_buf, &s.arg_buf[..p.arg_len]);
     match abi::contracts::storage::object::write_answer(rc) {
         abi::contracts::storage::object::WriteAnswer::Pending => {
             // No reply: the caller is owed exactly one, and this write has
@@ -1104,15 +1162,16 @@ unsafe fn do_delete(
     let mut guard = [0u8; state_wire::MAX_ETAG];
     guard[..etag_len].copy_from_slice(&s.etag_buf[..etag_len]);
 
-    s.fence_buf = [0u8; FENCE_CAP];
-    let fence_ptr = s.fence_buf.as_mut_ptr();
-    let key_ptr = s.key_buf.as_ptr();
-    let Some(arg_len) = encode_delete_arg(
+    let Some(arg_len) = abi::contracts::storage::object::delete::encode_request(
         &mut s.arg_buf,
-        key_ptr,
-        key_len,
-        &guard[..etag_len],
-        fence_ptr,
+        &abi::contracts::storage::object::delete::Request {
+            key: s.key_buf.get(..key_len).unwrap_or(&[]),
+            // A delete this module issues is always guarded: removing a
+            // security record unconditionally is not something a caller
+            // here may ask for.
+            precondition: PRECONDITION_ETAG,
+            etag: &guard[..etag_len],
+        },
     ) else {
         reply(s, sys, corr, client, auth_wire::ST_FULL, &[], false);
         return;
@@ -1124,6 +1183,7 @@ unsafe fn do_delete(
             live: true,
             opcode: OBJECT_DELETE,
             arg_len,
+            data_len: 0,
             namespace: 0,
             key_len,
             corr,
@@ -1141,19 +1201,25 @@ unsafe fn do_delete(
 ///
 /// Caller holds an exclusive `&mut ModuleState` and a live `SyscallTable`.
 unsafe fn head_object(s: &mut ModuleState, sys: &SyscallTable, key_len: usize) -> i32 {
-    // Cleared first: a provider that writes no fence leaves whatever the last
-    // call left, and a stale strong fence would pass a floor this answer never
-    // met. Zero is `Volatile`, the weakest, so silence fails closed.
-    s.fence_buf = [0u8; FENCE_CAP];
-    let out_ptr = s.head_buf.as_mut_ptr();
-    let fence_ptr = s.fence_buf.as_mut_ptr();
+    // The trailer starts empty and the fence is taken from it after: a
+    // provider that writes no fence leaves the zero fence, `Volatile`, the
+    // weakest, so silence fails closed.
     let Some(key) = s.key_buf.get(..key_len) else {
         return abi::kernel_abi::errno::EINVAL;
     };
-    let Some(arg_len) = encode_head_arg(&mut s.arg_buf, key, out_ptr, fence_ptr) else {
+    if abi::contracts::storage::object::head::encode_request(&mut s.head_buf, key).is_none() {
         return abi::kernel_abi::errno::EINVAL;
-    };
-    (sys.provider_call)(-1, OBJECT_HEAD, s.arg_buf.as_mut_ptr(), arg_len)
+    }
+    let rc = (sys.provider_call)(
+        -1,
+        OBJECT_HEAD,
+        s.head_buf.as_mut_ptr(),
+        s.head_buf.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    take_fence(&mut s.fence_buf, &s.head_buf);
+    rc
 }
 
 /// Pull `size` and the etag out of a HEAD record, as the contract decodes it.
@@ -1161,130 +1227,6 @@ fn parse_head(record: &[u8], etag_out: &mut [u8]) -> Option<(u64, usize)> {
     let (head, _, etag, _) = abi::contracts::storage::object::range::decode_head(record)?;
     etag_out.get_mut(..etag.len())?.copy_from_slice(etag);
     Some((head.size, etag.len()))
-}
-
-/// Build the `storage.object::PUT` arg block.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one PUT arg block, spelled out; separating the guard from the record it guards is how a write loses its precondition"
-)]
-fn encode_put_arg(
-    arg: &mut [u8],
-    key_ptr: *const u8,
-    key_len: usize,
-    body_ptr: *const u8,
-    body_len: usize,
-    precondition: u8,
-    etag: &[u8],
-    fence_ptr: *mut u8,
-) -> Option<usize> {
-    let kept = abi::contracts::storage::object::Kept::none();
-    let total =
-        2 + key_len + 1 + CONTENT_TYPE.len() + 8 + 8 + 2 + etag.len() + kept.wire_len() + 8 + 2;
-    if total > arg.len() || key_len > usize::from(u16::MAX) || etag.len() > 255 {
-        return None;
-    }
-    let mut p = 0usize;
-    #[allow(clippy::cast_possible_truncation, reason = "checked against u16::MAX")]
-    arg[p..p + 2].copy_from_slice(&(key_len as u16).to_le_bytes());
-    p += 2;
-    // SAFETY: `key_ptr` addresses `key_len` initialised bytes in module state
-    // and does not overlap `arg`.
-    unsafe { core::ptr::copy_nonoverlapping(key_ptr, arg.as_mut_ptr().add(p), key_len) };
-    p += key_len;
-    #[allow(clippy::cast_possible_truncation, reason = "a fixed short constant")]
-    {
-        arg[p] = CONTENT_TYPE.len() as u8;
-    }
-    p += 1;
-    arg[p..p + CONTENT_TYPE.len()].copy_from_slice(CONTENT_TYPE);
-    p += CONTENT_TYPE.len();
-    arg[p..p + 8].copy_from_slice(&(body_ptr as u64).to_le_bytes());
-    p += 8;
-    arg[p..p + 8].copy_from_slice(&(body_len as u64).to_le_bytes());
-    p += 8;
-    arg[p] = precondition;
-    #[allow(clippy::cast_possible_truncation, reason = "checked against 255")]
-    {
-        arg[p + 1] = etag.len() as u8;
-    }
-    p += 2;
-    arg[p..p + etag.len()].copy_from_slice(etag);
-    p += etag.len();
-    p += kept.encode(&mut arg[p..])?;
-    arg[p..p + 8].copy_from_slice(&(fence_ptr as u64).to_le_bytes());
-    p += 8;
-    #[allow(clippy::cast_possible_truncation, reason = "a fixed small constant")]
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    Some(p)
-}
-
-/// Build the `storage.object::DELETE` arg block.
-fn encode_delete_arg(
-    arg: &mut [u8],
-    key_ptr: *const u8,
-    key_len: usize,
-    etag: &[u8],
-    fence_ptr: *mut u8,
-) -> Option<usize> {
-    let total = 2 + key_len + 2 + etag.len() + 8 + 2;
-    if total > arg.len() || key_len > usize::from(u16::MAX) || etag.len() > 255 {
-        return None;
-    }
-    let mut p = 0usize;
-    #[allow(clippy::cast_possible_truncation, reason = "checked against u16::MAX")]
-    arg[p..p + 2].copy_from_slice(&(key_len as u16).to_le_bytes());
-    p += 2;
-    // SAFETY: as `encode_put_arg`.
-    unsafe { core::ptr::copy_nonoverlapping(key_ptr, arg.as_mut_ptr().add(p), key_len) };
-    p += key_len;
-    // A delete this module issues is always guarded: removing a security
-    // record unconditionally is not something a caller here may ask for.
-    arg[p] = PRECONDITION_ETAG;
-    #[allow(clippy::cast_possible_truncation, reason = "checked against 255")]
-    {
-        arg[p + 1] = etag.len() as u8;
-    }
-    p += 2;
-    arg[p..p + etag.len()].copy_from_slice(etag);
-    p += etag.len();
-    arg[p..p + 8].copy_from_slice(&(fence_ptr as u64).to_le_bytes());
-    p += 8;
-    #[allow(clippy::cast_possible_truncation, reason = "a fixed small constant")]
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    Some(p)
-}
-
-/// Build the `storage.object::HEAD` arg block.
-fn encode_head_arg(
-    arg: &mut [u8],
-    key: &[u8],
-    out_ptr: *mut u8,
-    fence_ptr: *mut u8,
-) -> Option<usize> {
-    let total = 2 + key.len() + 8 + 4 + 8 + 2;
-    if total > arg.len() || key.len() > usize::from(u16::MAX) {
-        return None;
-    }
-    let mut p = 0usize;
-    #[allow(clippy::cast_possible_truncation, reason = "checked against u16::MAX")]
-    arg[p..p + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    p += 2;
-    arg[p..p + key.len()].copy_from_slice(key);
-    p += key.len();
-    arg[p..p + 8].copy_from_slice(&(out_ptr as u64).to_le_bytes());
-    p += 8;
-    #[allow(clippy::cast_possible_truncation, reason = "a fixed small constant")]
-    arg[p..p + 4].copy_from_slice(&(HEAD_BUF_LEN as u32).to_le_bytes());
-    p += 4;
-    arg[p..p + 8].copy_from_slice(&(fence_ptr as u64).to_le_bytes());
-    p += 8;
-    #[allow(clippy::cast_possible_truncation, reason = "a fixed small constant")]
-    arg[p..p + 2].copy_from_slice(&(FENCE_CAP as u16).to_le_bytes());
-    p += 2;
-    Some(p)
 }
 
 /// Emit a status-only reply, as a `VALUE` for a read and an `ACK` otherwise.

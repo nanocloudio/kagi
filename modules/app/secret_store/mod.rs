@@ -835,7 +835,14 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> StepReturn {
     if s.load_fd < 0 {
         let mut path = [0u8; 32];
         path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), STORE_PATH.len());
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_mut_ptr(),
+            STORE_PATH.len(),
+            core::ptr::null_mut(),
+            0,
+        );
         if fs_pending(fd) {
             // Not now (mount not up, entry not cached) — ask again next step.
             return StepReturn::Continue;
@@ -855,6 +862,8 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> StepReturn {
         let r = (sys.provider_call)(
             s.load_fd,
             FS_READ,
+            core::ptr::null_mut(),
+            0,
             s.file_buf.as_mut_ptr().add(s.load_total),
             FILE_BUF_LEN - s.load_total,
         );
@@ -863,7 +872,14 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> StepReturn {
             return StepReturn::Continue;
         }
         if r < 0 || r as usize > FILE_BUF_LEN - s.load_total {
-            (sys.provider_call)(s.load_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                s.load_fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             s.load_fd = -1;
             s.no_fs = true;
             s.no_fs_logged = true;
@@ -881,7 +897,14 @@ unsafe fn step_load(s: &mut ModuleState, sys: &SyscallTable) -> StepReturn {
         }
         s.load_total += r as usize;
     }
-    (sys.provider_call)(s.load_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    (sys.provider_call)(
+        s.load_fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.load_fd = -1;
     let total = s.load_total;
 
@@ -975,7 +998,14 @@ unsafe fn build_image(s: &mut ModuleState) -> usize {
 /// rewrite (from a fresh image) after a real failure of this one.
 unsafe fn persist_end(s: &mut ModuleState, sys: &SyscallTable, retry: bool) {
     if s.persist_fd >= 0 {
-        (sys.provider_call)(s.persist_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.persist_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.persist_fd = -1;
     }
     s.persist_stage = PST_IDLE;
@@ -1016,8 +1046,14 @@ unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
             PST_OPEN => {
                 let mut path = [0u8; 32];
                 path[..STORE_PATH.len()].copy_from_slice(STORE_PATH);
-                let fd =
-                    (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), STORE_PATH.len());
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    STORE_PATH.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if fs_pending(fd) {
                     return;
                 }
@@ -1038,8 +1074,15 @@ unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
             }
             PST_SEEK => {
                 // OPEN_CREATE position is provider-defined; pin to 0 for a rewrite.
-                let seek = 0i32.to_le_bytes();
-                let rc = (sys.provider_call)(s.persist_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                let mut seek = abi::contracts::storage::fs::seek::encode(0);
+                let rc = (sys.provider_call)(
+                    s.persist_fd,
+                    FS_SEEK,
+                    seek.as_mut_ptr(),
+                    seek.len(),
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if fs_pending(rc) {
                     return;
                 }
@@ -1058,6 +1101,8 @@ unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
                 let w = (sys.provider_call)(
                     s.persist_fd,
                     FS_WRITE,
+                    core::ptr::null_mut(),
+                    0,
                     s.file_buf.as_mut_ptr().add(s.persist_off),
                     left,
                 );
@@ -1072,7 +1117,14 @@ unsafe fn step_persist(s: &mut ModuleState, sys: &SyscallTable) {
                 s.persist_off += w as usize;
             }
             _ => {
-                let rc = (sys.provider_call)(s.persist_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.persist_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if fs_pending(rc) {
                     return;
                 }

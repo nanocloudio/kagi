@@ -17,6 +17,8 @@ direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = 16384
 max_record = 8192
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "response_out"

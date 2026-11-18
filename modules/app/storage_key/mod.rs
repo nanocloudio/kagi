@@ -84,6 +84,7 @@ mod time_policy;
 mod typed_exchange;
 
 use abi::contracts::exchange::{self as x, Collector, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 
 use auth_wire::assurance::{AssuranceLevel, AuthMethod, Evidence};
 use storage_key as sk;
@@ -107,7 +108,7 @@ const MAX_EXCHANGES: usize = 4;
 /// Longest target and header block held. Neither is read; they are bounded
 /// so the module can sit behind an HTTP route as well as a requester.
 const MAX_TARGET: usize = 256;
-const MAX_HEADERS: usize = 1024;
+const MAX_META: usize = 1024;
 /// Longest request body: one `msg::REQUEST` envelope.
 const MAX_REQUEST: usize = auth_wire::ENVELOPE + 1 + svc::MAX_REQUEST;
 
@@ -140,7 +141,7 @@ struct ModuleState {
     service: svc::Service,
 
     /// Requests being collected until their body is whole.
-    requests: Collector<MAX_EXCHANGES, MAX_TARGET, MAX_HEADERS, MAX_REQUEST>,
+    requests: Collector<Http, MAX_EXCHANGES, MAX_TARGET, MAX_META, MAX_REQUEST>,
     /// The verified peer each collecting exchange arrived with.
     peers: exchange_peer::Peers<MAX_EXCHANGES>,
     /// Whether the switch to SVID-named actors has been logged.
@@ -279,9 +280,13 @@ impl svc::Host for ModuleHost<'_> {
         let id = ExchangeId(*caller);
         // An answer that does not fit one record is this module's failure,
         // answered as one rather than left unanswered.
-        let Some(n) = typed_exchange::write_answer(&id, frame, &mut self.out[..])
-            .or_else(|| typed_exchange::write_status(&id, x::status::FAILED, &mut self.out[..]))
-        else {
+        let Some(n) = typed_exchange::write_answer(&id, frame, &mut self.out[..]).or_else(|| {
+            typed_exchange::write_status(
+                &id,
+                http::status::INTERNAL_SERVER_ERROR,
+                &mut self.out[..],
+            )
+        }) else {
             return false;
         };
         // SAFETY: as above; `out` holds the record until it is placed.
@@ -559,7 +564,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 }
             }
             if let Some((id, why)) = requests.take_refusal() {
-                answer_status(&mut host, &id, why.status());
+                answer_status(&mut host, &id, http::canonical_status(why.outcome()));
             }
             let Ok(Some(at)) = outcome else {
                 continue;
@@ -568,7 +573,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 continue;
             };
             let id = request.id;
-            let refused = typed_exchange::admissible(request.method, request.resp_credit);
+            let refused = typed_exchange::admissible(request.op, request.verb, request.resp_credit);
             let body_len = request.body.len();
             buf[..body_len].copy_from_slice(request.body);
             requests.release(at);
@@ -590,7 +595,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         dev_log(sys, 3, line.as_ptr(), line.len());
                     }
                 }
-                _ => answer_status(&mut host, &id, x::status::BAD_REQUEST),
+                _ => answer_status(&mut host, &id, http::status::BAD_REQUEST),
             }
         }
         if !host.outbox.holding() {

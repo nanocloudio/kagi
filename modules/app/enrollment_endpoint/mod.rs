@@ -55,6 +55,7 @@ include!("../../common/sdk_bridge.rs");
 mod http_endpoint;
 
 use abi::contracts::exchange::{self as x, ExchangeId};
+use abi::contracts::exchange_http::{self as http, Http};
 
 #[path = "../../common/auth_wire.rs"]
 mod auth_wire;
@@ -107,7 +108,7 @@ mod smtp_wire;
 const STEP_DID_WORK: i32 = 2;
 
 /// The exchange contract's method byte for `POST`.
-const METHOD_POST: u8 = x::METHOD_POST;
+const METHOD_POST: u8 = http::method::POST;
 
 /// The `cty` a challenge token carries.
 ///
@@ -582,6 +583,8 @@ unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_DIGITS]) -> Result<(
         if (sys.provider_call)(
             -1,
             abi::registry::kernel::RANDOM_FILL,
+            core::ptr::null_mut(),
+            0,
             raw.as_mut_ptr(),
             raw.len(),
         ) < 0
@@ -606,8 +609,8 @@ unsafe fn draw_code(sys: &SyscallTable, out: &mut [u8; CODE_DIGITS]) -> Result<(
     Err(Refusal::NoEntropy)
 }
 
-/// The mail-from header line every submission carries, before the address.
-const MAIL_FROM_HEADER: &[u8] = b"mail-from: ";
+/// The meta key every submission names its envelope sender under.
+const MAIL_FROM: &[u8] = b"mail-from";
 /// Response credit granted with a submission: room for the relay's whole
 /// result, its text included.
 const MAIL_RESULT_CREDIT: u32 = 4096;
@@ -655,29 +658,28 @@ unsafe fn submit_mail(s: &mut ModuleState, sys: &SyscallTable, to: &[u8], code: 
     put_str(&mut body, &mut at, code);
     put_str(&mut body, &mut at, b"\r\n");
 
-    let mut headers = [0u8; MAIL_FROM_HEADER.len() + MAX_FIELD + 2];
-    let mut hdr_len = 0usize;
-    put_str(&mut headers, &mut hdr_len, MAIL_FROM_HEADER);
-    put_str(
-        &mut headers,
-        &mut hdr_len,
-        &s.mail_from[..usize::from(s.mail_from_len)],
-    );
-    put_str(&mut headers, &mut hdr_len, b"\r\n");
+    let mut meta = [0u8; x::meta_field_len(MAIL_FROM.len(), MAX_FIELD)];
+    let mut w = x::MetaWriter::new(&mut meta);
+    w.put(MAIL_FROM, &s.mail_from[..usize::from(s.mail_from_len)]);
+    let Some(meta_len) = w.finish() else {
+        s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
+        return;
+    };
 
     let id = typed_exchange::call_id(s.next_mail, s.out_mail);
     s.next_mail = s.next_mail.wrapping_add(1);
     let head = x::RequestHead {
         id,
         flags: 0,
-        method: x::METHOD_POST,
+        op: x::op::CALL,
+        verb: http::method::POST,
         target: to,
-        headers: &headers[..hdr_len],
+        meta: &meta[..meta_len],
         peer: &[],
         resp_credit: MAIL_RESULT_CREDIT,
         body: &body[..at],
     };
-    let Some(n) = x::write_request_head(&head, &mut s.mail_buf) else {
+    let Some(n) = x::write_request_head::<Http>(&head, &mut s.mail_buf) else {
         s.enrol_mail_failed = s.enrol_mail_failed.saturating_add(1);
         return;
     };
@@ -709,13 +711,13 @@ unsafe fn drain_mail(s: &mut ModuleState, sys: &SyscallTable) {
         if n <= 0 {
             break;
         }
-        let accepted = match x::parse_response(&buf[..n as usize]) {
-            Some(x::Record::Head(head)) => {
-                head.status == x::status::OK
+        let accepted = match x::parse_response::<Http>(&buf[..n as usize]) {
+            Ok(x::Record::Head(head)) => {
+                head.outcome == x::outcome::OK
                     && smtp_wire::parse_smtp_result(head.body)
                         .is_some_and(|r| r.outcome == smtp_wire::SMTP_OUT_ACCEPTED)
             }
-            Some(x::Record::Abort { .. }) => false,
+            Ok(x::Record::Abort { .. }) => false,
             // A LINK change, a credit grant or a continuation: nothing to
             // count.
             _ => continue,
@@ -1085,7 +1087,7 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             // endpoint that drops one answers with silence, which a client
             // cannot tell from a server that hung.
             if let Some((rid, why)) = s.exch.take_refusal() {
-                respond(s, sys, &rid, 0, why.status(), &[]);
+                respond(s, sys, &rid, 0, http::canonical_status(why.outcome()), &[]);
             }
             if let Ok(Some(at)) = outcome {
                 handle_request(s, sys, at);
@@ -1227,21 +1229,21 @@ unsafe fn handle_request(s: &mut ModuleState, sys: &SyscallTable, at: usize) {
     let Some(req) = s.exch.request(at) else {
         return;
     };
-    let (id, credit, method) = (req.id, req.resp_credit, req.method);
+    let (id, credit, method) = (req.id, req.resp_credit, req.verb);
     // Copied out of the collector so the handler can still take `&mut s`:
     // the request borrows the table, and answering borrows the module.
     let mut target_buf = [0u8; http_endpoint::MAX_TARGET];
     let path_len = req.target.len().min(target_buf.len());
     target_buf[..path_len].copy_from_slice(&req.target[..path_len]);
-    let mut header_buf = [0u8; http_endpoint::MAX_HEADERS];
-    let hdr_len = req.headers.len().min(header_buf.len());
-    header_buf[..hdr_len].copy_from_slice(&req.headers[..hdr_len]);
+    let mut meta_buf = [0u8; http_endpoint::MAX_META];
+    let meta_len = req.meta.len().min(meta_buf.len());
+    meta_buf[..meta_len].copy_from_slice(&req.meta[..meta_len]);
     let mut body_buf = [0u8; http_endpoint::MAX_BODY];
     let body_len = req.body.len().min(body_buf.len());
     body_buf[..body_len].copy_from_slice(&req.body[..body_len]);
     s.exch.release(at);
     let path = &target_buf[..path_len];
-    let headers = &header_buf[..hdr_len];
+    let headers = &meta_buf[..meta_len];
     let body = &body_buf[..body_len];
 
     let confirming = path.starts_with(b"/authenticators/totp/confirm");
@@ -1536,6 +1538,8 @@ unsafe fn start(s: &mut ModuleState, sys: &SyscallTable, body: &[u8]) -> Result<
         if (sys.provider_call)(
             -1,
             abi::registry::kernel::RANDOM_FILL,
+            core::ptr::null_mut(),
+            0,
             nonce_bytes.as_mut_ptr(),
             NONCE_BYTES,
         ) < 0
@@ -1968,6 +1972,8 @@ unsafe fn mint_authorisation(s: &mut ModuleState, sys: &SyscallTable, corr: u32,
     if (sys.provider_call)(
         -1,
         abi::registry::kernel::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
         nonce_bytes.as_mut_ptr(),
         nonce_bytes.len(),
     ) < 0
@@ -2145,29 +2151,9 @@ unsafe fn begin_lookup(
     }
 }
 
-/// One header's value, by lowercase name.
-fn header_value<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    let mut at = 0usize;
-    while at < headers.len() {
-        let end = headers[at..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(headers.len(), |p| at + p);
-        let line = &headers[at..end];
-        if let Some(colon) = line.iter().position(|b| *b == b':') {
-            let (key, value) = line.split_at(colon);
-            if key.len() == name.len()
-                && key
-                    .iter()
-                    .zip(name)
-                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
-            {
-                return Some(trim_ws(&value[1..]));
-            }
-        }
-        at = end + 1;
-    }
-    None
+/// A header field's value by its lowercase name, from the request meta.
+fn header_value<'a>(meta: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    x::meta_get(meta, name)
 }
 
 /// The credential out of a `DPoP <token>` authorization header.
@@ -2314,6 +2300,8 @@ unsafe fn begin_totp_register(
     if (sys.provider_call)(
         -1,
         abi::registry::kernel::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
         raw.as_mut_ptr(),
         raw.len(),
     ) < 0
