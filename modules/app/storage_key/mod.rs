@@ -1,4 +1,4 @@
-//! Storage-key service — grants, fresh attachment bundles, rotation and
+//! Storage-key service — grants, fresh attachment share sets, rotation and
 //! recovery for encrypted volumes, decided by this issuer and never holding
 //! a volume key.
 //!
@@ -9,7 +9,7 @@
 //! - **requesters** on `request_in` / `response_out`, where this module is
 //!   a PROVIDER of the workspace exchange contract: the control plane asking
 //!   to create, grant, revoke, rotate, retire, erase or authorise recovery,
-//!   and attaching nodes asking for a challenge and then for a bundle, or
+//!   and attaching nodes asking for a challenge and then for a share set, or
 //!   for a renewal of an attachment they hold. A request body is one
 //!   `msg::REQUEST` envelope and its answer body one `msg::REPLY` envelope
 //!   (`typed_exchange.rs`; byte layouts in

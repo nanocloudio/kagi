@@ -471,12 +471,13 @@ pub extern "C" fn module_new(
         // The grant key's custody floor, refused at construction like
         // token_mint's: a grant admits one tenant to another's service, so
         // its key is issuer-grade.
-        let Some(tier) = issuer_key::vault_tier(sys) else {
-            let line = b"[attachment] refusing to construct: the key vault did not answer its tier";
+        let Some(custody) = issuer_key::vault_custody(sys) else {
+            let line =
+                b"[attachment] refusing to construct: the key vault did not answer its custody";
             dev_log(sys, 1, line.as_ptr(), line.len());
             return -1;
         };
-        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, tier) {
+        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, custody) {
             let why = key_custody::REFUSAL_TEXT;
             let line = b"[attachment] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());

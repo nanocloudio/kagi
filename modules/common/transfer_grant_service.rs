@@ -153,7 +153,7 @@ impl Service {
             issuer_len: 0,
             policy: Policy {
                 allow_possession: false,
-                min_tier: 1,
+                min_vault_custody: 1,
             },
             next_corr: 1,
             ops: [Op::EMPTY; MAX_OPS],

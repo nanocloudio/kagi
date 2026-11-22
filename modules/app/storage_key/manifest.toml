@@ -12,7 +12,7 @@ grants = ["key_vault"]
 # exchange contract: each request body is one
 # `storage_key_service::msg::REQUEST` envelope and each answer body one
 # `msg::REPLY` envelope (the record decided, and on a release the FXSB
-# bundle); the exchange id is the correlation. Layouts:
+# share set); the exchange id is the correlation. Layouts:
 # docs/architecture/typed-operations.md. The control verbs are
 # unauthenticated here; the edge feeding this port is the control plane's
 # and belongs behind its admission.

@@ -60,26 +60,26 @@ pub const SIGN_SCRATCH_OVERHEAD: usize = auth_wire::suite::MAX_IMPLEMENTED_SIGNA
 /// bounds only a vault that never finishes.
 const SIGN_CALLS_MAX: usize = 1024;
 
-/// The isolation tier the vault reads out (`key_vault::TIER`), or `None`
+/// The custody the vault reads out (`key_vault::CUSTODY`), or `None`
 /// when it will not say. A vault that will not say what it is gets no
-/// credit for being one: reading a refusal as `TIER_SOFTWARE` would be
+/// credit for being one: reading a refusal as `CUSTODY_SOFTWARE` would be
 /// inventing the answer.
 ///
 /// # Safety
 ///
 /// `sys` must be a valid syscall table per the module ABI.
-pub unsafe fn vault_tier(sys: &SyscallTable) -> Option<u8> {
-    let mut tier = [0u8; key_vault::tier_arg::ARG_LEN];
+pub unsafe fn vault_custody(sys: &SyscallTable) -> Option<u8> {
+    let mut custody = [0u8; key_vault::custody_arg::ARG_LEN];
     let rc = (sys.provider_call)(
         -1,
-        key_vault::TIER,
-        tier.as_mut_ptr(),
-        tier.len(),
+        key_vault::CUSTODY,
+        custody.as_mut_ptr(),
+        custody.len(),
         core::ptr::null_mut(),
         0,
     );
     if rc == 1 {
-        Some(tier[0])
+        Some(custody[0])
     } else {
         None
     }

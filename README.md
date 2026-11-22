@@ -144,7 +144,7 @@ CA deployment.
   custody checks as `KTGR` grants (an enrolled standby's attested
   recipient, hardware custody, single use in the ledger), relays its
   token checks to Clustor's session directory, and answers `CUSTODY_READY`
-  — per standby, enrolled, the tier its evidence proved, grant-ready,
+  — per standby, enrolled, the vault custody its evidence proved, grant-ready,
   holding a live host certificate — before a transfer is planned.
 - **carrier_mint** — the holder's half of a cert-bound identity carrier:
   ES256 carriers signed with its own vault-born key, certified over the

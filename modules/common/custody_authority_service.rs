@@ -27,7 +27,7 @@
 //! And one question before a transfer is planned:
 //!
 //! - **Could these hosts take over now?** (`CUSTODY_READY`, [`ready`]): per
-//!   host, whether it is enrolled here, the custody tier its own attested
+//!   host, whether it is enrolled here, the vault custody its own attested
 //!   evidence last proved to this authority, whether a grant could be
 //!   issued to it now (grant key open, trusted clock, the ledger answering a
 //!   read made for this question, the posture admitting the grant key's
@@ -70,12 +70,12 @@ pub const MSG_KTGR_RECORD: u8 = 0x4B;
 const MAX_KEY: usize = 80;
 
 /// `CUSTODY_READY`: whether hosts could take over a Service's traffic now —
-/// enrolled, their proven custody tier, a grant issuable to them, a live
+/// enrolled, their proven vault custody, a grant issuable to them, a live
 /// identity certificate (`docs/architecture/typed-operations.md`).
 pub mod ready {
     /// `[service 16][n u8][host 16 × n]`.
     pub const REQUEST: u8 = 0xA0;
-    /// `[status u8][n u8]` then per host `[host 16][enrolled u8][tier u8]
+    /// `[status u8][n u8]` then per host `[host 16][enrolled u8][custody u8]
     /// [grant_ready u8][cert_ready u8][not_after u64]`.
     pub const REPLY: u8 = 0xA1;
     /// Hosts one question may name.
@@ -88,8 +88,8 @@ pub mod ready {
     pub const PROBES: usize = 2;
     /// How long the ledger has to answer before it is reported unreachable.
     pub const TIMEOUT_MS: u64 = 2_000;
-    /// A tier no attested evidence has proven.
-    pub const TIER_UNKNOWN: u8 = 0xFF;
+    /// A vault custody no attested evidence has proven.
+    pub const CUSTODY_UNKNOWN: u8 = 0xFF;
     pub mod status {
         pub const OK: u8 = 0;
         /// Not `17 + 16·n` bytes, or `n` outside `1..=MAX_HOSTS`.
@@ -109,15 +109,15 @@ pub struct HeldCert {
 /// What this authority has observed of one enrolled host.
 #[derive(Clone, Copy)]
 pub struct Observed {
-    /// The tier the host's own attested evidence proved in a custody check
-    /// that verified here; [`ready::TIER_UNKNOWN`] until one has.
-    pub tier: u8,
+    /// The vault custody the host's own attested evidence proved in a custody check
+    /// that verified here; [`ready::CUSTODY_UNKNOWN`] until one has.
+    pub vault_custody: u8,
     pub cert: Option<HeldCert>,
 }
 
 impl Observed {
     const NONE: Self = Self {
-        tier: ready::TIER_UNKNOWN,
+        vault_custody: ready::CUSTODY_UNKNOWN,
         cert: None,
     };
 }
@@ -231,7 +231,7 @@ pub struct Config {
     /// delivered, and while empty no certificate is taken.
     pub anchor: [u8; 2 + 65],
     pub anchor_len: usize,
-    /// Whether the deployment's posture admits the grant key's vault tier
+    /// Whether the deployment's posture admits the grant key's vault custody
     /// (`key_custody::permits(TransferGrant, …)`).
     pub posture_admits: bool,
 }
@@ -248,7 +248,7 @@ impl Config {
             host_count: 0,
             policy: Policy {
                 allow_possession: false,
-                min_tier: 1,
+                min_vault_custody: 1,
             },
             ttl_ms: tg::TRANSFER_GRANT_TTL_MS,
             issuer: [0; tg::MAX_ID],
@@ -402,12 +402,12 @@ impl Authority {
             cfg.ttl_ms,
             now,
         );
-        // The standby's evidence verified: the tier it proved is a fact
+        // The standby's evidence verified: the vault custody it proved is a fact
         // about that host whatever the ledger does next.
         if let Ok(g) = &decided {
             if let Some(i) = cfg.enrolled(&g.destination) {
                 if let Some(o) = self.observed.get_mut(i) {
-                    o.tier = g.proven_tier;
+                    o.vault_custody = g.proven_vault_custody;
                 }
             }
         }
@@ -649,7 +649,7 @@ impl Authority {
             });
             row[..16].copy_from_slice(id);
             row[16] = u8::from(enrolled);
-            row[17] = seen.tier;
+            row[17] = seen.vault_custody;
             row[18] = u8::from(grant_ready);
             row[19] = u8::from(cert_ready);
             row[20..28].copy_from_slice(&seen.cert.map_or(0, |c| c.not_after).to_le_bytes());

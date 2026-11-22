@@ -32,7 +32,7 @@
 //! | 5 | 1 | use: what the moved secret may do (`KEY_VAULT` usage class) |
 //! | 6 | 1 | direction ([`direction`]) |
 //! | 7 | 1 | custody established (`storage_key::custody`) |
-//! | 8 | 1 | proven vault tier, `0xFF` when none was |
+//! | 8 | 1 | proven vault custody, `0xFF` when none was |
 //! | 9 | 1 | reserved, zero |
 //! | 10 | 2 | algorithm: the TLS cipher suite the secrets belong to |
 //! | 12 | 4 | traffic epoch |
@@ -106,7 +106,7 @@ pub const OFF_VERSION: usize = 4;
 pub const OFF_USE: usize = 5;
 pub const OFF_DIRECTION: usize = 6;
 pub const OFF_CUSTODY: usize = 7;
-pub const OFF_PROVEN_TIER: usize = 8;
+pub const OFF_PROVEN_VAULT_CUSTODY: usize = 8;
 pub const OFF_ALGORITHM: usize = 10;
 pub const OFF_TRAFFIC_EPOCH: usize = 12;
 pub const OFF_TARGET_EPOCH: usize = 16;
@@ -145,7 +145,7 @@ pub enum Refusal {
     /// The policy demands hardware custody and no evidence was offered.
     AttestationRequired = 5,
     /// The evidence verifies and does not meet the policy: a software key,
-    /// a tier too low, a persisted or wrongly-used key.
+    /// a vault custody too low, a persisted or wrongly-used key.
     AttestationInsufficient = 6,
     /// The evidence does not verify, or is not over this transfer.
     AttestationInvalid = 7,
@@ -229,7 +229,7 @@ pub struct Grant {
     pub key_use: u8,
     pub direction: u8,
     pub custody: u8,
-    pub proven_tier: u8,
+    pub proven_vault_custody: u8,
     pub algorithm: u16,
     pub traffic_epoch: u32,
     pub target_epoch: u64,
@@ -254,7 +254,7 @@ impl Grant {
             key_use: 0,
             direction: 0,
             custody: sk::custody::POSSESSION_BOUND,
-            proven_tier: sk::NOT_ATTESTED,
+            proven_vault_custody: sk::NOT_ATTESTED,
             algorithm: 0,
             traffic_epoch: 0,
             target_epoch: 0,
@@ -279,7 +279,7 @@ impl Grant {
         w.u8(self.key_use)?;
         w.u8(self.direction)?;
         w.u8(self.custody)?;
-        w.u8(self.proven_tier)?;
+        w.u8(self.proven_vault_custody)?;
         w.u8(0)?;
         w.u16(self.algorithm)?;
         w.u32(self.traffic_epoch)?;
@@ -306,7 +306,7 @@ impl Grant {
             key_use: *b.get(OFF_USE)?,
             direction: *b.get(OFF_DIRECTION)?,
             custody: *b.get(OFF_CUSTODY)?,
-            proven_tier: *b.get(OFF_PROVEN_TIER)?,
+            proven_vault_custody: *b.get(OFF_PROVEN_VAULT_CUSTODY)?,
             algorithm: rd_u16(b, OFF_ALGORITHM)?,
             traffic_epoch: rd_u32(b, OFF_TRAFFIC_EPOCH)?,
             target_epoch: rd_u64(b, OFF_TARGET_EPOCH)?,
@@ -538,8 +538,8 @@ pub struct Policy {
     /// RFC requires the continuity policy to state the cost of widening the
     /// live-secret boundary; refusing by default is that statement.
     pub allow_possession: bool,
-    /// The minimum vault tier hardware evidence must report.
-    pub min_tier: u8,
+    /// The minimum vault custody hardware evidence must report.
+    pub min_vault_custody: u8,
 }
 
 /// The digest a policy is named by in a grant.
@@ -553,7 +553,7 @@ pub fn policy_digest(sha: Sha256Fn, p: &Policy) -> [u8; 32] {
             b'G',
             b'P',
             u8::from(p.allow_possession),
-            p.min_tier,
+            p.min_vault_custody,
         ],
         &mut d,
     );
@@ -719,7 +719,7 @@ pub fn decide_issue(
     } else {
         sk::custody::HARDWARE_BOUND
     };
-    floor.min_tier = policy.min_tier;
+    floor.min_vault_custody = policy.min_vault_custody;
     let challenge = attestation_challenge(sha, req);
     let attach = sk::AttachRequest {
         kind: sk::kind::ATTACHMENT,
@@ -750,7 +750,7 @@ pub fn decide_issue(
         key_use: req.key_use,
         direction: req.direction,
         custody: held.custody,
-        proven_tier: held.proven_tier,
+        proven_vault_custody: held.proven_vault_custody,
         algorithm: req.algorithm,
         traffic_epoch: req.traffic_epoch,
         target_epoch: req.target_epoch,
@@ -917,7 +917,7 @@ pub fn decide_custody_check(
     } else {
         sk::custody::HARDWARE_BOUND
     };
-    floor.min_tier = policy.min_tier;
+    floor.min_vault_custody = policy.min_vault_custody;
     let attach = sk::AttachRequest {
         kind: sk::kind::ATTACHMENT,
         resource_kind: 0,
@@ -954,7 +954,7 @@ pub fn decide_custody_check(
         key_use: 1,
         direction: direction::BOTH,
         custody: held.custody,
-        proven_tier: held.proven_tier,
+        proven_vault_custody: held.proven_vault_custody,
         algorithm: ALG_CONTINUITY_KEY,
         traffic_epoch: 0,
         target_epoch: u64::from(check.epoch),

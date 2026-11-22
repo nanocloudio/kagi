@@ -32,8 +32,8 @@
 //! | 5 | 1 | resource kind ([`resource`]) |
 //! | 6 | 1 | purpose: envelope purpose, `share::purpose` |
 //! | 7 | 1 | custody ([`custody`]): required on a grant, proven on a release |
-//! | 8 | 1 | minimum vault tier (`key_vault::tier`) |
-//! | 9 | 1 | proven vault tier, [`NOT_ATTESTED`] when none was |
+//! | 8 | 1 | minimum vault custody (`key_vault::custody`) |
+//! | 9 | 1 | proven vault custody, [`NOT_ATTESTED`] when none was |
 //! | 10 | 1 | minimum enrolment assurance: NIST AAL 1–3, 0 = none required |
 //! | 11 | 1 | flags ([`flag`]) |
 //! | 12 | 2 | KEM suite (`share::kem`) |
@@ -101,8 +101,8 @@
 //!
 //! | Field | On a renewal |
 //! | --- | --- |
-//! | custody, proven tier | what this renewal's evidence established |
-//! | minimum tier and assurance, generation | the grant's, now |
+//! | custody, proven vault custody | what this renewal's evidence established |
+//! | minimum vault custody and assurance, generation | the grant's, now |
 //! | lifetime | the lifetime granted by this renewal |
 //! | issued at | the renewal decision |
 //! | expiry | the attachment's new expiry: issued at + lifetime |
@@ -174,7 +174,7 @@ pub mod custody {
     /// Possession only: the enrolled device signed for the recipient key.
     pub const POSSESSION_BOUND: u8 = 0;
     /// Admitted attestation evidence binds the recipient key to a
-    /// hardware backend at or above the grant's minimum tier.
+    /// hardware backend at or above the grant's minimum vault custody.
     pub const HARDWARE_BOUND: u8 = 1;
 }
 
@@ -186,11 +186,11 @@ pub mod flag {
     pub const CONSUMED: u8 = 1 << 1;
 }
 
-/// The proven-tier byte when no evidence was admitted.
+/// The proven-custody byte when no evidence was admitted.
 pub const NOT_ATTESTED: u8 = 0xFF;
 
-/// Vault tiers, as the `KEY_VAULT` contract numbers them.
-pub use crate::key_vault::tier;
+/// Vault custody ordinals, as the `KEY_VAULT` contract numbers them.
+pub use crate::key_vault::custody as vault_custody;
 
 // ── Layout ──────────────────────────────────────────────────────────────
 
@@ -198,8 +198,8 @@ pub const OFF_KIND: usize = 4;
 pub const OFF_RESOURCE_KIND: usize = 5;
 pub const OFF_PURPOSE: usize = 6;
 pub const OFF_CUSTODY: usize = 7;
-pub const OFF_MIN_TIER: usize = 8;
-pub const OFF_PROVEN_TIER: usize = 9;
+pub const OFF_MIN_VAULT_CUSTODY: usize = 8;
+pub const OFF_PROVEN_VAULT_CUSTODY: usize = 9;
 pub const OFF_MIN_ASSURANCE: usize = 10;
 pub const OFF_FLAGS: usize = 11;
 pub const OFF_KEM: usize = 12;
@@ -239,16 +239,16 @@ pub const ENVELOPE_LEN: usize = share::P256_LEN;
 /// A P-256 public key, uncompressed.
 pub const PUBLIC_LEN: usize = share::P256_PUB_LEN;
 
-// ── Recipient announcement and bundle ───────────────────────────────────
+// ── Recipient announcement and share set ────────────────────────────────
 
 /// `"FXRK" ‖ public(65)`: `crypt_block`'s fresh recipient announcement.
 pub const RECIPIENT_MAGIC: [u8; 4] = *b"FXRK";
 pub const RECIPIENT_LEN: usize = 4 + PUBLIC_LEN;
 
 /// `"FXSB"`, count 2, three zero bytes, then envelopes A and B.
-pub const BUNDLE_MAGIC: [u8; 4] = *b"FXSB";
-pub const BUNDLE_HEADER: usize = 8;
-pub const BUNDLE_LEN: usize = BUNDLE_HEADER + 2 * ENVELOPE_LEN;
+pub const SHARE_SET_MAGIC: [u8; 4] = *b"FXSB";
+pub const SHARE_SET_HEADER: usize = 8;
+pub const SHARE_SET_LEN: usize = SHARE_SET_HEADER + 2 * ENVELOPE_LEN;
 
 /// The recipient public key an announcement carries, if it is one.
 #[must_use]
@@ -498,8 +498,8 @@ pub struct Binding {
     pub resource_kind: u8,
     pub purpose: u8,
     pub custody: u8,
-    pub min_tier: u8,
-    pub proven_tier: u8,
+    pub min_vault_custody: u8,
+    pub proven_vault_custody: u8,
     pub min_assurance: u8,
     pub flags: u8,
     pub kem: u16,
@@ -530,8 +530,8 @@ impl Binding {
             resource_kind: 0,
             purpose: 0,
             custody: custody::POSSESSION_BOUND,
-            min_tier: tier::SOFTWARE,
-            proven_tier: NOT_ATTESTED,
+            min_vault_custody: vault_custody::SOFTWARE,
+            proven_vault_custody: NOT_ATTESTED,
             min_assurance: 0,
             flags: 0,
             kem: share::kem::P256,
@@ -565,8 +565,8 @@ impl Binding {
         w.u8(self.resource_kind)?;
         w.u8(self.purpose)?;
         w.u8(self.custody)?;
-        w.u8(self.min_tier)?;
-        w.u8(self.proven_tier)?;
+        w.u8(self.min_vault_custody)?;
+        w.u8(self.proven_vault_custody)?;
         w.u8(self.min_assurance)?;
         w.u8(self.flags)?;
         w.u16(self.kem)?;
@@ -597,8 +597,8 @@ impl Binding {
             resource_kind: *b.get(OFF_RESOURCE_KIND)?,
             purpose: *b.get(OFF_PURPOSE)?,
             custody: *b.get(OFF_CUSTODY)?,
-            min_tier: *b.get(OFF_MIN_TIER)?,
-            proven_tier: *b.get(OFF_PROVEN_TIER)?,
+            min_vault_custody: *b.get(OFF_MIN_VAULT_CUSTODY)?,
+            proven_vault_custody: *b.get(OFF_PROVEN_VAULT_CUSTODY)?,
             min_assurance: *b.get(OFF_MIN_ASSURANCE)?,
             flags: *b.get(OFF_FLAGS)?,
             kem: rd_u16(b, OFF_KEM)?,
@@ -1040,7 +1040,7 @@ pub mod evidence {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Custody {
     pub custody: u8,
-    pub proven_tier: u8,
+    pub proven_vault_custody: u8,
 }
 
 /// The only uses a fresh recipient key may carry: agree, and export its
@@ -1054,7 +1054,7 @@ pub const RECIPIENT_USAGE: u32 =
 /// A hardware-bound grant requires evidence: signed by the device's
 /// enrolled key, over this service's challenge, naming this recipient key,
 /// with the recipient key's immutable fresh-recipient usage, held unpersisted
-/// by a hardware backend at or above the grant's minimum tier. A
+/// by a hardware backend at or above the grant's minimum vault custody. A
 /// possession-bound grant is released without evidence and says so; evidence
 /// offered to one is still checked, because evidence that does not verify is
 /// not neutral.
@@ -1069,7 +1069,7 @@ pub fn admit_custody(
 ) -> Result<Custody, Refusal> {
     let possession = Custody {
         custody: custody::POSSESSION_BOUND,
-        proven_tier: NOT_ATTESTED,
+        proven_vault_custody: NOT_ATTESTED,
     };
     if req.evidence.is_empty() {
         return if grant.custody == custody::HARDWARE_BOUND {
@@ -1108,26 +1108,26 @@ pub fn admit_custody(
         .get(evidence::R_BACKEND)
         .ok_or(Refusal::AttestationInvalid)?;
     let reported = *record
-        .get(evidence::R_TIER)
+        .get(evidence::R_CUSTODY)
         .ok_or(Refusal::AttestationInvalid)?;
     if suite != crate::key_vault::suite::P256 || usage != RECIPIENT_USAGE || persisted != 0 {
         return Err(Refusal::AttestationInsufficient);
     }
-    let hardware = backend == evidence::backend::PKCS11 && reported >= tier::PROCESS_HW;
-    if hardware && reported >= grant.min_tier {
+    let hardware = backend == evidence::backend::PKCS11 && reported >= vault_custody::PROCESS_HW;
+    if hardware && reported >= grant.min_vault_custody {
         return Ok(Custody {
             custody: custody::HARDWARE_BOUND,
-            proven_tier: reported,
+            proven_vault_custody: reported,
         });
     }
     if grant.custody == custody::HARDWARE_BOUND {
         return Err(Refusal::AttestationInsufficient);
     }
-    // Valid evidence of a software key: the tier is proven, the custody is
-    // still possession.
+    // Valid evidence of a software key: the vault custody is proven, the
+    // recipient's custody is still possession.
     Ok(Custody {
         custody: custody::POSSESSION_BOUND,
-        proven_tier: reported,
+        proven_vault_custody: reported,
     })
 }
 
@@ -1272,8 +1272,8 @@ pub fn decide_release(
     b.resource_kind = g.resource_kind;
     b.purpose = share::purpose::ATTACHMENT;
     b.custody = held.custody;
-    b.min_tier = g.min_tier;
-    b.proven_tier = held.proven_tier;
+    b.min_vault_custody = g.min_vault_custody;
+    b.proven_vault_custody = held.proven_vault_custody;
     b.min_assurance = g.min_assurance;
     b.kem = s.kem;
     b.aead = s.aead;
@@ -1496,8 +1496,8 @@ pub fn decide_renewal(
     let mut b = *a;
     b.kind = kind::RENEWAL;
     b.custody = held.custody;
-    b.proven_tier = held.proven_tier;
-    b.min_tier = g.min_tier;
+    b.proven_vault_custody = held.proven_vault_custody;
+    b.min_vault_custody = g.min_vault_custody;
     b.min_assurance = g.min_assurance;
     b.flags = 0;
     b.generation = g.generation;
@@ -1635,16 +1635,16 @@ pub fn check_custody_set(
     Ok(())
 }
 
-/// Assemble the `FXSB` bundle `crypt_block` takes on its `bundle` input.
+/// Assemble the `FXSB` share set `crypt_block` takes on its `shares` input.
 ///
 /// Envelope A is the one with the lower share index. Both are checked
 /// against the authorisation, and their indices must differ: two envelopes
 /// carrying the same share reconstruct nothing.
-pub fn write_bundle(
+pub fn write_share_set(
     a: &[u8],
     b: &[u8],
     auth: &Binding,
-    out: &mut [u8; BUNDLE_LEN],
+    out: &mut [u8; SHARE_SET_LEN],
 ) -> Result<(), Refusal> {
     let ia = check_released(a, auth)?;
     let ib = check_released(b, auth)?;
@@ -1653,9 +1653,9 @@ pub fn write_bundle(
     }
     let (first, second) = if ia < ib { (a, b) } else { (b, a) };
     out.fill(0);
-    out[..4].copy_from_slice(&BUNDLE_MAGIC);
+    out[..4].copy_from_slice(&SHARE_SET_MAGIC);
     out[4] = 2;
-    let (_, envelopes) = out.split_at_mut(BUNDLE_HEADER);
+    let (_, envelopes) = out.split_at_mut(SHARE_SET_HEADER);
     let (a_slot, b_slot) = envelopes.split_at_mut(ENVELOPE_LEN);
     if copy_exact(a_slot, first) && copy_exact(b_slot, second) {
         Ok(())
@@ -1889,7 +1889,7 @@ pub mod op {
 /// | 88 | 32 | recipient thumbprint |
 /// | 120 | 8 | lease fence |
 /// | 128 | 1 | custody established |
-/// | 129 | 1 | proven vault tier |
+/// | 129 | 1 | proven vault custody |
 /// | 130 | 2 | reserved, zero |
 /// | 132 | | `device f8`, `actor f8` |
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1906,7 +1906,7 @@ pub struct Audit {
     pub recipient: [u8; 32],
     pub fence: u64,
     pub custody: u8,
-    pub proven_tier: u8,
+    pub proven_vault_custody: u8,
 }
 
 pub const AUDIT_FIXED: usize = 132;
@@ -1928,7 +1928,7 @@ impl Audit {
             recipient: [0; 32],
             fence: 0,
             custody: custody::POSSESSION_BOUND,
-            proven_tier: NOT_ATTESTED,
+            proven_vault_custody: NOT_ATTESTED,
         }
     }
 
@@ -1945,7 +1945,7 @@ impl Audit {
         self.recipient = b.recipient;
         self.fence = b.fence;
         self.custody = b.custody;
-        self.proven_tier = b.proven_tier;
+        self.proven_vault_custody = b.proven_vault_custody;
     }
 
     pub fn encode(&self, device: &[u8], actor: &[u8], out: &mut [u8]) -> Option<usize> {
@@ -1967,7 +1967,7 @@ impl Audit {
         w.bytes(&self.recipient)?;
         w.u64(self.fence)?;
         w.u8(self.custody)?;
-        w.u8(self.proven_tier)?;
+        w.u8(self.proven_vault_custody)?;
         w.u16(0)?;
         w.f8(device)?;
         w.f8(actor)?;
@@ -1999,7 +1999,7 @@ impl Audit {
             recipient: r.arr()?,
             fence: r.u64()?,
             custody: r.u8()?,
-            proven_tier: r.u8()?,
+            proven_vault_custody: r.u8()?,
         };
         r.u16()?;
         let device = r.f8()?;

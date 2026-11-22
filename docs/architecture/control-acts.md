@@ -139,7 +139,7 @@ never general use of the service key. `transfer_grant` issues one when:
    — meets the policy's custody, decided by the storage-key profile's
    `admit_custody`. A possession-bound recipient is refused unless the
    graph sets `allow_possession`; hardware evidence must report at least
-   `min_tier` (default `PROCESS_HW`);
+   `min_vault_custody` (default `PROCESS_HW`);
 3. **the nonce is claimed**: a fresh 16-byte nonce's state is created in
    `kagi/transfer-grants/<flow>-<nonce>` as `ISSUED`, create-if-absent.
 
@@ -188,7 +188,7 @@ back, so one module is the provider's whole authority.
 
 Before a transfer is planned, the same module answers `CUSTODY_READY`
 (REQUEST 0xA0 / REPLY 0xA1, a typed operation on `request_in` /
-`response_out`): per host, whether it is enrolled, the tier its own
+`response_out`): per host, whether it is enrolled, the vault custody its own
 evidence last proved here, whether a grant is issuable now (key, clock,
 posture, and the ledger answering a read made for the question) and
 whether it holds a live host certificate from the CA on `ca_key`

@@ -21,7 +21,7 @@
 //!   `PROCESS_HW` in production, checked at construction.
 //!
 //! Params: `iss` (1), `trust_domain` (2), `audience` (3), `allow_possession`
-//! (4, u8, default 0 — a possession-bound standby is refused), `min_tier`
+//! (4, u8, default 0 — a possession-bound standby is refused), `min_vault_custody`
 //! (5, u8, default 1 = `PROCESS_HW`), `posture` (6: development | production;
 //! undeclared refuses to construct).
 
@@ -129,7 +129,7 @@ struct ModuleState {
     audience: [u8; MAX_FIELD],
     audience_len: u8,
     allow_possession: u8,
-    min_tier: u8,
+    min_vault_custody: u8,
     posture: u8,
 
     auth: carrier_auth::Authenticator<REPLAY_SLOTS>,
@@ -168,7 +168,7 @@ fluxor_rt::define_params! {
     2, trust_domain, str, 0 => |s, d, len| { str_param!(s, d, len, trust_domain, trust_domain_len); };
     3, audience, str, 0 => |s, d, len| { str_param!(s, d, len, audience, audience_len); };
     4, allow_possession, u8, 0 => |s, d, len| { s.allow_possession = p_u8(d, len, 0, 0); };
-    5, min_tier, u8, 1 => |s, d, len| { s.min_tier = p_u8(d, len, 0, 1); };
+    5, min_vault_custody, u8, 1 => |s, d, len| { s.min_vault_custody = p_u8(d, len, 0, 1); };
     6, posture, u8, 0, enum { undeclared=0, development=1, production=2 }
         => |s, d, len| { s.posture = p_u8(d, len, 0, POSTURE_UNDECLARED); };
 }
@@ -425,7 +425,7 @@ pub extern "C" fn module_new(
         s.audience = [0; MAX_FIELD];
         s.audience_len = 0;
         s.allow_possession = 0;
-        s.min_tier = 1;
+        s.min_vault_custody = 1;
         s.posture = POSTURE_UNDECLARED;
         s.auth = carrier_auth::Authenticator::new();
         s.requests = Collector::new();
@@ -451,13 +451,13 @@ pub extern "C" fn module_new(
         // The grant key's custody floor, refused at construction like
         // token_mint's: a grant moves live TLS secrets, so its key is
         // issuer-grade.
-        let Some(tier) = issuer_key::vault_tier(sys) else {
+        let Some(custody) = issuer_key::vault_custody(sys) else {
             let line =
-                b"[transfer-grant] refusing to construct: the key vault did not answer its tier";
+                b"[transfer-grant] refusing to construct: the key vault did not answer its custody";
             dev_log(sys, 1, line.as_ptr(), line.len());
             return -1;
         };
-        if !key_custody::permits(key_custody::KeyRole::TransferGrant, posture, tier) {
+        if !key_custody::permits(key_custody::KeyRole::TransferGrant, posture, custody) {
             let why = key_custody::REFUSAL_TEXT;
             let line = b"[transfer-grant] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());
@@ -468,7 +468,7 @@ pub extern "C" fn module_new(
         let issuer_len = usize::from(s.issuer_len);
         let policy = tg::Policy {
             allow_possession: s.allow_possession != 0,
-            min_tier: s.min_tier,
+            min_vault_custody: s.min_vault_custody,
         };
         let ModuleState {
             service, issuer, ..

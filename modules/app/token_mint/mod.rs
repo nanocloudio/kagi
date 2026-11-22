@@ -82,8 +82,8 @@ fluxor_rt::define_params! {
 
     // The custody posture this deployment claims. Declared, never
     // defaulted: `development` admits any answering vault (the floor is
-    // SOFTWARE), `production` requires the vault tier to meet
-    // `key_custody::required_tier` for the Issuer role (PROCESS_HW), and
+    // SOFTWARE), `production` requires the vault custody to meet
+    // `key_custody::required_custody` for the Issuer role (PROCESS_HW), and
     // an undeclared posture refuses at construction.
     1, posture, u8, 0, enum { undeclared=0, development=1, production=2 }
         => |s, d, len| { s.posture = p_u8(d, len, 0, POSTURE_UNDECLARED); };
@@ -193,10 +193,10 @@ struct ModuleState {
     /// The keyset, indexed by `(issuer, profile_id, kid)`.
     keys: [KeySlot; MAX_KEYS],
 
-    /// The vault's isolation tier from `key_vault::TIER`: what `C5` is
+    /// The vault's custody from `key_vault::CUSTODY`: what `C5` is
     /// checked against. Signing goes through the vault; the key is never
     /// held in this module.
-    vault_tier: u8,
+    vault_custody: u8,
     /// The declared custody posture (`POSTURE_*`), from the `posture`
     /// param. `POSTURE_UNDECLARED` never survives `module_new`.
     posture: u8,
@@ -278,16 +278,16 @@ pub extern "C" fn module_new(
         s.no_key_errors = 0;
         s.sign_ops = 0;
 
-        // The vault's TIER: `C5` is a statement about isolation, so it is
+        // The vault's CUSTODY: `C5` is a statement about isolation, so it is
         // checked against the ordinal that carries isolation. The vault
         // itself is claimed in the manifest, so a graph without one never
         // composes; the vault is the only signing path.
-        let Some(tier) = issuer_key::vault_tier(sys) else {
-            let line = b"[mint] refusing to construct: the key vault did not answer its tier";
+        let Some(custody) = issuer_key::vault_custody(sys) else {
+            let line = b"[mint] refusing to construct: the key vault did not answer its custody";
             dev_log(sys, 1, line.as_ptr(), line.len());
             return -1;
         };
-        s.vault_tier = tier;
+        s.vault_custody = custody;
 
         // The posture must be DECLARED. An undeclared posture is not
         // development; it is a graph that has not said what it is, and the
@@ -316,15 +316,15 @@ pub extern "C" fn module_new(
         // other direction: a deployment issuing under a software key
         // believes its issuer key is protected, and nothing downstream can
         // tell — the credentials verify either way.
-        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, s.vault_tier) {
+        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, s.vault_custody) {
             let why = key_custody::REFUSAL_TEXT;
             dev_log(sys, 1, b"[mint] refusing to construct:".as_ptr(), 29);
             dev_log(sys, 1, why.as_ptr(), why.len());
             return -1;
         }
 
-        let t = key_custody::tier_text(s.vault_tier);
-        dev_log(sys, 3, b"[mint] init (key_vault tier=)".as_ptr(), 28);
+        let t = key_custody::custody_text(s.vault_custody);
+        dev_log(sys, 3, b"[mint] init (key_vault custody=)".as_ptr(), 31);
         dev_log(sys, 3, t.as_ptr(), t.len());
         0
     }

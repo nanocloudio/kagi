@@ -17,7 +17,7 @@
 //!   on `token_out` and its verdict (`0xC3`) back from `token_in`.
 //! - **`CUSTODY_READY`** (`custody_authority_service::ready`, REQUEST 0xA0 /
 //!   REPLY 0xA1) is a typed operation on `request_in` / `response_out`: for
-//!   up to 32 hosts, whether each is enrolled here, the custody tier its
+//!   up to 32 hosts, whether each is enrolled here, the vault custody its
 //!   attested evidence last proved, whether a grant could be issued to it
 //!   now — the grant key open, a trusted clock, the ledger answering a read
 //!   made for the question within two seconds, the posture admitting the
@@ -26,7 +26,7 @@
 //!   `[0x5C][len][leaf ‖ issuer]` frames), with its notAfter.
 //!
 //! Params: `host` (1, 32 hex: this host, the source of every transfer
-//! checked here), `iss` (2), `allow_possession` (3, default 0), `min_tier`
+//! checked here), `iss` (2), `allow_possession` (3, default 0), `min_vault_custody`
 //! (4, default 1 = `PROCESS_HW`), `posture` (5: development | production;
 //! undeclared refuses to construct), `ttl_ms` (6, default 30000),
 //! `dest0`..`dest7` (7..14: `<host id 32 hex>:<identity key 130 hex>`, the
@@ -124,7 +124,7 @@ struct ModuleState {
     host: [u8; 16],
     host_ok: u8,
     allow_possession: u8,
-    min_tier: u8,
+    min_vault_custody: u8,
     posture: u8,
     ttl_ms: u32,
     /// Enrolment params that did not parse: refused at construction.
@@ -209,7 +209,7 @@ fluxor_rt::define_params! {
         s.issuer_len = n as u8;
     };
     3, allow_possession, u8, 0 => |s, d, len| { s.allow_possession = p_u8(d, len, 0, 0); };
-    4, min_tier, u8, 1 => |s, d, len| { s.min_tier = p_u8(d, len, 0, 1); };
+    4, min_vault_custody, u8, 1 => |s, d, len| { s.min_vault_custody = p_u8(d, len, 0, 1); };
     5, posture, u8, 0, enum { undeclared=0, development=1, production=2 }
         => |s, d, len| { s.posture = p_u8(d, len, 0, POSTURE_UNDECLARED); };
     6, ttl_ms, u32, 30000 => |s, d, len| { s.ttl_ms = p_u32(d, len, 0, 30000); };
@@ -412,7 +412,7 @@ pub unsafe extern "C" fn module_new(
         s.issuer_len = 0;
         s.host_ok = 0;
         s.allow_possession = 0;
-        s.min_tier = 1;
+        s.min_vault_custody = 1;
         s.posture = POSTURE_UNDECLARED;
         s.ttl_ms = 30_000;
         s.bad_dest = 0;
@@ -444,13 +444,13 @@ pub unsafe extern "C" fn module_new(
         };
         // The grant key's custody floor, as the transfer-grant service's:
         // a grant moves live TLS secrets.
-        let Some(tier) = issuer_key::vault_tier(sys) else {
+        let Some(custody) = issuer_key::vault_custody(sys) else {
             let line =
-                b"[custody-authority] refusing to construct: the key vault did not answer its tier";
+                b"[custody-authority] refusing to construct: the key vault did not answer its custody";
             dev_log(sys, 1, line.as_ptr(), line.len());
             return -1;
         };
-        if !key_custody::permits(key_custody::KeyRole::TransferGrant, posture, tier) {
+        if !key_custody::permits(key_custody::KeyRole::TransferGrant, posture, custody) {
             let why = key_custody::REFUSAL_TEXT;
             let line = b"[custody-authority] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());
@@ -461,7 +461,7 @@ pub unsafe extern "C" fn module_new(
         cfg.source = s.host;
         cfg.policy = tg::Policy {
             allow_possession: s.allow_possession != 0,
-            min_tier: s.min_tier,
+            min_vault_custody: s.min_vault_custody,
         };
         cfg.ttl_ms = u64::from(s.ttl_ms);
         // Construction is refused above unless the posture admits the

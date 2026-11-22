@@ -1,22 +1,22 @@
 //! Key-custody policy: what isolation a signing key must have.
 //!
 //! `C5` — production signing requires an approved vault. This is where that
-//! is enforced, and it is enforced as a **policy on the tier ordinal**
+//! is enforced, and it is enforced as a **policy on the custody ordinal**
 //! rather than on whether a backend answered.
 //!
-//! # Why the tier and not persistence
+//! # Why custody and not persistence
 //!
 //! It is tempting to treat "the key survives a restart" as the security
 //! property, because that is the visible one. It is not. Where no
 //! device-unique key exists, a persisted software key is sealed under
 //! something the host can also read — so persistence buys confidentiality
 //! against a compromised *module* and none against a compromised *host*.
-//! That is exactly what [`TIER_SOFTWARE`] already says.
+//! That is exactly what [`CUSTODY_SOFTWARE`] already says.
 //!
-//! So **persistence must never be read as raising the tier.** A backend that
+//! So **persistence must never be read as raising the custody.** A backend that
 //! learns to persist is the same backend it was; the ordinal is the truthful
 //! signal and it does not move. A profile that needs isolation from the host
-//! asks for the tier, gets refused when it is not there, and is never
+//! asks for the custody, gets refused when it is not there, and is never
 //! consoled by durability.
 //!
 //! # Why refusing rather than falling back
@@ -32,13 +32,13 @@
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface"
 )]
 
-/// Tier ordinals, mirroring `key_vault::tier`.
+/// Custody ordinals, mirroring `key_vault::custody`.
 ///
 /// Ordered by what they isolate against, so a policy says "at least this"
 /// rather than enumerating backends it would then have to be taught about.
-pub const TIER_SOFTWARE: u8 = 0;
-pub const TIER_PROCESS_HW: u8 = 1;
-pub const TIER_DEVICE_HW: u8 = 2;
+pub const CUSTODY_SOFTWARE: u8 = 0;
+pub const CUSTODY_PROCESS_HW: u8 = 1;
+pub const CUSTODY_DEVICE_HW: u8 = 2;
 
 /// What a key is for. The requirement follows from this, not from the
 /// caller's own opinion of how important it is.
@@ -75,9 +75,9 @@ pub enum Posture {
     Production,
 }
 
-/// The minimum tier `role` requires under `posture`.
+/// The minimum custody `role` requires under `posture`.
 ///
-/// `EnrolmentChallenge` is the one role that takes `TIER_SOFTWARE` in
+/// `EnrolmentChallenge` is the one role that takes `CUSTODY_SOFTWARE` in
 /// production, and it is argued rather than assumed: the artefact it signs
 /// grants nothing. Someone who steals that key can forge a challenge, which
 /// buys them a redemption attempt they must still pass a mailed code and a
@@ -89,37 +89,37 @@ pub enum Posture {
 /// authorises nobody, so its floor is about the data's sensitivity rather
 /// than about issuance, and that is the deployment's call.
 #[must_use]
-pub const fn required_tier(role: KeyRole, posture: Posture) -> u8 {
+pub const fn required_custody(role: KeyRole, posture: Posture) -> u8 {
     match posture {
         // Development runs on whatever vault is there.
-        Posture::Development => TIER_SOFTWARE,
+        Posture::Development => CUSTODY_SOFTWARE,
         Posture::Production => match role {
             KeyRole::Issuer
             | KeyRole::CertificateAuthority
             | KeyRole::Workload
-            | KeyRole::TransferGrant => TIER_PROCESS_HW,
-            KeyRole::EnrolmentChallenge | KeyRole::DataEncryption => TIER_SOFTWARE,
+            | KeyRole::TransferGrant => CUSTODY_PROCESS_HW,
+            KeyRole::EnrolmentChallenge | KeyRole::DataEncryption => CUSTODY_SOFTWARE,
         },
     }
 }
 
-/// Whether a backend at `tier` may hold a key for `role`.
+/// Whether a backend at `custody` may hold a key for `role`.
 #[must_use]
-pub const fn permits(role: KeyRole, posture: Posture, tier: u8) -> bool {
-    tier >= required_tier(role, posture)
+pub const fn permits(role: KeyRole, posture: Posture, custody: u8) -> bool {
+    custody >= required_custody(role, posture)
 }
 
 /// Why a key was refused, for an operator-facing log line: the vault every
 /// signing module claims is there, and isolates less than the role needs.
-pub const REFUSAL_TEXT: &[u8] = b"key_vault tier is below this role's production floor";
+pub const REFUSAL_TEXT: &[u8] = b"key_vault custody is below this role's production floor";
 
-/// Short stable token for a tier.
+/// Short stable token for a custody ordinal.
 #[must_use]
-pub const fn tier_text(tier: u8) -> &'static [u8] {
-    match tier {
-        TIER_SOFTWARE => b"software",
-        TIER_PROCESS_HW => b"process-hw",
-        TIER_DEVICE_HW => b"device-hw",
+pub const fn custody_text(custody: u8) -> &'static [u8] {
+    match custody {
+        CUSTODY_SOFTWARE => b"software",
+        CUSTODY_PROCESS_HW => b"process-hw",
+        CUSTODY_DEVICE_HW => b"device-hw",
         _ => b"unknown",
     }
 }

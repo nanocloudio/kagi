@@ -275,12 +275,13 @@ pub extern "C" fn module_new(
         // The signing key's custody floor, refused at construction: a scope
         // authorises fences, DR moves and prefix imports, so the key is
         // issuer-grade.
-        let Some(tier) = issuer_key::vault_tier(sys) else {
-            let line = b"[scope-mint] refusing to construct: the key vault did not answer its tier";
+        let Some(custody) = issuer_key::vault_custody(sys) else {
+            let line =
+                b"[scope-mint] refusing to construct: the key vault did not answer its custody";
             dev_log(sys, 1, line.as_ptr(), line.len());
             return -1;
         };
-        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, tier) {
+        if !key_custody::permits(key_custody::KeyRole::Issuer, posture, custody) {
             let why = key_custody::REFUSAL_TEXT;
             let line = b"[scope-mint] refusing to construct:";
             dev_log(sys, 1, line.as_ptr(), line.len());

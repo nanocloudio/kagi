@@ -339,20 +339,20 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
 
         // Once per rotation through suite 0: the platform probe beat,
         // discriminating WHERE an open failure lives. `rng` is the CSPRNG
-        // provider (the salt call wellknown makes); `tier` is the vault's
-        // own answer. A vault that answers TIER but cannot OPEN, next to a
+        // provider (the salt call wellknown makes); `custody` is the vault's
+        // own answer. A vault that answers CUSTODY but cannot OPEN, next to a
         // failing RNG, is a platform-entropy defect; next to a healthy RNG
         // it is the vault's own keygen/public path.
         if s.suite_idx == 0 && s.op == OP_SIGN {
             let mut rng_buf = [0u8; 64];
             let rng_rc = dev_csprng_fill(sys, rng_buf.as_mut_ptr(), 8);
             let rng32_rc = dev_csprng_fill(sys, rng_buf.as_mut_ptr(), 32);
-            let mut tier_buf = [0u8; key_vault::tier_arg::ARG_LEN];
-            let tier_rc = (sys.provider_call)(
+            let mut custody_buf = [0u8; key_vault::custody_arg::ARG_LEN];
+            let custody_rc = (sys.provider_call)(
                 -1,
-                key_vault::TIER,
-                tier_buf.as_mut_ptr(),
-                tier_buf.len(),
+                key_vault::CUSTODY,
+                custody_buf.as_mut_ptr(),
+                custody_buf.len(),
                 core::ptr::null_mut(),
                 0,
             );
@@ -370,8 +370,13 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 line[at] = b'-';
                 at += 1;
             }
-            put(&mut line, &mut at, b" tierrc=", tier_rc.unsigned_abs());
-            put(&mut line, &mut at, b" tier=", u32::from(tier_buf[0]));
+            put(
+                &mut line,
+                &mut at,
+                b" custodyrc=",
+                custody_rc.unsigned_abs(),
+            );
+            put(&mut line, &mut at, b" custody=", u32::from(custody_buf[0]));
             dev_log(sys, 3, line.as_ptr(), at);
         }
 

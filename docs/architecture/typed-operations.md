@@ -369,7 +369,7 @@ module-private); `key_announce` out[3]. Param: `iss` (1, str).
 
 `msg::REQUEST` 0x80 payload: `[op u8][resource kind u8][resource 16][body]`;
 `msg::REPLY` 0x81 payload: `[op u8][status u8][refusal u8][audited u8]
-[record f16][bundle f16][extra f16]`. The operations, their bodies and the
+[record f16][share_set f16][extra f16]`. The operations, their bodies and the
 refusal codes are in [storage-key.md](storage-key.md).
 
 ## control_act_verify and control_act_mint
@@ -438,7 +438,7 @@ Ports: `request_in` in[0], `response_out` out[0]; `signing_key` in[1];
 `ca_key` in[2]; `ledger_in` in[3] / `ledger_out` out[1] (`security_state`,
 `kagi/transfer-grants/`); `key_announce` out[2]. Params: `iss` (1),
 `trust_domain` (2), `audience` (3), `allow_possession` (4, u8, default 0),
-`min_tier` (5, u8, default 1 = `PROCESS_HW`), `posture` (6, required:
+`min_vault_custody` (5, u8, default 1 = `PROCESS_HW`), `posture` (6, required:
 `development` | `production`).
 
 `REQUEST` 0x94 payload: `[op u8][body]`; `REPLY` 0x95 payload: `[op u8]
@@ -602,7 +602,7 @@ required when `cert_in` is wired (and then `ca_key` must be too).
 ```text
 REQUEST 0xA0  [service 16][n u8][host 16 × n]              n in 1..=32, exactly 17 + 16·n bytes
 REPLY   0xA1  [status u8][n u8]
-              ([host 16][enrolled u8][tier u8][grant_ready u8][cert_ready u8][not_after u64]) × n
+              ([host 16][enrolled u8][custody u8][grant_ready u8][cert_ready u8][not_after u64]) × n
 ```
 
 Rows are in the request's order, 28 bytes each; the longest reply is 898
@@ -614,8 +614,8 @@ has not observed reads not-ready, never ready:
 | Field | 1 / value when |
 |---|---|
 | `enrolled` | the host is one of the graph's `dest0`..`dest7` — a standby a continuity key may move to. The graph's own `host` (every transfer's source) is not. |
-| `tier` | the vault tier (`key_vault::tier`: 0 software, 1 process-hw, 2 device-hw) the host's own attested evidence proved in a custody check that verified here; 0xFF until one has, or when the evidence was possession-only. |
-| `grant_ready` | enrolled, the `TRANSFER_GRANT` key open, a trusted clock, the posture admitting the key's vault, and the ledger answering a read (`kagi/transfer-grants/generation`) made for this question within 2 s. The evidence floor (`min_tier`, `allow_possession`) is checked at the transfer itself, from that transfer's evidence: compare `tier` with the policy beforehand. |
+| `custody` | the vault custody (`key_vault::custody`: 0 software, 1 process-hw, 2 device-hw) the host's own attested evidence proved in a custody check that verified here; 0xFF until one has, or when the evidence was possession-only. |
+| `grant_ready` | enrolled, the `TRANSFER_GRANT` key open, a trusted clock, the posture admitting the key's vault, and the ledger answering a read (`kagi/transfer-grants/generation`) made for this question within 2 s. The evidence floor (`min_vault_custody`, `allow_possession`) is checked at the transfer itself, from that transfer's evidence: compare `custody` with the policy beforehand. |
 | `cert_ready` | a certificate for the host (`spiffe://<trust_domain>/host/<id>`), signed by the CA on `ca_key`, has arrived on `cert_in` and is inside its window on the trusted clock. Of two, the later-expiring is kept. |
 | `not_after` | that certificate's notAfter, Unix seconds; 0 when none is held. |
 

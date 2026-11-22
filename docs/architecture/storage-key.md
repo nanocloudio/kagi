@@ -1,4 +1,4 @@
-# Storage-key grants and attachment bundles
+# Storage-key grants and attachment share sets
 
 Kagi decides who may reconstruct an encrypted volume's key; it never holds
 the key. A volume key lives only behind Fluxor `KEY_VAULT` handles: it is
@@ -29,8 +29,8 @@ One signed layout for every decision, `KSKG`. All integers little-endian.
 | 5 | 1 | resource kind: 1 volume, 2 Clustor partition, 3 snapshot |
 | 6 | 1 | envelope purpose: 1 attachment, 2 recovery custody |
 | 7 | 1 | custody: 0 possession-bound, 1 hardware-bound (required on a grant, proven on a release) |
-| 8 | 1 | minimum vault tier |
-| 9 | 1 | proven vault tier, `0xFF` when no evidence was admitted |
+| 8 | 1 | minimum vault custody |
+| 9 | 1 | proven vault custody, `0xFF` when no evidence was admitted |
 | 10 | 1 | minimum enrolment assurance (NIST AAL 1–3, 0 = none) |
 | 11 | 1 | flags: bit 0 revoked, bit 1 ticket consumed |
 | 12 | 2 | KEM suite |
@@ -79,8 +79,8 @@ A node proves one attach with its enrolled device key over
 Ed25519 signs it whole; ES256 signs its SHA-256. For a hardware-bound grant
 the request also carries `ATTEST_KEY` evidence for the recipient key over
 the same challenge, signed by the device key: a PKCS#11 backend at or above
-the grant's tier, P-256, uses exactly `AGREE | EXPORT_PUBLIC`, not
-persisted. Kernel-backend evidence proves a tier but never hardware custody.
+the grant's vault custody, P-256, uses exactly `AGREE | EXPORT_PUBLIC`, not
+persisted. Kernel-backend evidence proves the vault's custody but never hardware custody.
 
 ## Operations
 
@@ -99,18 +99,18 @@ those of every typed operation
 | 2 create | `tenant f8`, policy, `aead u16`, three custodian public keys, actor | creation (epoch 1) |
 | 3 record set | `epoch u32`, three envelopes `f16`, actor | recovery set |
 | 4 grant | `device f8`, policy, actor | grant |
-| 5 attach | see `write_attach_body` | release + `FXSB` bundle |
+| 5 attach | see `write_attach_body` | release + `FXSB` share set |
 | 6 revoke | actor | grant |
 | 7 replace device | `old f8`, `new f8`, actor | grant |
 | 8 rotate grant | `device f8`, policy, actor | grant |
 | 9 rotate key | three custodian public keys, actor | creation (next epoch) |
 | 10 retire epoch | `epoch u32` (a retained epoch), actor | grant |
 | 11 authorise recovery | `epoch u32`, `device f8`, `ttl secs u32`, actor | ticket |
-| 12 recover | as attach, naming the ticket | release + `FXSB` bundle |
+| 12 recover | as attach, naming the ticket | release + `FXSB` share set |
 | 13 renew attachment | as attach, `ticket` = attachment id, then the record renewed `f16` | renewal |
 | 14 erase | `epoch u32` (the current epoch the pin scan covered), `pins u32`, actor | erasure |
 
-Policy is `[custody u8][min tier u8][min assurance u8][lifetime secs u32]`,
+Policy is `[custody u8][min vault custody u8][min assurance u8][lifetime secs u32]`,
 and the AEAD a creation names is ChaCha20-Poly1305 or AES-256-GCM.
 
 Op 2 claims the resource: it writes the resource's grant create-if-absent —
@@ -119,14 +119,14 @@ stops there, and it replies with the creation authorisation a provisioning
 vault runs `SHARE_SPLIT` under. Op 4 is what names the device.
 
 The reply payload is `[op u8][status u8][refusal u8][audited u8][record f16]
-[bundle f16][extra f16]`; refusal codes are `storage_key::Refusal`, and a
+[share_set f16][extra f16]`; refusal codes are `storage_key::Refusal`, and a
 refusal is still a 200 exchange.
 
 A release is decided in full — grant, directory record, ticket, recovery
 set, proof and evidence — before its anti-replay id is claimed; then two
 custodians are ordered to rewrap, the third standing in for one that
 refuses; then the record is signed over both envelopes and audited, and only
-then answered. The bundle is `"FXSB"`, count 2, three zero bytes, then the
+then answered. The share set is `"FXSB"`, count 2, three zero bytes, then the
 lower-index envelope and the higher, 528 bytes.
 
 ## The network edge
@@ -182,7 +182,7 @@ epoch, fence, recipient, set, policy and suites; states the custody just
 proven, the grant's current floors and generation, the lifetime granted,
 issued at now and expiry = now + lifetime; and carries the renewal's own
 anti-replay id and challenge. It advances the chain head, is audited, and is
-returned with no bundle. No custodian is asked and no key material moves: the
+returned with no share set. No custodian is asked and no key material moves: the
 node keeps the handle it reconstructed at attach.
 
 ## Retained epochs

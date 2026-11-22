@@ -69,7 +69,7 @@ pub mod msg {
     /// exchange id is the correlation.
     pub const REQUEST: u8 = 0x80;
     /// `[op u8][status u8][refusal u8][audited u8]
-    ///  [record f16][bundle f16][extra f16]`: the answer's body, inside its
+    ///  [record f16][share_set f16][extra f16]`: the answer's body, inside its
     /// envelope.
     pub const REPLY: u8 = 0x81;
     /// To custodians: `[corr u32][custodian u8][record f16][recipient f8]
@@ -109,8 +109,8 @@ pub const MAX_LIFETIME_SECS: u32 = sk::MAX_LIFETIME_SECS;
 /// Longest a recovery ticket stays usable: an hour.
 pub const MAX_TICKET_SECS: u32 = 3600;
 /// Largest frame this service writes: a reply carrying a record and a
-/// bundle, or a ledger write carrying a record.
-pub const MAX_FRAME: usize = 3 + 8 + 2 + sk::MAX_RECORD + 2 + sk::BUNDLE_LEN + 2 + 64;
+/// share set, or a ledger write carrying a record.
+pub const MAX_FRAME: usize = 3 + 8 + 2 + sk::MAX_RECORD + 2 + sk::SHARE_SET_LEN + 2 + 64;
 /// Longest ledger key this service composes.
 const MAX_KEY: usize = 96;
 
@@ -543,11 +543,11 @@ fn head(body: &[u8]) -> Result<Head<'_>, Refusal> {
 }
 
 /// The policy a create or grant carries:
-/// `[custody u8][min tier u8][min assurance u8][lifetime u32]`.
+/// `[custody u8][min vault custody u8][min assurance u8][lifetime u32]`.
 #[derive(Clone, Copy)]
 struct PolicyFields {
     custody: u8,
-    min_tier: u8,
+    min_vault_custody: u8,
     min_assurance: u8,
     lifetime_secs: u32,
 }
@@ -557,16 +557,17 @@ const POLICY_LEN: usize = 7;
 fn policy_fields(r: &mut sk::Reader<'_>) -> Result<PolicyFields, Refusal> {
     let p = PolicyFields {
         custody: r.u8().ok_or(Refusal::Malformed)?,
-        min_tier: r.u8().ok_or(Refusal::Malformed)?,
+        min_vault_custody: r.u8().ok_or(Refusal::Malformed)?,
         min_assurance: r.u8().ok_or(Refusal::Malformed)?,
         lifetime_secs: r.u32().ok_or(Refusal::Malformed)?,
     };
     let custody_ok = match p.custody {
-        sk::custody::POSSESSION_BOUND => p.min_tier <= sk::tier::DEVICE_HW,
+        sk::custody::POSSESSION_BOUND => p.min_vault_custody <= sk::vault_custody::DEVICE_HW,
         // A hardware-bound policy whose floor a software vault meets would
         // be a hardware claim nothing can prove.
         sk::custody::HARDWARE_BOUND => {
-            p.min_tier >= sk::tier::PROCESS_HW && p.min_tier <= sk::tier::DEVICE_HW
+            p.min_vault_custody >= sk::vault_custody::PROCESS_HW
+                && p.min_vault_custody <= sk::vault_custody::DEVICE_HW
         }
         _ => false,
     };
@@ -712,7 +713,7 @@ pub struct Reply<'a> {
     pub refusal: u8,
     pub audited: bool,
     pub record: &'a [u8],
-    pub bundle: &'a [u8],
+    pub share_set: &'a [u8],
     pub extra: &'a [u8],
 }
 
@@ -724,7 +725,7 @@ pub fn read_reply(payload: &[u8]) -> Option<Reply<'_>> {
         refusal: r.u8()?,
         audited: r.u8()? != 0,
         record: r.f16()?,
-        bundle: r.f16()?,
+        share_set: r.f16()?,
         extra: r.f16()?,
     };
     (r.remaining() == 0).then_some(reply)
@@ -1236,7 +1237,7 @@ fn start_create<H: Host>(cx: &mut Cx<'_, H>, op: &mut Op, now: u64) -> Result<()
     g.resource = h.resource;
     g.purpose = share::purpose::ATTACHMENT;
     g.custody = policy.custody;
-    g.min_tier = policy.min_tier;
+    g.min_vault_custody = policy.min_vault_custody;
     g.min_assurance = policy.min_assurance;
     g.lifetime_secs = policy.lifetime_secs;
     g.aead = aead;
@@ -1542,7 +1543,7 @@ fn after_grant<H: Host>(cx: &mut Cx<'_, H>, op: &mut Op, now: u64) -> Result<(),
                 }
             }
             g.custody = policy.custody;
-            g.min_tier = policy.min_tier;
+            g.min_vault_custody = policy.min_vault_custody;
             g.min_assurance = policy.min_assurance;
             g.lifetime_secs = policy.lifetime_secs;
             device = named;
@@ -2200,12 +2201,12 @@ fn custodian_result<H: Host>(
     release(cx, op)
 }
 
-/// Both envelopes are in: assemble the bundle, sign the record whole.
+/// Both envelopes are in: assemble the share set, sign the record whole.
 fn release<H: Host>(cx: &mut Cx<'_, H>, op: &mut Op) -> Result<(), Refusal> {
-    let mut bundle = [0u8; sk::BUNDLE_LEN];
-    sk::write_bundle(&op.envs[0], &op.envs[1], &op.auth, &mut bundle)?;
-    let a = &bundle[sk::BUNDLE_HEADER..sk::BUNDLE_HEADER + sk::ENVELOPE_LEN];
-    let b = &bundle[sk::BUNDLE_HEADER + sk::ENVELOPE_LEN..];
+    let mut share_set = [0u8; sk::SHARE_SET_LEN];
+    sk::write_share_set(&op.envs[0], &op.envs[1], &op.auth, &mut share_set)?;
+    let a = &share_set[sk::SHARE_SET_HEADER..sk::SHARE_SET_HEADER + sk::ENVELOPE_LEN];
+    let b = &share_set[sk::SHARE_SET_HEADER + sk::ENVELOPE_LEN..];
     {
         let Op {
             req,
@@ -2230,7 +2231,7 @@ fn release<H: Host>(cx: &mut Cx<'_, H>, op: &mut Op) -> Result<(), Refusal> {
         };
         sign_into(cx.host, out, auth, &names, &[a, b])?;
     }
-    // Held in bundle order, so the reply's bundle is the record's.
+    // Held in share set order, so the reply's share set is the record's.
     op.envs[0].copy_from_slice(a);
     op.envs[1].copy_from_slice(b);
     finish(cx, op, Ok(()));
@@ -2381,14 +2382,14 @@ fn reply<H: Host>(cx: &mut Cx<'_, H>, op: &Op, audited: bool) {
         None if op.proven() && !audited => Some(Refusal::LedgerUnavailable),
         other => other,
     };
-    let mut bundle = [0u8; sk::BUNDLE_LEN];
-    let with_bundle = release && refusal.is_none() && op.env_count == 2;
-    if with_bundle {
-        bundle[..4].copy_from_slice(&sk::BUNDLE_MAGIC);
-        bundle[4] = 2;
-        bundle[sk::BUNDLE_HEADER..sk::BUNDLE_HEADER + sk::ENVELOPE_LEN]
+    let mut share_set = [0u8; sk::SHARE_SET_LEN];
+    let with_share_set = release && refusal.is_none() && op.env_count == 2;
+    if with_share_set {
+        share_set[..4].copy_from_slice(&sk::SHARE_SET_MAGIC);
+        share_set[4] = 2;
+        share_set[sk::SHARE_SET_HEADER..sk::SHARE_SET_HEADER + sk::ENVELOPE_LEN]
             .copy_from_slice(&op.envs[0]);
-        bundle[sk::BUNDLE_HEADER + sk::ENVELOPE_LEN..].copy_from_slice(&op.envs[1]);
+        share_set[sk::SHARE_SET_HEADER + sk::ENVELOPE_LEN..].copy_from_slice(&op.envs[1]);
         cx.stats.released = cx.stats.released.saturating_add(1);
     }
     let record: &[u8] = if refusal.is_none() {
@@ -2396,7 +2397,7 @@ fn reply<H: Host>(cx: &mut Cx<'_, H>, op: &Op, audited: bool) {
     } else {
         &[]
     };
-    let bundle: &[u8] = if with_bundle { &bundle } else { &[] };
+    let share_set: &[u8] = if with_share_set { &share_set } else { &[] };
     send_reply(
         cx,
         &op.caller,
@@ -2404,7 +2405,7 @@ fn reply<H: Host>(cx: &mut Cx<'_, H>, op: &Op, audited: bool) {
         refusal,
         audited,
         record,
-        bundle,
+        share_set,
         &[],
     );
 }
@@ -2424,7 +2425,7 @@ fn send_reply<H: Host>(
     refusal: Option<Refusal>,
     audited: bool,
     record: &[u8],
-    bundle: &[u8],
+    share_set: &[u8],
     extra: &[u8],
 ) {
     let mut payload = [0u8; MAX_FRAME];
@@ -2439,7 +2440,7 @@ fn send_reply<H: Host>(
         && w.u8(refusal.map_or(0, Refusal::code)).is_some()
         && w.u8(u8::from(audited)).is_some()
         && w.f16(record).is_some()
-        && w.f16(bundle).is_some()
+        && w.f16(share_set).is_some()
         && w.f16(extra).is_some();
     if !ok {
         return;
