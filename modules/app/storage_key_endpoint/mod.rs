@@ -35,7 +35,15 @@ mod auth_wire;
 mod chan;
 #[path = "../../common/storage_key_endpoint.rs"]
 mod endpoint;
-use abi::contracts::key_vault;
+/// The vault's record layouts the mounted storage-key fragments read. This
+/// module makes no vault call, so it takes the layouts and not the contract.
+mod key_vault {
+    pub use fluxor_abi::contracts::key_vault::attest_key;
+    pub use fluxor_abi::contracts::key_vault::custody;
+    pub use fluxor_abi::contracts::key_vault::share;
+    pub use fluxor_abi::contracts::key_vault::suite;
+    pub use fluxor_abi::contracts::key_vault::usage;
+}
 #[path = "../../common/state_wire.rs"]
 mod state_wire;
 #[path = "../../common/storage_key.rs"]

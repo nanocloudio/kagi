@@ -4,13 +4,16 @@ type = "Source"
 entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
-grants = ["key_vault"]
 
 # The step-cost instrument. One credential operation per step, timed with
 # the monotonic microsecond clock, reported as a recurring beat — never a
 # one-shot line, which does not survive the UDP telemetry attach. The
 # numbers this module emits are what the tree's WCET constants are checked
 # against; `docs/performance/step-costs.md` is the table it fills.
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
 
 [[ports]]
 name = "tick_out"

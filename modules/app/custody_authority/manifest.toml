@@ -5,7 +5,6 @@ entry = "mod.rs"
 edition = "2021"
 # Where its ledger runs: a grant's single-use state is the ledger's.
 hardware_targets = ["bcm2712", "linux"]
-grants = ["key_vault"]
 
 # custody_authority — the continuity authority a Fluxor
 # TRANSPORT_CONTINUITY provider asks, as a module of the provider's graph
@@ -13,6 +12,10 @@ grants = ["key_vault"]
 # decided here and answered (0xC5) once the transfer's KTGR is signed and
 # its single-use state written CONSUMED in the ledger; token checks (0xC2)
 # are relayed to Clustor's session directory and its verdicts (0xC3) back.
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
 
 # The provider's `auth_req`: `[type][len u16][payload]` frames, custody and
 # token checks.

@@ -103,6 +103,9 @@ struct ModuleState {
     label_len: u8,
     /// The recovery key's vault handle, or -1.
     handle: i32,
+    /// The recovery key is still to be opened: the vault is asked on each
+    /// step until it answers anything but `EAGAIN`, and orders wait meanwhile.
+    key_pending: u8,
     public: [u8; sk::PUBLIC_LEN],
     thumbprint: [u8; 32],
 
@@ -211,6 +214,7 @@ pub extern "C" fn module_new(
         s.label = [0; key_vault::MAX_LABEL];
         s.label_len = 0;
         s.handle = -1;
+        s.key_pending = 0;
         s.public = [0; sk::PUBLIC_LEN];
         s.thumbprint = [0; 32];
         s.issuer_suite = 0;
@@ -230,7 +234,9 @@ pub extern "C" fn module_new(
             // A fourth custodian is not a custodian of a 2-of-3 set.
             s.index = NOT_A_CUSTODIAN;
         }
-        open_recovery_key(s, sys);
+        // Opened from the step: the vault answers `EAGAIN` until its image has
+        // loaded, and a key that may already be there must not be made anew.
+        s.key_pending = u8::from(s.label_len > 0);
 
         dev_log(sys, 3, b"[custodian] init".as_ptr(), 16);
         0
@@ -238,6 +244,7 @@ pub extern "C" fn module_new(
 }
 
 /// Open (or on first start, generate) the recovery key under its label.
+/// Kept pending while the vault answers `EAGAIN`; any other answer settles it.
 ///
 /// # Safety
 ///
@@ -245,6 +252,7 @@ pub extern "C" fn module_new(
 unsafe fn open_recovery_key(s: &mut ModuleState, sys: &SyscallTable) {
     let n = usize::from(s.label_len);
     if n == 0 {
+        s.key_pending = 0;
         return;
     }
     // AGREE to open custody envelopes, EXPORT_PUBLIC because an envelope
@@ -263,6 +271,7 @@ unsafe fn open_recovery_key(s: &mut ModuleState, sys: &SyscallTable) {
             label: &s.label[..n],
         },
     ) else {
+        s.key_pending = 0;
         return;
     };
     let h = (sys.provider_call)(
@@ -273,6 +282,10 @@ unsafe fn open_recovery_key(s: &mut ModuleState, sys: &SyscallTable) {
         s.public.as_mut_ptr(),
         s.public.len(),
     );
+    if h == abi::errno::EAGAIN {
+        return;
+    }
+    s.key_pending = 0;
     if h < 0 {
         return;
     }
@@ -299,6 +312,12 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         drain_key(s, sys);
+        if s.key_pending != 0 {
+            open_recovery_key(s, sys);
+            if s.key_pending != 0 {
+                return StepReturn::Continue;
+            }
+        }
         let mut worked = false;
         for _ in 0..MAX_ORDERS_PER_STEP {
             if !chan::can_read(sys, s.in_orders) || !chan::can_write(sys, s.out_results) {

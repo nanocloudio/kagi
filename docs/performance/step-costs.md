@@ -9,8 +9,8 @@ checked against; a constant that disagrees with it is wrong, not the table.
 Method: `configs/bench-suites.yaml` under `fluxor-linux` for the Linux
 column; `tests/hardware/pi5_kagi_bench.toml` (via
 `configs/bench-suites-pi5.yaml`) for the bcm2712 column — same module, same
-bytes. Vault = the kernel software backend on both (an HSM deployment
-re-measures with its own backend: PKCS#11 calls block inline). "sign" is a
+bytes. Vault = the `key_vault` module's software custody on both (an HSM
+deployment re-measures with token custody: PKCS#11 calls block inline). "sign" is a
 vault SIGN round trip; "verify" is the in-module SDK verifier; "hash" is
 one SHA-256 over the suite's public key (the thumbprint shape).
 

@@ -34,7 +34,9 @@ sed -e 's/__WS_PORT__/9700/'          -e 's/__TOKEN_PORT__/8081/' \
     -e 's|__ISSUER__|http://localhost:8080|' \
     -e 's/__TENANT_SEED__/dev-tenant-seed/' \
     -e 's/__CA_PEM__/none/' \
+    -e 's|__STORE_DIR__|/tmp/issuer/store|' \
     "$KAGI/configs/issuer.yaml" > issuer.yaml
+mkdir -p /tmp/issuer/store
 ```
 
 The control listener also needs `__CONTROL_CERT__`, `__CONTROL_KEY__`,
@@ -50,6 +52,12 @@ listener refuses handshakes. The enrolment mail path needs
 it later changes every tenant id the deployment has ever issued. `__ISSUER__`
 is what minted tokens claim as `iss`, so a placeholder left in place produces
 tokens claiming to come from `__ISSUER__`.
+
+`__STORE_DIR__` is the absolute directory the graph's `store` keeps the
+ledger's log in. The graph's `key_vault` keeps its keys as records in
+`vault.img` under the runtime's CWD, sealed under the host's
+`FLUXOR_SEAL_KEY` (64 hex digits): without it the vault refuses to
+construct, and under a different one the keys it sealed do not reopen.
 
 `fluxor run` finds the project by walking up for `fluxor.toml` and reads
 artefacts through `fluxor.lock`, so give the rendered graph a root of its

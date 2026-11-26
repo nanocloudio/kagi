@@ -327,7 +327,7 @@ opens.
   exchange record per buffer, and every answer reaches the requester that
   asked with many exchanges in flight.
   `configs/e2e-storage-custodian.yaml` runs the service with its ledger and
-  three custodians, each holding its recovery key in the kernel's vault: a
+  three custodians, each holding its recovery key in the graph's `key_vault`: a
   volume key split with an independent implementation of the vault contract,
   sealed to the keys the running custodians report, is rewrapped by their
   vaults and recombines; a custodian refuses a second release under one

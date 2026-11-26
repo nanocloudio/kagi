@@ -36,6 +36,7 @@ content_type = "OctetStream"
 [[resources]]
 requires_contract = "fs"
 access = "write"
+optional = true
 
 [observability]
 metrics = ["get_ops", "put_ops", "list_ops", "rotate_ops", "decrypt_failures", "records", "bytes_stored"]

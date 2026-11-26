@@ -23,19 +23,21 @@ buffer_size = 8192
 # (1 + 64) + value f16 (2 + 2048).
 max_record = 4096
 
-# The durable ledger. `storage.object` is required, not optional: this module
-# refuses service when no provider answers rather than degrading to memory,
-# because a security-state store that silently forgets is worse than one that
-# says it is absent.
+# The durable ledger on the `object` backend. `storage.object` is required
+# there, not optional: this module refuses service when no provider answers
+# rather than degrading to memory, because a security-state store that
+# silently forgets is worse than one that says it is absent. The `lattice`
+# backend never calls it.
 #
-# On Linux the conditional-write provider is the versioned store, which is
-# active only when `FLUXOR_STORE_DIR` is set. That is an environment
-# variable rather than a graph declaration, so a deployment that forgets it
-# gets the HTTP-backed object provider whose PUT is unimplemented — the
-# start-up probe below turns that into a refusal instead of a surprise.
+# The conditional-write provider is a `store` module the graph composes
+# (with a `dir` for its log); an object-backend graph that composes no
+# `storage.object` provider is refused when it is built. A provider that
+# answers but cannot write conditionally is still refused at run time by the
+# start-up probe.
 [[resources]]
 requires_contract = "storage.object"
 access = "write"
+when = { backend = ["object"] }
 
 # The lattice kv lane — used only when the graph declares
 # `backend: lattice`, and REQUIRED then: a replicated authority on the

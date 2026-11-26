@@ -5,7 +5,6 @@ type = "Transformer"
 entry = "mod.rs"
 edition = "2021"
 hardware_targets = ["bcm2712", "linux"]
-grants = ["key_vault"]
 
 # carrier_mint — the holder's half of a certificate-bound identity carrier
 # (modules/common/cert_bound_identity.rs is the relying party's): ES256
@@ -14,6 +13,10 @@ grants = ["key_vault"]
 # TLS identity (Kagi's `service_dns_sign` behind the traffic fabric's
 # `dns_sign_relay`). The key is certified on the seam Fluxor's `tls` uses:
 # `identity_req` out, `identity_cert` in.
+
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
 
 # `[0x5C][len u16 LE][leaf DER ‖ issuer DER ‖ …]` (net_proto framed), from
 # the enrolment path. Taken only when the leaf certifies this key.
